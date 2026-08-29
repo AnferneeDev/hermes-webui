@@ -6803,9 +6803,22 @@ if(typeof window!=='undefined'){
         &&typeof _recentMessageWheelIntent==='function'&&!_recentMessageWheelIntent()
         &&typeof _recentMessageKeyScrollIntent==='function'&&!_recentMessageKeyScrollIntent()
         &&typeof _recentNonMessageScrollIntent==='function'&&!_recentNonMessageScrollIntent();
+      const _prevMessageScrollHeightForRepin=(typeof _lastMessageScrollHeight!=='undefined'&&_lastMessageScrollHeight!==null)?_lastMessageScrollHeight:null;
       if(typeof _lastMessageScrollHeight!=='undefined') _lastMessageScrollHeight=el.scrollHeight;
       const movedUp=!grew&&!shrankNoIntent&&_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
+      // Fast-stream re-pin race: while content streams in quickly (200+ tok/s),
+      // the true bottom moves DOWN between the reader's wheel event and this
+      // handler running — bottomDistance measured against the freshly-grown
+      // scrollHeight chronically reads >80px (often >250px), so an unpinned
+      // reader actively chasing the tail can NEVER satisfy the re-pin gates.
+      // Judge arrival against where the tail WAS at the previous scroll event:
+      // if a downward scroll carried the viewport to within 80px of the
+      // previous tail, the reader caught the tail they were aiming at — that
+      // is decisive re-pin intent even though new content already grew below.
+      const caughtPrevTail=movedDown
+        &&_prevMessageScrollHeightForRepin!==null
+        &&(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);
       // Suppress the post-render scroll artifact: right after renderMessages()
       // rebuilds #msgInner, the browser can emit a non-user upward scroll event.
       // The typeof guards keep this branch inert in unit harnesses that inject
@@ -6839,17 +6852,12 @@ if(typeof window!=='undefined'){
       const _prevScrollTopForLog=_lastScrollTop;
       _lastScrollTop=top;
       if(movedUp&&bottomDistance>1){
-        // Only a real scroll-away unpins. A collapse ABOVE the tail (worklog
-        // "Done" fold, thinking/tool card collapse, interim-note collapse) shrinks
-        // scrollHeight while the reader is still flush at the tail, so the browser
-        // clamps scrollTop DOWN by the collapsed height and fires a scroll event:
-        // movedUp is true while bottomDistance stays ~0. Reading that as user
-        // intent killed live-follow mid-stream on a reader who never scrolled.
-        // The render-artifact suppression below cannot cover it: it needs a
-        // renderMessages() within the last 1400ms, and the collapse paths above run
-        // from the streaming handlers, which update the DOM incrementally and never
-        // stamp _lastMessageRenderAt. A genuine upward scroll always leaves the true
-        // bottom first, so it still has bottomDistance>1 here.
+        // Collapse clamps at the true bottom are not user intent. While
+        // aggressive follow is enabled, only an upward move that carries the
+        // previous tail beyond one viewport escapes the pin.
+        if(typeof window!=='undefined'&&window._autoScrollFollow&&_scrollPinned&&bottomDistance<=el.clientHeight){
+          _nearBottomCount=0;
+        }else{
         _cancelBottomSettle();
         _nearBottomCount=0;
         _scrollPinned=false;
@@ -6857,11 +6865,22 @@ if(typeof window!=='undefined'){
         // Unpin breadcrumb: if live-follow ever strands with no user scroll,
         // this line names the culprit event (deltas + which intent was recent).
         try{
-          if(window._autoScrollFollow&&console&&console.debug){
+          if(typeof window!=='undefined'&&window._autoScrollFollow&&console&&console.debug){
             console.debug('[follow] sticky-unpin',{top,lastTop:_prevScrollTopForLog,dTop:top-(_prevScrollTopForLog??top),scrollH:el.scrollHeight,bottomDistance,wheel:_recentMessageWheelIntent(),key:_recentMessageKeyScrollIntent(),touch:_recentMessageTouchScrollIntent(),drag:(typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive)});
           }
         }catch(_e){}
-      }else if(movedDown&&nearBottom){
+        }
+      }else if(movedDown&&(nearBottom||caughtPrevTail)){
+        // Catching the PREVIOUS tail is decisive: re-pin immediately (no
+        // debounce — at fast stream rates a second qualifying event may never
+        // come, because each handler run re-measures against a taller
+        // transcript) and snap to the true bottom so follow resumes cleanly.
+        if(caughtPrevTail){
+          _nearBottomCount=0;
+          _messageUserUnpinned=false;
+          _scrollPinned=true;
+          if(typeof window!=='undefined'&&window._autoScrollFollow&&typeof _setMessageScrollToBottom==='function') _setMessageScrollToBottom();
+        }else{
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
           // Only re-pin when the reader has genuinely reached the true bottom
@@ -6873,6 +6892,7 @@ if(typeof window!=='undefined'){
             _scrollPinned=true;
           }
           _nearBottomCount=0;
+        }
         }
       }else if(!_messageUserUnpinned){
         if(nearBottom){
@@ -7689,7 +7709,12 @@ function scrollIfPinned(){
   }
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
-  if(_messageBottomDistance()>500) _setMessageScrollToBottom();
+  // Aggressive follow: while pinned, keep the true tail glued to the viewport
+  // bottom on EVERY streamed write — do not let content expand below the fold
+  // waiting for the debounced settle (at 200+ tok/s the settle chronically
+  // lags a growing transcript). The settle still runs after for late layout
+  // growth (Prism/KaTeX/Mermaid/images).
+  if(_messageBottomDistance()>2) _setMessageScrollToBottom();
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){

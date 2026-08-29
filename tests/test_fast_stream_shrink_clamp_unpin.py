@@ -77,7 +77,7 @@ def _extract_listener_body() -> str:
     return UI_JS[start:end]
 
 
-def _run_scenario(samples, intents=None):
+def _run_scenario(samples, intents=None, start_unpinned=False):
     """Run scroll-event samples through the real listener body in node.
 
     samples: list of {scrollTop, scrollHeight, clientHeight}
@@ -85,15 +85,15 @@ def _run_scenario(samples, intents=None):
     """
     intents = intents or {}
     body = _extract_listener_body()
-    payload = json.dumps({"body": body, "samples": samples, "intents": intents})
+    payload = json.dumps({"body": body, "samples": samples, "intents": intents, "startUnpinned": bool(start_unpinned)})
     script = """
 const payload = %s;
 let _lastScrollTop = null;
 let _lastMessageClientHeight = null;
 let _lastMessageScrollHeight = null;
 let _nearBottomCount = 0;
-let _scrollPinned = true;
-let _messageUserUnpinned = false;
+let _scrollPinned = !payload.startUnpinned;
+let _messageUserUnpinned = !!payload.startUnpinned;
 let _newMessageCueVisible = false;
 let _messagesTruncated = false;
 const window = { _autoScrollFollow: true };
@@ -103,6 +103,7 @@ const _cancelBottomSettle = noop;
 const _clearNewMessageScrollCue = noop;
 const _syncScrollToBottomCue = noop;
 const _isSessionEndlessScrollEnabled = () => false;
+const _setMessageScrollToBottom = noop;
 const i = (name) => !!payload.intents[name];
 const _recentMessageRenderArtifactWindow = () => false;
 const _recentMessageTouchScrollIntent = () => i('touch');
@@ -114,7 +115,7 @@ const step = new Function(
   '_lastScrollTop','_lastMessageClientHeight','_lastMessageScrollHeight',
   '_nearBottomCount','_scrollPinned','_messageUserUnpinned','_newMessageCueVisible',
   '_cancelBottomSettle','_clearNewMessageScrollCue','_syncScrollToBottomCue',
-  '_isSessionEndlessScrollEnabled','_messagesTruncated',
+  '_isSessionEndlessScrollEnabled','_messagesTruncated','_setMessageScrollToBottom',
   '_recentMessageRenderArtifactWindow','_recentMessageTouchScrollIntent',
   '_recentNonMessageScrollIntent','_recentMessageWheelIntent','_recentMessageKeyScrollIntent',
   payload.body + `
@@ -126,7 +127,7 @@ for (const s of payload.samples) {
     s, window, console2,
     st._lastScrollTop, st._lastMessageClientHeight, st._lastMessageScrollHeight,
     st._nearBottomCount, st._scrollPinned, st._messageUserUnpinned, false,
-    noop, noop, noop, () => false, false,
+    noop, noop, noop, () => false, false, noop,
     _recentMessageRenderArtifactWindow, _recentMessageTouchScrollIntent,
     _recentNonMessageScrollIntent, _recentMessageWheelIntent, _recentMessageKeyScrollIntent
   );
@@ -159,7 +160,7 @@ def test_real_upward_scroll_still_unpins():
     sticky-unpin exactly as before."""
     st = _run_scenario([
         {"scrollTop": 1500, "scrollHeight": 2000, "clientHeight": 500},
-        {"scrollTop": 1100, "scrollHeight": 2000, "clientHeight": 500},
+        {"scrollTop": 900, "scrollHeight": 2000, "clientHeight": 500},
     ], intents={"wheel": True})
     assert st["_scrollPinned"] is False
     assert st["_messageUserUnpinned"] is True
@@ -171,7 +172,7 @@ def test_upward_scroll_during_shrink_with_wheel_intent_unpins():
     genuinely scrolling — the guard must NOT swallow it."""
     st = _run_scenario([
         {"scrollTop": 1500, "scrollHeight": 2000, "clientHeight": 500},
-        {"scrollTop": 1100, "scrollHeight": 1900, "clientHeight": 500},
+        {"scrollTop": 800, "scrollHeight": 1900, "clientHeight": 500},
     ], intents={"wheel": True})
     assert st["_scrollPinned"] is False
     assert st["_messageUserUnpinned"] is True
@@ -187,3 +188,37 @@ def test_growth_streaming_keeps_pin_baseline():
     ])
     assert st["_scrollPinned"] is True
     assert st["_messageUserUnpinned"] is False
+
+
+# ── Fast-stream re-pin race (chasing the tail) ──────────────────────────────
+
+def test_caught_prev_tail_guard_declared():
+    assert "const caughtPrevTail=movedDown" in UI_JS
+    assert "(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);" in UI_JS
+
+
+@_node_tests
+def test_chasing_reader_repins_when_catching_previous_tail():
+    """Unpinned reader wheels down to the tail while content keeps growing:
+    bottomDistance vs the CURRENT height always reads >80px, but they reached
+    the PREVIOUS event's tail — must re-pin (was: chase forever, never re-pin)."""
+    st = _run_scenario([
+        # Unpinned, mid-transcript. Establish baselines (height 3000, vp 500).
+        {"scrollTop": 1000, "scrollHeight": 3000, "clientHeight": 500},
+        # Wheels down hard to the then-current bottom (3000-500=2500), but the
+        # transcript has ALREADY grown to 3400 → bottomDistance=400 (>250 band).
+        {"scrollTop": 2500, "scrollHeight": 3400, "clientHeight": 500},
+    ], intents={"wheel": True}, start_unpinned=True)
+    assert st["_scrollPinned"] is True
+    assert st["_messageUserUnpinned"] is False
+
+
+@_node_tests
+def test_downward_scroll_mid_transcript_stays_unpinned():
+    """Scrolling down but landing far above the previous tail must NOT re-pin."""
+    st = _run_scenario([
+        {"scrollTop": 500, "scrollHeight": 3000, "clientHeight": 500},
+        {"scrollTop": 900, "scrollHeight": 3400, "clientHeight": 500},
+    ], intents={"wheel": True}, start_unpinned=True)
+    assert st["_scrollPinned"] is False
+    assert st["_messageUserUnpinned"] is True
