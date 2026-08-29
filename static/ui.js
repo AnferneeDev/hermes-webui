@@ -6365,6 +6365,16 @@ function _cancelMessageJumpScroll(){
 let _nearBottomCount=0;
 let _lastScrollTop=null;
 let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore iOS portrait toolbar-settle reflows (a clientHeight increase fires a scroll event with decreased scrollTop that is NOT a user scroll)
+// Fast-stream shrink-clamp guard: track scrollHeight between scroll events.
+// During high-throughput streaming (200+ tok/s), content ABOVE the tail can
+// re-render SHORTER (live thinking block replaced by shorter final block, tool
+// output collapsing into a compact card, provisional markdown re-parse). When
+// scrollHeight shrinks, the browser clamps scrollTop down and fires a scroll
+// event that reads as "moved up" — with NO user input. The movedUp branch then
+// sticky-unpins and live-follow silently dies mid-stream, stranding the
+// viewport mid-transcript. Sibling of the #4702 clientHeight-grew guard: both
+// are geometry changes masquerading as user scrolls.
+let _lastMessageScrollHeight=null;
 // Sticky-unpin model (#3343 supersedes #3330's proximity re-pin): once the user
 // scrolls up, streaming stops auto-following until they return to the bottom or
 // click ↓. The upward-intent TIMEOUT mechanism (_lastMessageUpwardIntentMs /
@@ -6582,6 +6592,7 @@ function _resetScrollDirectionTracker(){
   _clearNewMessageScrollCue();
   _lastScrollTop=null;
   _lastMessageClientHeight=null;
+  _lastMessageScrollHeight=null;
   _messageUserUnpinned=false;
   _scrollPinned=true;
   _nearBottomCount=0;
@@ -6610,6 +6621,7 @@ function _resetStreamScrollFollow(){
   _scrollPinned=true;
   _nearBottomCount=0;
   _lastScrollTop=null;
+  _lastMessageScrollHeight=null;
   // #4970 review: clear low-delta wheel intent on fresh stream start too, else a
   // gentle upward wheel within the prior 1200ms can under-suppress a genuine
   // no-intent render artifact and silently disable live follow for the new stream.
@@ -6776,7 +6788,23 @@ if(typeof window!=='undefined'){
       // false and behavior is byte-identical.
       const grew=_lastMessageClientHeight!==null&&el.clientHeight>_lastMessageClientHeight+1;
       _lastMessageClientHeight=el.clientHeight;
-      const movedUp=!grew&&_lastScrollTop!==null&&top<_lastScrollTop-2;
+      // Fast-stream shrink-clamp: scrollHeight shrank since the last scroll
+      // event AND there is no recent user scroll input of any kind (wheel,
+      // keyboard, touch, scrollbar drag). The browser clamped scrollTop after
+      // content above the tail re-rendered shorter — NOT a user scroll. Treat
+      // like `grew`: never read it as movedUp. Real user scrolls keep their
+      // 2px trigger because any actual input stamps one of the intent trackers.
+      const shrankNoIntent=typeof _lastMessageScrollHeight!=='undefined'
+        &&_lastScrollTop!==null
+        &&_lastMessageScrollHeight!==null
+        &&el.scrollHeight<_lastMessageScrollHeight-1
+        &&(typeof _scrollbarDragActive==='undefined'||!_scrollbarDragActive)
+        &&typeof _recentMessageTouchScrollIntent==='function'&&!_recentMessageTouchScrollIntent()
+        &&typeof _recentMessageWheelIntent==='function'&&!_recentMessageWheelIntent()
+        &&typeof _recentMessageKeyScrollIntent==='function'&&!_recentMessageKeyScrollIntent()
+        &&typeof _recentNonMessageScrollIntent==='function'&&!_recentNonMessageScrollIntent();
+      if(typeof _lastMessageScrollHeight!=='undefined') _lastMessageScrollHeight=el.scrollHeight;
+      const movedUp=!grew&&!shrankNoIntent&&_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
       // Suppress the post-render scroll artifact: right after renderMessages()
       // rebuilds #msgInner, the browser can emit a non-user upward scroll event.
@@ -6808,6 +6836,7 @@ if(typeof window!=='undefined'){
         _lastScrollTop=top;
         return;
       }
+      const _prevScrollTopForLog=_lastScrollTop;
       _lastScrollTop=top;
       if(movedUp&&bottomDistance>1){
         // Only a real scroll-away unpins. A collapse ABOVE the tail (worklog
@@ -6825,6 +6854,13 @@ if(typeof window!=='undefined'){
         _nearBottomCount=0;
         _scrollPinned=false;
         _messageUserUnpinned=true;
+        // Unpin breadcrumb: if live-follow ever strands with no user scroll,
+        // this line names the culprit event (deltas + which intent was recent).
+        try{
+          if(window._autoScrollFollow&&console&&console.debug){
+            console.debug('[follow] sticky-unpin',{top,lastTop:_prevScrollTopForLog,dTop:top-(_prevScrollTopForLog??top),scrollH:el.scrollHeight,bottomDistance,wheel:_recentMessageWheelIntent(),key:_recentMessageKeyScrollIntent(),touch:_recentMessageTouchScrollIntent(),drag:(typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive)});
+          }
+        }catch(_e){}
       }else if(movedDown&&nearBottom){
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
