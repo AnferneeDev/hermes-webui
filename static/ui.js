@@ -6819,15 +6819,6 @@ if(typeof window!=='undefined'){
       const caughtPrevTail=movedDown
         &&_prevMessageScrollHeightForRepin!==null
         &&(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);
-      // A small upward movement can be either a browser/layout nudge or real
-      // reader input. Aggressive follow may absorb only the former. If the
-      // wheel, keyboard, touch surface, or native scrollbar owns the movement,
-      // release the pin immediately so the next streamed write cannot yank the
-      // viewport back to the bottom and create a visible bottom-edge vibration.
-      const explicitReaderScrollIntent=(typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive)
-        ||(typeof _recentMessageTouchScrollIntent==='function'&&_recentMessageTouchScrollIntent())
-        ||(typeof _recentMessageWheelIntent==='function'&&_recentMessageWheelIntent())
-        ||(typeof _recentMessageKeyScrollIntent==='function'&&_recentMessageKeyScrollIntent());
       // Suppress the post-render scroll artifact: right after renderMessages()
       // rebuilds #msgInner, the browser can emit a non-user upward scroll event.
       // The typeof guards keep this branch inert in unit harnesses that inject

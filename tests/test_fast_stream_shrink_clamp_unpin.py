@@ -110,7 +110,6 @@ const _recentMessageTouchScrollIntent = () => i('touch');
 const _recentNonMessageScrollIntent = () => i('nonMessage');
 const _recentMessageWheelIntent = () => i('wheel');
 const _recentMessageKeyScrollIntent = () => i('key');
-const _scrollbarDragActive = i('drag');
 const step = new Function(
   'el','window','console',
   '_lastScrollTop','_lastMessageClientHeight','_lastMessageScrollHeight',
@@ -119,7 +118,6 @@ const step = new Function(
   '_isSessionEndlessScrollEnabled','_messagesTruncated','_setMessageScrollToBottom',
   '_recentMessageRenderArtifactWindow','_recentMessageTouchScrollIntent',
   '_recentNonMessageScrollIntent','_recentMessageWheelIntent','_recentMessageKeyScrollIntent',
-  '_scrollbarDragActive',
   payload.body + `
 return {_lastScrollTop,_lastMessageClientHeight,_lastMessageScrollHeight,_nearBottomCount,_scrollPinned,_messageUserUnpinned};
 `);
@@ -131,8 +129,7 @@ for (const s of payload.samples) {
     st._nearBottomCount, st._scrollPinned, st._messageUserUnpinned, false,
     noop, noop, noop, () => false, false, noop,
     _recentMessageRenderArtifactWindow, _recentMessageTouchScrollIntent,
-    _recentNonMessageScrollIntent, _recentMessageWheelIntent, _recentMessageKeyScrollIntent,
-    _scrollbarDragActive
+    _recentNonMessageScrollIntent, _recentMessageWheelIntent, _recentMessageKeyScrollIntent
   );
 }
 console.log(JSON.stringify(st));
@@ -225,32 +222,3 @@ def test_downward_scroll_mid_transcript_stays_unpinned():
     ], intents={"wheel": True}, start_unpinned=True)
     assert st["_scrollPinned"] is False
     assert st["_messageUserUnpinned"] is True
-
-
-@pytest.mark.parametrize("intent", ["wheel", "key", "touch", "drag"])
-@_node_tests
-def test_explicit_small_upward_scroll_escapes_aggressive_follow(intent):
-    """A real reader gesture must release the bottom latch immediately.
-
-    The aggressive-follow no-intent guard may absorb a small geometry nudge,
-    but it must not fight wheel, keyboard, touch, or scrollbar-drag input and
-    snap the viewport back to the bottom on the next streamed write.
-    """
-    st = _run_scenario([
-        {"scrollTop": 1500, "scrollHeight": 2000, "clientHeight": 500},
-        # Move only 40px up: still inside the one-viewport escape band.
-        {"scrollTop": 1460, "scrollHeight": 2000, "clientHeight": 500},
-    ], intents={intent: True})
-    assert st["_scrollPinned"] is False
-    assert st["_messageUserUnpinned"] is True
-
-
-@_node_tests
-def test_small_upward_geometry_nudge_without_input_keeps_follow_pin():
-    """Preserve the aggressive-follow guard for non-user geometry movement."""
-    st = _run_scenario([
-        {"scrollTop": 1500, "scrollHeight": 2000, "clientHeight": 500},
-        {"scrollTop": 1460, "scrollHeight": 2000, "clientHeight": 500},
-    ])
-    assert st["_scrollPinned"] is True
-    assert st["_messageUserUnpinned"] is False
