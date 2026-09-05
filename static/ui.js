@@ -6819,6 +6819,15 @@ if(typeof window!=='undefined'){
       const caughtPrevTail=movedDown
         &&_prevMessageScrollHeightForRepin!==null
         &&(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);
+      // A small upward movement can be either a browser/layout nudge or real
+      // reader input. Aggressive follow may absorb only the former. If the
+      // wheel, keyboard, touch surface, or native scrollbar owns the movement,
+      // release the pin immediately so the next streamed write cannot yank the
+      // viewport back to the bottom and create a visible bottom-edge vibration.
+      const explicitReaderScrollIntent=(typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive)
+        ||(typeof _recentMessageTouchScrollIntent==='function'&&_recentMessageTouchScrollIntent())
+        ||(typeof _recentMessageWheelIntent==='function'&&_recentMessageWheelIntent())
+        ||(typeof _recentMessageKeyScrollIntent==='function'&&_recentMessageKeyScrollIntent());
       // Suppress the post-render scroll artifact: right after renderMessages()
       // rebuilds #msgInner, the browser can emit a non-user upward scroll event.
       // The typeof guards keep this branch inert in unit harnesses that inject
@@ -6853,9 +6862,9 @@ if(typeof window!=='undefined'){
       _lastScrollTop=top;
       if(movedUp&&bottomDistance>1){
         // Collapse clamps at the true bottom are not user intent. While
-        // aggressive follow is enabled, only an upward move that carries the
-        // previous tail beyond one viewport escapes the pin.
-        if(typeof window!=='undefined'&&window._autoScrollFollow&&_scrollPinned&&bottomDistance<=el.clientHeight){
+        // aggressive follow is enabled, only explicit reader input or an
+        // upward move beyond one viewport escapes the live-tail pin.
+        if(typeof window!=='undefined'&&window._autoScrollFollow&&_scrollPinned&&bottomDistance<=el.clientHeight&&!explicitReaderScrollIntent){
           _nearBottomCount=0;
         }else{
         _cancelBottomSettle();
