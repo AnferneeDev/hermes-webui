@@ -16806,9 +16806,19 @@ function _abandonMessageScrollSnapshot(){
 function _restorePinnedMessageScrollSnapshot(snapshot){
   const el=$('messages');
   if(!el||!snapshot||snapshot.pinned!==true||snapshot.userUnpinned===true) return false;
+  // Bounce fix (Sep 6 2026): activity-scene rebuilds capture `snapshot.bottom`
+  // (the tail gap) BEFORE the rebuild, then restore the pinned reader AFTER
+  // content has GROWN below. Restoring to maxTop-bottom used the stale
+  // pre-rebuild gap and landed the viewport up to the full growth-delta short
+  // of the tail; the follow writer's snap-to-bottom then landed in a different
+  // paint frame — the reader saw up-then-snap text bounce on every streamed
+  // scene update. A pinned reader follows the live tail by definition, so the
+  // restore target is the POST-rebuild tail (maxTop): idempotent with
+  // _setMessageScrollToBottom(), which runs immediately after. Also removes a
+  // latent pathology: a pathological shrink (stale bottom > new maxTop) used
+  // to clamp the target to scrollTop 0 — a jump to the TOP.
   const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
-  const bottom=Number(snapshot.bottom);
-  const target=Number.isFinite(bottom)?maxTop-Math.max(0,bottom):maxTop;
+  const target=maxTop;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   el.scrollTop=Math.max(0,Math.min(target,maxTop));
   // Sync _lastScrollTop after programmatic restore so sticky-unpin does not false-trigger (#1731).
@@ -17069,7 +17079,6 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   }
   if(!restoredViaAnchor){
     const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
-    const bottom=Number(snapshot.bottom);
     // Mobile/touch viewports have native overflow anchoring to hold an
     // unpinned reader across a rebuild. Desktop deliberately disables that
     // browser behavior, so it must continue into the explicit fallback below.
@@ -17090,8 +17099,14 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
       _nearBottomCount=0;
       return;
     }
-    const target=(snapshot.pinned===true&&Number.isFinite(bottom))
-      ? maxTop-Math.max(0,bottom)
+    // Bounce fix (Sep 6 2026): same post-rebuild tail as
+    // _restorePinnedMessageScrollSnapshot — the pre-rebuild `bottom` gap is
+    // stale once the rebuild grew content, so restoring to maxTop-bottom
+    // landed short of the tail and raced the follow writer's bottom snap
+    // across paint frames (visible up-then-snap bounce mid-stream). A pinned
+    // reader follows the live tail; target the tail exactly.
+    const target=(snapshot.pinned===true)
+      ? maxTop
       : Number(snapshot.top)||0;
     // Streaming stale-snapshot guard (issue #5637). The userUnpinned check above is
     // defeated when a live stream re-pins the state machine (a scrollHeight-collapse
