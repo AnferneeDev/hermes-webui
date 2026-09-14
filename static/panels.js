@@ -12343,9 +12343,8 @@ async function checkUpdatesNow(channelOverride){
         if(manualInstruction) txt+=' · '+manualInstruction;
         if(noGitParts.length) txt+=' · '+t('settings_update_no_git');
         if(status){status.textContent=txt;status.style.color='var(--accent)';}
-        // Also trigger the update banner. Manual checks are user-requested, so
-        // they bypass the weekly automatic notice cap.
-        if(typeof _showUpdateBanner==='function') _showUpdateBanner(data,{force:true});
+        // Also trigger the update banner
+        if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
       } else if(errorParts.length){
         if(status){status.textContent=t('settings_update_check_failed')+': '+errorParts.join(', ');status.style.color='var(--error)';}
       } else if(noGitParts.length){

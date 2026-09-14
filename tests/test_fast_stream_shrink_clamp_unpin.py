@@ -192,6 +192,18 @@ def test_growth_streaming_keeps_pin_baseline():
 
 # ── Fast-stream re-pin race (chasing the tail) ──────────────────────────────
 
+@_node_tests
+@pytest.mark.parametrize("intent", ["wheel", "key", "touch"])
+def test_gentle_upward_scroll_releases_pin_near_tail(intent):
+    """Incremental reader input must not need a full viewport to escape follow."""
+    st = _run_scenario([
+        {"scrollTop": 1500, "scrollHeight": 2000, "clientHeight": 500},
+        {"scrollTop": 1495, "scrollHeight": 2000, "clientHeight": 500},
+    ], intents={intent: True})
+    assert st["_scrollPinned"] is False
+    assert st["_messageUserUnpinned"] is True
+
+
 def test_caught_prev_tail_guard_declared():
     assert "const caughtPrevTail=movedDown" in UI_JS
     assert "(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);" in UI_JS

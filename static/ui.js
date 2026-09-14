@@ -6851,10 +6851,10 @@ if(typeof window!=='undefined'){
       }
       const _prevScrollTopForLog=_lastScrollTop;
       _lastScrollTop=top;
-      if(movedUp&&bottomDistance>1){
-        // Collapse clamps at the true bottom are not user intent. While
-        // aggressive follow is enabled, only explicit reader input or an
-        // upward move beyond one viewport escapes the live-tail pin.
+      if(movedUp&&(bottomDistance>1||explicitReaderScrollIntent)){
+        // Ignore geometry clamps at the true bottom, but let even gentle
+        // explicit reader input release follow. Without explicit input, the
+        // previous tail must leave the viewport before aggressive follow ends.
         if(typeof window!=='undefined'&&window._autoScrollFollow&&_scrollPinned&&bottomDistance<=el.clientHeight&&!explicitReaderScrollIntent){
           _nearBottomCount=0;
         }else{
@@ -6869,7 +6869,6 @@ if(typeof window!=='undefined'){
             console.debug('[follow] sticky-unpin',{top,lastTop:_prevScrollTopForLog,dTop:top-(_prevScrollTopForLog??top),scrollH:el.scrollHeight,bottomDistance,wheel:_recentMessageWheelIntent(),key:_recentMessageKeyScrollIntent(),touch:_recentMessageTouchScrollIntent(),drag:(typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive)});
           }
         }catch(_e){}
-        }
       }else if(movedDown&&(nearBottom||caughtPrevTail)){
         // Catching the PREVIOUS tail is decisive: re-pin immediately (no
         // debounce — at fast stream rates a second qualifying event may never
