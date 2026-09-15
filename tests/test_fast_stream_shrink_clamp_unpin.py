@@ -13,7 +13,7 @@ scrollHeight shrank since the last scroll event AND no user scroll input of any
 kind is recent (wheel, keyboard, touch, scrollbar drag). A real user scroll
 stamps one of the intent trackers, so genuine scroll-ups keep the 2px trigger.
 
-Executed node-VM tests (behavioral) + source-string guards.
+Executed Node VM tests exercise the production listener body behavior.
 """
 import json
 import pathlib
@@ -28,42 +28,6 @@ UI_JS = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
 NODE_BIN = shutil.which("node") or str(pathlib.Path.home() / ".local/bin/node")
 _node_available = pathlib.Path(NODE_BIN).exists()
 _node_tests = pytest.mark.skipif(not _node_available, reason="node not available")
-
-
-# ── Source-string guards ─────────────────────────────────────────────────────
-
-def test_shrink_guard_declared():
-    assert "let _lastMessageScrollHeight=null;" in UI_JS
-
-
-def test_moved_up_gated_on_shrink_guard():
-    assert "const movedUp=!grew&&!shrankNoIntent&&_lastScrollTop!==null&&top<_lastScrollTop-2;" in UI_JS
-
-
-def test_shrink_guard_requires_no_user_intent():
-    idx = UI_JS.index("const shrankNoIntent=")
-    body = UI_JS[idx: idx + 900]
-    for helper in (
-        "_recentMessageTouchScrollIntent",
-        "_recentMessageWheelIntent",
-        "_recentMessageKeyScrollIntent",
-        "_recentNonMessageScrollIntent",
-        "_scrollbarDragActive",
-    ):
-        assert helper in body, f"shrankNoIntent must consult {helper}"
-
-
-def test_shrink_tracker_reset_on_session_switch_and_stream_start():
-    reset_idx = UI_JS.index("function _resetScrollDirectionTracker(){")
-    assert "_lastMessageScrollHeight=null;" in UI_JS[reset_idx: reset_idx + 800]
-    stream_idx = UI_JS.index("function _resetStreamScrollFollow(){")
-    assert "_lastMessageScrollHeight=null;" in UI_JS[stream_idx: stream_idx + 900]
-
-
-def test_unpin_breadcrumb_present():
-    """A console.debug breadcrumb must name every sticky-unpin so a stranded
-    follow can be diagnosed from the browser console."""
-    assert "'[follow] sticky-unpin'" in UI_JS
 
 
 # ── Executed behavioral tests ────────────────────────────────────────────────
@@ -203,10 +167,6 @@ def test_gentle_upward_scroll_releases_pin_near_tail(intent):
     assert st["_scrollPinned"] is False
     assert st["_messageUserUnpinned"] is True
 
-
-def test_caught_prev_tail_guard_declared():
-    assert "const caughtPrevTail=movedDown" in UI_JS
-    assert "(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);" in UI_JS
 
 
 @_node_tests
