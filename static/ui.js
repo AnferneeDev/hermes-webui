@@ -6849,26 +6849,14 @@ if(typeof window!=='undefined'){
         _lastScrollTop=top;
         return;
       }
-      const _prevScrollTopForLog=_lastScrollTop;
       _lastScrollTop=top;
-      if(movedUp&&(bottomDistance>1||explicitReaderScrollIntent)){
-        // Ignore geometry clamps at the true bottom, but let even gentle
-        // explicit reader input release follow. Without explicit input, the
-        // previous tail must leave the viewport before aggressive follow ends.
-        if(typeof window!=='undefined'&&window._autoScrollFollow&&_scrollPinned&&bottomDistance<=el.clientHeight&&!explicitReaderScrollIntent){
-          _nearBottomCount=0;
-        }else{
+      if(movedUp&&bottomDistance>1){
+        // Only a real scroll-away unpins. A true-bottom geometry clamp keeps
+        // bottomDistance <= 1; even gentle reader input leaves that boundary.
         _cancelBottomSettle();
         _nearBottomCount=0;
         _scrollPinned=false;
         _messageUserUnpinned=true;
-        // Unpin breadcrumb: if live-follow ever strands with no user scroll,
-        // this line names the culprit event (deltas + which intent was recent).
-        try{
-          if(typeof window!=='undefined'&&window._autoScrollFollow&&console&&console.debug){
-            console.debug('[follow] sticky-unpin',{top,lastTop:_prevScrollTopForLog,dTop:top-(_prevScrollTopForLog??top),scrollH:el.scrollHeight,bottomDistance,wheel:_recentMessageWheelIntent(),key:_recentMessageKeyScrollIntent(),touch:_recentMessageTouchScrollIntent(),drag:(typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive)});
-          }
-        }catch(_e){}
       }else if(movedDown&&(nearBottom||caughtPrevTail)){
         // Catching the PREVIOUS tail is decisive: re-pin immediately (no
         // debounce — at fast stream rates a second qualifying event may never
