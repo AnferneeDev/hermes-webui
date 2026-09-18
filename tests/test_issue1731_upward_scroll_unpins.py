@@ -115,7 +115,7 @@ def test_wheel_touch_upward_intent_unpins_immediately_inside_messages():
 def test_downward_path_preserves_macos_momentum_hysteresis():
     """Downward motion into the near-bottom zone re-follows with hysteresis (#1360)."""
     block = _scroll_listener_block()
-    assert "elseif(movedDown&&(nearBottom||caughtPrevTail))" in block.replace(" ", ""), (
+    assert "elseif(movedDown&&(nearBottom||caughtInputTail))" in block.replace(" ", ""), (
         "Explicit downward scroll into the near-bottom zone must be the re-follow path "
         "after a sticky manual unpin."
     )

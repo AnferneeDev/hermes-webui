@@ -6387,6 +6387,20 @@ let _messageUserUnpinned=false;
 // A monotonic ownership token lets delayed restores distinguish reader input
 // that happened after a snapshot from input that merely happened recently.
 let _messageScrollInputGeneration=0;
+// Capture the tail geometry at the reader input itself, before the browser
+// applies that wheel/touch/key/drag. A later scroll callback may observe a
+// taller streaming transcript, so event-to-event scrollHeight is not authority
+// for the tail the reader was actually aiming at.
+let _messageScrollInputTailHeight=null;
+let _messageScrollInputTailGeneration=0;
+let _messageScrollInputTailConsumedGeneration=0;
+function _captureMessageScrollInputTail(el){
+  _messageScrollInputGeneration++;
+  _messageScrollInputTailGeneration=_messageScrollInputGeneration;
+  _messageScrollInputTailHeight=el&&Number.isFinite(Number(el.scrollHeight))
+    ? Number(el.scrollHeight)
+    : null;
+}
 let _bottomSettleToken=0;
 let _settleRAF=0;
 let _settleRO=null;
@@ -6477,7 +6491,7 @@ function _recordNonMessageScrollIntent(e){
   const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
   const jumpScrollOwned=typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
-    if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+    if(typeof _captureMessageScrollInputTail==='function') _captureMessageScrollInputTail(el);
     if(jumpScrollOwned||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
     }
@@ -6593,6 +6607,8 @@ function _resetScrollDirectionTracker(){
   _lastScrollTop=null;
   _lastMessageClientHeight=null;
   _lastMessageScrollHeight=null;
+  _messageScrollInputTailHeight=null;
+  _messageScrollInputTailConsumedGeneration=_messageScrollInputTailGeneration;
   _messageUserUnpinned=false;
   _scrollPinned=true;
   _nearBottomCount=0;
@@ -6622,6 +6638,8 @@ function _resetStreamScrollFollow(){
   _nearBottomCount=0;
   _lastScrollTop=null;
   _lastMessageScrollHeight=null;
+  _messageScrollInputTailHeight=null;
+  _messageScrollInputTailConsumedGeneration=_messageScrollInputTailGeneration;
   // #4970 review: clear low-delta wheel intent on fresh stream start too, else a
   // gentle upward wheel within the prior 1200ms can under-suppress a genuine
   // no-intent render artifact and silently disable live follow for the new stream.
@@ -6710,7 +6728,7 @@ if(typeof window!=='undefined'){
     if(e.target===el&&e.offsetX>=el.clientWidth){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       _scrollbarDragActive=true;
-      if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+      if(typeof _captureMessageScrollInputTail==='function') _captureMessageScrollInputTail(el);
     }
   },{passive:true});
   window.addEventListener('pointerup',()=>{
@@ -6758,7 +6776,7 @@ if(typeof window!=='undefined'){
     if(a===el||el.contains(a)||el.matches(':hover')){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       const now=performance.now();
-      if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+      if(typeof _captureMessageScrollInputTail==='function') _captureMessageScrollInputTail(el);
       _lastMessageKeyScrollIntentMs=now;
       const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
       if(bottomDistance>120) _lastMessageScrollIntentMs=now;
@@ -6803,22 +6821,25 @@ if(typeof window!=='undefined'){
         &&typeof _recentMessageWheelIntent==='function'&&!_recentMessageWheelIntent()
         &&typeof _recentMessageKeyScrollIntent==='function'&&!_recentMessageKeyScrollIntent()
         &&typeof _recentNonMessageScrollIntent==='function'&&!_recentNonMessageScrollIntent();
-      const _prevMessageScrollHeightForRepin=(typeof _lastMessageScrollHeight!=='undefined'&&_lastMessageScrollHeight!==null)?_lastMessageScrollHeight:null;
       if(typeof _lastMessageScrollHeight!=='undefined') _lastMessageScrollHeight=el.scrollHeight;
       const movedUp=!grew&&!shrankNoIntent&&_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
-      // Fast-stream re-pin race: while content streams in quickly (200+ tok/s),
-      // the true bottom moves DOWN between the reader's wheel event and this
-      // handler running — bottomDistance measured against the freshly-grown
-      // scrollHeight chronically reads >80px (often >250px), so an unpinned
-      // reader actively chasing the tail can NEVER satisfy the re-pin gates.
-      // Judge arrival against where the tail WAS at the previous scroll event:
-      // if a downward scroll carried the viewport to within 80px of the
-      // previous tail, the reader caught the tail they were aiming at — that
-      // is decisive re-pin intent even though new content already grew below.
-      const caughtPrevTail=movedDown
-        &&_prevMessageScrollHeightForRepin!==null
-        &&(top+el.clientHeight)>=(_prevMessageScrollHeightForRepin-80);
+      // Fast-stream re-pin race: bind the target tail to the actual reader
+      // input, not to the prior scroll callback. Streaming can add arbitrary
+      // height between callbacks; only the wheel/touch/key/drag capture says
+      // which tail the reader was aiming at. Consume each input generation once
+      // so a later programmatic/layout scroll cannot reuse stale authority.
+      const inputTailGeneration=(typeof _messageScrollInputTailGeneration==='number')
+        ?_messageScrollInputTailGeneration:0;
+      const hasUnconsumedInputTail=typeof _messageScrollInputTailConsumedGeneration==='number'
+        &&inputTailGeneration>_messageScrollInputTailConsumedGeneration;
+      const inputTailHeightForRepin=hasUnconsumedInputTail
+        &&typeof _messageScrollInputTailHeight==='number'
+        ?_messageScrollInputTailHeight:null;
+      if(hasUnconsumedInputTail) _messageScrollInputTailConsumedGeneration=inputTailGeneration;
+      const caughtInputTail=movedDown
+        &&inputTailHeightForRepin!==null
+        &&(top+el.clientHeight)>=(inputTailHeightForRepin-80);
       // Suppress the post-render scroll artifact: right after renderMessages()
       // rebuilds #msgInner, the browser can emit a non-user upward scroll event.
       // The typeof guards keep this branch inert in unit harnesses that inject
@@ -6857,12 +6878,12 @@ if(typeof window!=='undefined'){
         _nearBottomCount=0;
         _scrollPinned=false;
         _messageUserUnpinned=true;
-      }else if(movedDown&&(nearBottom||caughtPrevTail)){
-        // Catching the PREVIOUS tail is decisive: re-pin immediately (no
+      }else if(movedDown&&(nearBottom||caughtInputTail)){
+        // Catching the INPUT-CAPTURED tail is decisive: re-pin immediately (no
         // debounce — at fast stream rates a second qualifying event may never
         // come, because each handler run re-measures against a taller
         // transcript) and snap to the true bottom so follow resumes cleanly.
-        if(caughtPrevTail){
+        if(caughtInputTail){
           _nearBottomCount=0;
           _messageUserUnpinned=false;
           _scrollPinned=true;
@@ -7696,12 +7717,6 @@ function scrollIfPinned(){
   }
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
-  // Aggressive follow: while pinned, keep the true tail glued to the viewport
-  // bottom on EVERY streamed write — do not let content expand below the fold
-  // waiting for the debounced settle (at 200+ tok/s the settle chronically
-  // lags a growing transcript). The settle still runs after for late layout
-  // growth (Prism/KaTeX/Mermaid/images).
-  if(_messageBottomDistance()>2) _setMessageScrollToBottom();
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){

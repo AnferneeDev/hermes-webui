@@ -55,6 +55,9 @@ const payload = %s;
 let _lastScrollTop = null;
 let _lastMessageClientHeight = null;
 let _lastMessageScrollHeight = null;
+let _messageScrollInputTailHeight = null;
+let _messageScrollInputTailGeneration = 0;
+let _messageScrollInputTailConsumedGeneration = 0;
 let _nearBottomCount = 0;
 let _scrollPinned = !payload.startUnpinned;
 let _messageUserUnpinned = !!payload.startUnpinned;
@@ -77,19 +80,25 @@ const _recentMessageKeyScrollIntent = () => i('key');
 const step = new Function(
   'el','window','console',
   '_lastScrollTop','_lastMessageClientHeight','_lastMessageScrollHeight',
+  '_messageScrollInputTailHeight','_messageScrollInputTailGeneration','_messageScrollInputTailConsumedGeneration',
   '_nearBottomCount','_scrollPinned','_messageUserUnpinned','_newMessageCueVisible',
   '_cancelBottomSettle','_clearNewMessageScrollCue','_syncScrollToBottomCue',
   '_isSessionEndlessScrollEnabled','_messagesTruncated','_setMessageScrollToBottom',
   '_recentMessageRenderArtifactWindow','_recentMessageTouchScrollIntent',
   '_recentNonMessageScrollIntent','_recentMessageWheelIntent','_recentMessageKeyScrollIntent',
   payload.body + `
-return {_lastScrollTop,_lastMessageClientHeight,_lastMessageScrollHeight,_nearBottomCount,_scrollPinned,_messageUserUnpinned};
+return {_lastScrollTop,_lastMessageClientHeight,_lastMessageScrollHeight,_messageScrollInputTailHeight,_messageScrollInputTailGeneration,_messageScrollInputTailConsumedGeneration,_nearBottomCount,_scrollPinned,_messageUserUnpinned};
 `);
-let st = {_lastScrollTop, _lastMessageClientHeight, _lastMessageScrollHeight, _nearBottomCount, _scrollPinned, _messageUserUnpinned};
+let st = {_lastScrollTop, _lastMessageClientHeight, _lastMessageScrollHeight, _messageScrollInputTailHeight, _messageScrollInputTailGeneration, _messageScrollInputTailConsumedGeneration, _nearBottomCount, _scrollPinned, _messageUserUnpinned};
 for (const s of payload.samples) {
+  if (Object.prototype.hasOwnProperty.call(s, 'inputTailHeight')) {
+    st._messageScrollInputTailGeneration += 1;
+    st._messageScrollInputTailHeight = s.inputTailHeight;
+  }
   st = step(
     s, window, console2,
     st._lastScrollTop, st._lastMessageClientHeight, st._lastMessageScrollHeight,
+    st._messageScrollInputTailHeight, st._messageScrollInputTailGeneration, st._messageScrollInputTailConsumedGeneration,
     st._nearBottomCount, st._scrollPinned, st._messageUserUnpinned, false,
     noop, noop, noop, () => false, false, noop,
     _recentMessageRenderArtifactWindow, _recentMessageTouchScrollIntent,
@@ -179,7 +188,7 @@ def test_chasing_reader_repins_when_catching_previous_tail():
         {"scrollTop": 1000, "scrollHeight": 3000, "clientHeight": 500},
         # Wheels down hard to the then-current bottom (3000-500=2500), but the
         # transcript has ALREADY grown to 3400 → bottomDistance=400 (>250 band).
-        {"scrollTop": 2500, "scrollHeight": 3400, "clientHeight": 500},
+        {"scrollTop": 2500, "scrollHeight": 3400, "clientHeight": 500, "inputTailHeight": 3000},
     ], intents={"wheel": True}, start_unpinned=True)
     assert st["_scrollPinned"] is True
     assert st["_messageUserUnpinned"] is False
@@ -190,7 +199,60 @@ def test_downward_scroll_mid_transcript_stays_unpinned():
     """Scrolling down but landing far above the previous tail must NOT re-pin."""
     st = _run_scenario([
         {"scrollTop": 500, "scrollHeight": 3000, "clientHeight": 500},
-        {"scrollTop": 900, "scrollHeight": 3400, "clientHeight": 500},
+        {"scrollTop": 900, "scrollHeight": 3400, "clientHeight": 500, "inputTailHeight": 3400},
     ], intents={"wheel": True}, start_unpinned=True)
     assert st["_scrollPinned"] is False
     assert st["_messageUserUnpinned"] is True
+
+
+@_node_tests
+def test_stale_previous_callback_height_cannot_repin_reader():
+    """The tail captured at input time outranks a stale callback height."""
+    st = _run_scenario([
+        {"scrollTop": 1620, "scrollHeight": 3000, "clientHeight": 500},
+        {"scrollTop": 2420, "scrollHeight": 4200, "clientHeight": 500, "inputTailHeight": 4200},
+    ], intents={"wheel": True}, start_unpinned=True)
+    assert st["_scrollPinned"] is False
+    assert st["_messageUserUnpinned"] is True
+
+
+@_node_tests
+def test_input_tail_generation_is_consumed_once():
+    """One wheel sample cannot authorize a later unrelated scroll event."""
+    st = _run_scenario([
+        {"scrollTop": 1000, "scrollHeight": 3000, "clientHeight": 500},
+        {"scrollTop": 1200, "scrollHeight": 3400, "clientHeight": 500, "inputTailHeight": 3000},
+        {"scrollTop": 2500, "scrollHeight": 4000, "clientHeight": 500},
+    ], intents={"wheel": True}, start_unpinned=True)
+    assert st["_scrollPinned"] is False
+    assert st["_messageUserUnpinned"] is True
+
+
+@_node_tests
+def test_scroll_if_pinned_delegates_single_initial_write_to_settle():
+    """The hot path must not pre-write before the settle writer runs."""
+    start = UI_JS.index("function scrollIfPinned()")
+    end = UI_JS.index("function scrollToBottom()", start)
+    fn_src = UI_JS[start:end]
+    script = f"""
+let directWrites=0;
+let settleCalls=0;
+let _scrollPinned=true;
+let _messageUserUnpinned=false;
+let _nearBottomCount=0;
+const window={{_autoScrollFollow:true}};
+const _messageBottomDistance=()=>1000;
+const _recentMessageWheelIntent=()=>false;
+const _recentMessageKeyScrollIntent=()=>false;
+const _recentMessageTouchScrollIntent=()=>false;
+const _recentNonMessageScrollIntent=()=>false;
+const _setMessageScrollToBottom=()=>{{directWrites++;}};
+const _settleMessageScrollToBottom=()=>{{settleCalls++;}};
+{fn_src}
+scrollIfPinned();
+console.log(JSON.stringify({{directWrites,settleCalls}}));
+"""
+    result = subprocess.run([NODE_BIN, "-e", script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed == {"directWrites": 0, "settleCalls": 1}
