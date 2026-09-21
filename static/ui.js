@@ -6401,6 +6401,28 @@ function _captureMessageScrollInputTail(el){
     ? Number(el.scrollHeight)
     : null;
 }
+// The input tail is re-pin AUTHORITY, so it must describe input that actually
+// scrolls the transcript. Nested scroll surfaces — tool output panes, code
+// blocks, approval command views — sit inside the transcript but own their own
+// scrolling. Wheel/touch/key input consumed there never moves the transcript,
+// so a capture taken for it would sit unconsumed until a later layout-driven
+// downward transcript scroll consumed it and falsely re-pinned an intentionally
+// unpinned reader (#7494 review: Nested Input Leaves Stale Authority). Walk the
+// target's ancestors: a vertical scroller between the target and the transcript
+// scroller consumes the gesture, so only bare transcript targets capture.
+function _isTranscriptScrollTarget(node,el){
+  if(!node) return false;
+  let n=node;
+  while(n&&n!==el){
+    if(Number(n.scrollHeight)>Number(n.clientHeight)+1){
+      const cs=(typeof getComputedStyle==='function')?getComputedStyle(n):null;
+      const oy=cs?String(cs.overflowY||''):'';
+      if(oy==='auto'||oy==='scroll') return false;
+    }
+    n=n.parentElement;
+  }
+  return n===el;
+}
 let _bottomSettleToken=0;
 let _settleRAF=0;
 let _settleRO=null;
@@ -6491,7 +6513,9 @@ function _recordNonMessageScrollIntent(e){
   const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
   const jumpScrollOwned=typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
-    if(typeof _captureMessageScrollInputTail==='function') _captureMessageScrollInputTail(el);
+    // Nested-pane consumed input must not mint re-pin authority: gate the
+    // capture on the event target actually scrolling the transcript (#7494).
+    if(_isTranscriptScrollTarget(target,el)) _captureMessageScrollInputTail(el);
     if(jumpScrollOwned||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
     }
@@ -6728,6 +6752,8 @@ if(typeof window!=='undefined'){
     if(e.target===el&&e.offsetX>=el.clientWidth){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       _scrollbarDragActive=true;
+      // The scrollbar belongs to the transcript itself: drag input always
+      // targets the transcript scroll surface (#7494).
       if(typeof _captureMessageScrollInputTail==='function') _captureMessageScrollInputTail(el);
     }
   },{passive:true});
@@ -6776,7 +6802,9 @@ if(typeof window!=='undefined'){
     if(a===el||el.contains(a)||el.matches(':hover')){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       const now=performance.now();
-      if(typeof _captureMessageScrollInputTail==='function') _captureMessageScrollInputTail(el);
+      // Nested-pane focus (tool output, code block) consumes scroll keys —
+      // such a keydown must not mint transcript re-pin authority (#7494).
+      if(_isTranscriptScrollTarget(a||t,el)) _captureMessageScrollInputTail(el);
       _lastMessageKeyScrollIntentMs=now;
       const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
       if(bottomDistance>120) _lastMessageScrollIntentMs=now;

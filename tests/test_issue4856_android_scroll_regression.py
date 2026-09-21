@@ -475,6 +475,13 @@ const document = {
   _handler: null,
   addEventListener(type, fn){ if(type === 'keydown') this._handler = fn; },
 };
+// #7494: the keydown capture is gated on the targeting helper; Node has no
+// layout engine, so provide the global and a pass-through gate matching the
+// fake nodes (no nested surfaces in this harness).
+const getComputedStyle = () => ({ overflowY: 'visible' });
+const _isTranscriptScrollTarget = () => true;
+const _captureMessageScrollInputTail = () => {};
+const _cancelBottomSettle = () => {};
 function makeNode({tag='DIV', inMessages=true, interactive=false, editable=false}={}){
   return {
     tagName: tag,
@@ -484,7 +491,8 @@ function makeNode({tag='DIV', inMessages=true, interactive=false, editable=false
   };
 }
 // Run via a closure so the stamped variable lives with the extracted handler.
-const env = Function('el','document','performance', `let _lastMessageKeyScrollIntentMs=-Infinity; ${region}\nreturn {handler:document._handler, get:()=>_lastMessageKeyScrollIntentMs, setActive:(n)=>{document.activeElement=n;}};`)(el, document, performance);
+const env = Function('el','document','performance','_isTranscriptScrollTarget', `let _lastMessageKeyScrollIntentMs=-Infinity; ${region}
+return {handler:document._handler, get:()=>_lastMessageKeyScrollIntentMs, setActive:(n)=>{document.activeElement=n;}};`)(el, document, performance, _isTranscriptScrollTarget);
 const button = makeNode({tag:'BUTTON', interactive:true});
 env.setActive(button);
 env.handler({key:' ', target:button});

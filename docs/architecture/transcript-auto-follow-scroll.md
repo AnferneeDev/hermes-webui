@@ -27,7 +27,10 @@ Three pieces of state own the outcome, all inside `static/ui.js`:
 - `_messageScrollInputGeneration` — a monotonic ownership token bumped by every
   real reader input (wheel, touch, keyboard, scrollbar drag). Delayed restores
   compare their captured generation against it to distinguish "input happened
-  after the snapshot" from "input merely happened recently".
+  after the snapshot" from "input merely happened recently". The wheel/touch
+  bump additionally requires the event to target the transcript scroll surface
+  (see the capture rule below) so input consumed by a nested scroll surface
+  never becomes transcript re-pin authority.
 
 ## Input-tail capture and reader-resume re-pinning (catch-tail contract)
 
@@ -44,7 +47,16 @@ The contract that closes that race:
    browser applies that input, and stamps it with the input generation. Event
    values are the only authority for "the tail the reader was aiming at";
    `scrollHeight` observed later by a scroll callback is not, because streaming
-   can add arbitrary height between the event and the callback.
+   can add arbitrary height between the event and the callback. The capture
+   fires only when the input actually targets the transcript scroll surface:
+   wheel/touch events aimed at a nested scroll surface (tool output pane, code
+   block, approval command view) are consumed by that surface — they never move
+   the transcript — so they must not mint re-pin authority
+   (`_isTranscriptScrollTarget` walks the target's ancestor chain; any vertical
+   scroller between the target and `.messages` consumes the gesture). The
+   transcript's own scrollbar and the focused-pane keyboard path are exempt
+   from the nested check: the scrollbar belongs to `.messages`, and the keydown
+   capture keys off the focused element rather than the event target.
 2. **Consume once.** Each captured input tail authorizes exactly one scroll
    event (`_messageScrollInputTailConsumedGeneration`). A later programmatic or
    layout scroll cannot reuse stale authority — this is what prevents the
@@ -98,5 +110,10 @@ Desktop, narrow/mobile width, and long streaming content per the UI/UX guide:
    during streaming (the overscroll suppression above).
 4. During a live stream, open a jump/queue/compression card that shrinks or
    grows the transcript while pinned: no up-then-snap bounce.
+5. While unpinned mid-stream, wheel inside a nested scrollable pane (tool
+   output, code block, approval command view) and then let the stream grow the
+   transcript: the reader must NOT be yanked back to the tail — input consumed
+   by a nested surface leaves no re-pin authority. Wheeling over a bare
+   transcript message still enables a catch-tail re-pin.
 
 Regression suites: run the files listed at the top with `./scripts/test.sh`.
