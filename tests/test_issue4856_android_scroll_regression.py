@@ -358,7 +358,10 @@ def test_low_delta_wheel_intent_is_tracked_separately():
     assert "function _recentMessageWheelIntent" in UI_JS
     rec_idx = UI_JS.find("function _recordNonMessageScrollIntent")
     assert rec_idx != -1, "_recordNonMessageScrollIntent not found"
-    rec = UI_JS[rec_idx: rec_idx + 2000]
+    # Window spans the whole function body (next top-level helper), not a
+    # fixed byte count — comment/guard additions inside must not break it.
+    rec_end = UI_JS.find("function _recentNonMessageScrollIntent", rec_idx)
+    rec = UI_JS[rec_idx: rec_end if rec_end != -1 else rec_idx + 2000]
     assert "e.deltaY<0) _lastMessageWheelIntentMs=performance.now()" in rec, (
         "#4970: _recordNonMessageScrollIntent must record low-delta upward wheel "
         "intent (deltaY<0) separately from the decisive deltaY<-30 unpin."

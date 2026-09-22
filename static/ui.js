@@ -6409,15 +6409,32 @@ function _captureMessageScrollInputTail(el){
 // downward transcript scroll consumed it and falsely re-pinned an intentionally
 // unpinned reader (#7494 review: Nested Input Leaves Stale Authority). Walk the
 // target's ancestors: a vertical scroller between the target and the transcript
-// scroller consumes the gesture, so only bare transcript targets capture.
-function _isTranscriptScrollTarget(node,el){
+// scroller consumes the gesture, so only bare transcript targets capture —
+// UNLESS that scroller is pinned at the boundary in the gesture's direction and
+// the browser chains the gesture onward to the transcript itself (#7494 review:
+// Boundary Gestures Lose Re-Pinning). A downward gesture (deltaY>0 wheel, or a
+// touchmove whose finger moved UP past the pane's bottom boundary) passes
+// through such a pane and lands on the transcript, so it must retain capture.
+// The transcript scroller's own wheel/touch handler never suppresses chaining,
+// so a gesture that reached it still scrolls it regardless of its own position.
+function _isTranscriptScrollTarget(node,el,dir){
   if(!node) return false;
   let n=node;
   while(n&&n!==el){
     if(Number(n.scrollHeight)>Number(n.clientHeight)+1){
       const cs=(typeof getComputedStyle==='function')?getComputedStyle(n):null;
       const oy=cs?String(cs.overflowY||''):'';
-      if(oy==='auto'||oy==='scroll') return false;
+      if(oy==='auto'||oy==='scroll'){
+        // Direction-aware boundary chaining: the pane consumes the gesture
+        // only when it can actually scroll it (not pinned at the boundary in
+        // the gesture direction, within the same 1px epsilon used above).
+        // Default dir (0/undefined) stays strictly consumed: a keyboard
+        // focus-scroll into a mid-scroll pane chains nothing, and the
+        // capture-suppression contract fails closed.
+        if(!(dir>0
+          ?n.scrollTop>=n.scrollHeight-n.clientHeight-1
+          :dir<0&&n.scrollTop<=1)) return false;
+      }
     }
     n=n.parentElement;
   }
@@ -6513,9 +6530,22 @@ function _recordNonMessageScrollIntent(e){
   const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
   const jumpScrollOwned=typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
+    // Direction of the gesture in transcript coordinates: deltaY>0 = scroll
+    // down toward the tail. For touch, scrolling down = the finger moves UP
+    // (clientY decreases), so dy<0 maps to dir +1; dy>0 is upward intent.
+    let dir=0;
+    if(typeof e.deltaY==='number'&&e.deltaY!==0) dir=e.deltaY>0?1:-1;
+    else if(_touchStartY!==null&&e.touches&&e.touches[0]){
+      const dy=e.touches[0].clientY-_touchStartY;
+      if(dy<-2) dir=1;
+      else if(dy>2) dir=-1;
+    }
     // Nested-pane consumed input must not mint re-pin authority: gate the
     // capture on the event target actually scrolling the transcript (#7494).
-    if(_isTranscriptScrollTarget(target,el)) _captureMessageScrollInputTail(el);
+    // A pane pinned at the gesture's boundary chains the gesture to the
+    // transcript, so it must not swallow the capture (#7494, Boundary
+    // Gestures Lose Re-Pinning).
+    if(_isTranscriptScrollTarget(target,el,dir)) _captureMessageScrollInputTail(el);
     if(jumpScrollOwned||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
     }

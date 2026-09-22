@@ -270,7 +270,7 @@ def _extract_input_handler_body() -> str:
 
 def _extract_gate_helper_source() -> str:
     """Extract the production targeting gate helper source."""
-    start = UI_JS.index("function _isTranscriptScrollTarget(node,el){")
+    start = UI_JS.index("function _isTranscriptScrollTarget(node,el,dir){")
     end = UI_JS.index("\n}", start) + 2
     return UI_JS[start:end]
 
@@ -292,7 +292,12 @@ const nodes = {
   bareTranscript: { inMessages: true, parentElement: null },
   nestedPane: {
     inMessages: true,
-    scrollHeight: 900, clientHeight: 300,
+    scrollHeight: 900, clientHeight: 300, scrollTop: 100,
+    styles: { overflowY: 'auto' },
+  },
+  nestedPaneBottomPinned: {
+    inMessages: true,
+    scrollHeight: 900, clientHeight: 300, scrollTop: 600,
     styles: { overflowY: 'auto' },
   },
   plainMessageBody: { inMessages: true, scrollHeight: 200, clientHeight: 200, parentElement: null },
@@ -334,6 +339,8 @@ const _cancelBottomSettle = () => {};
 // (mirrors the real DOM, where the target chain reaches `el`).
 nodes.bareTranscript.parentElement = el;
 nodes.plainMessageBody.parentElement = el;
+nodes.nestedPane.parentElement = el;
+nodes.nestedPaneBottomPinned.parentElement = el;
 const _markMessageTouchScrollIntent = (active) => { state._messageTouchScrollActive = !!active; };
 const _captureMessageScrollInputTail = (scroller) => {
   state._messageScrollInputGeneration += 1;
@@ -479,7 +486,7 @@ const _freshProgrammaticScrollActive = () => false;
 const _markMessageTouchScrollIntent = noop;
 const nestedPane = {
   inMessages: true,
-  scrollHeight: 900, clientHeight: 300,
+  scrollHeight: 900, clientHeight: 300, scrollTop: 100,
   styles: { overflowY: 'auto' },
 };
 const getComputedStyle = (n) => (n && n.styles) || { overflowY: 'visible' };
@@ -597,8 +604,56 @@ def test_nested_pane_wheel_cannot_repin_reader_via_later_layout_scroll():
 
 
 @_node_tests
+def test_boundary_pinned_pane_wheel_down_still_captures_input_tail():
+    """A wheel-DOWN starting over a nested pane that is ALREADY at its bottom
+    boundary cannot scroll the pane: the browser chains the gesture onward to
+    the transcript, so the capture must survive (#7494 review: Boundary
+    Gestures Lose Re-Pinning). Pre-fix, the gate rejected the event solely for
+    having a scrollable ancestor and the reader lost re-pin authority."""
+    observed = _run_input_handler([
+        {"type": "wheel", "deltaY": 120, "targetName": "nestedPaneBottomPinned"},
+    ])
+    assert observed["tailGeneration"] == 1, observed
+    assert observed["tailHeight"] == 3000, observed
+
+
+@_node_tests
+def test_boundary_pinned_pane_wheel_up_does_not_capture_input_tail():
+    """Same boundary pane, wheel-UP: the pane CAN scroll up, so the gesture is
+    consumed there and must NOT mint transcript re-pin authority."""
+    observed = _run_input_handler([
+        {"type": "wheel", "deltaY": -120, "targetName": "nestedPaneBottomPinned"},
+    ])
+    assert observed["tailGeneration"] == 0, observed
+    assert observed["tailHeight"] is None, observed
+
+
+@_node_tests
+def test_boundary_pinned_pane_touch_down_chains_capture():
+    """Touch direction handling: with the finger below the start position the
+    swipe scrolls content UP-toward-earlier-history (upward transcript intent,
+    dy>0 → dir=-1); with the finger ABOVE the start (dy<0 → dir=+1) it scrolls
+    the transcript DOWN toward the tail. A bottom-pinned pane only chains the
+    dy<0 (downward) gesture — the touch analogue of the wheel case."""
+    chained = _run_input_handler([
+        {"type": "touchmove", "targetName": "nestedPaneBottomPinned",
+         "startY": 400, "clientY": 300},
+    ])
+    assert chained["tailGeneration"] == 1, chained
+    assert chained["tailHeight"] == 3000, chained
+    consumed = _run_input_handler([
+        {"type": "touchmove", "targetName": "nestedPaneBottomPinned",
+         "startY": 300, "clientY": 400},
+    ])
+    assert consumed["tailGeneration"] == 0, consumed
+    assert consumed["tailHeight"] is None, consumed
+
+
+@_node_tests
 def test_gate_helper_rejects_nested_scroller_and_accepts_transcript():
-    """Unit scenarios for the targeting gate helper itself."""
+    """Unit scenarios for the targeting gate helper itself. The strict
+    consumed-by-nested-pane invariant must hold for every dir, including the
+    no-direction default (keyboard path fails closed)."""
     fn_src = _extract_gate_helper_source()
     script = f"""
 // Node has no getComputedStyle; the production helper reads the global.
@@ -616,6 +671,8 @@ const staticLeaf = {{ parentElement: staticBox }};
 const detached = {{}};
 console.log(JSON.stringify({{
   nestedPane: _isTranscriptScrollTarget(leaf, el),
+  nestedPaneDirDown: _isTranscriptScrollTarget(leaf, el, 1),
+  nestedPaneDirUp: _isTranscriptScrollTarget(leaf, el, -1),
   staticBox: _isTranscriptScrollTarget(staticLeaf, el),
   scrollerItself: _isTranscriptScrollTarget(el, el),
   outsideTranscript: _isTranscriptScrollTarget(detached, el),
@@ -627,8 +684,57 @@ console.log(JSON.stringify({{
     observed = json.loads(result.stdout.strip().splitlines()[-1])
     assert observed == {
         "nestedPane": False,
+        "nestedPaneDirDown": False,
+        "nestedPaneDirUp": False,
         "staticBox": True,
         "scrollerItself": True,
         "outsideTranscript": False,
         "null": False,
+    }, observed
+
+
+@_node_tests
+def test_gate_helper_chains_boundary_pinned_pane_by_direction():
+    """A nested pane pinned at the boundary in the gesture's direction cannot
+    consume the gesture — the browser chains it to the transcript, so the
+    capture must survive. The opposite direction still consumes (the pane CAN
+    scroll that way)."""
+    fn_src = _extract_gate_helper_source()
+    script = f"""
+const getComputedStyle = (n) => (n && n.styles) || {{ overflowY: 'visible' }};
+{fn_src}
+const el = {{ id: 'messages' }};
+const mkPane = (scrollTop) => ({{
+  styles: {{ overflowY: 'auto' }}, scrollHeight: 900, clientHeight: 300,
+  scrollTop, parentElement: el,
+}});
+const atBottom = mkPane(600);   // scrollTop 600 = 900-300: bottom-pinned
+const midPane = mkPane(200);    // mid-scroll: consumes both directions
+const atTop = mkPane(0);        // top-pinned
+const leafIn = (pane) => ({{ parentElement: pane }});
+console.log(JSON.stringify({{
+  bottomPinnedWheelDown: _isTranscriptScrollTarget(leafIn(atBottom), el, 1),
+  bottomPinnedWheelUp: _isTranscriptScrollTarget(leafIn(atBottom), el, -1),
+  bottomPinnedNoDir: _isTranscriptScrollTarget(leafIn(atBottom), el),
+  bottomPinnedTouchUp: _isTranscriptScrollTarget(leafIn(atBottom), el, 1),
+  midPaneWheelDown: _isTranscriptScrollTarget(leafIn(midPane), el, 1),
+  midPaneWheelUp: _isTranscriptScrollTarget(leafIn(midPane), el, -1),
+  topPinnedWheelUp: _isTranscriptScrollTarget(leafIn(atTop), el, -1),
+  topPinnedWheelDown: _isTranscriptScrollTarget(leafIn(atTop), el, 1),
+  boundaryEpsilon: _isTranscriptScrollTarget(leafIn(mkPane(599)), el, 1),
+}}));
+"""
+    result = subprocess.run([NODE_BIN, "-e", script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed == {
+        "bottomPinnedWheelDown": True,
+        "bottomPinnedWheelUp": False,
+        "bottomPinnedNoDir": False,
+        "bottomPinnedTouchUp": True,
+        "midPaneWheelDown": False,
+        "midPaneWheelUp": False,
+        "topPinnedWheelUp": True,
+        "topPinnedWheelDown": False,
+        "boundaryEpsilon": True,
     }, observed

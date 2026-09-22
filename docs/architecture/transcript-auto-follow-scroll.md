@@ -53,7 +53,13 @@ The contract that closes that race:
    block, approval command view) are consumed by that surface — they never move
    the transcript — so they must not mint re-pin authority
    (`_isTranscriptScrollTarget` walks the target's ancestor chain; any vertical
-   scroller between the target and `.messages` consumes the gesture). The
+   scroller between the target and `.messages` consumes the gesture). The one
+   exception is boundary chaining: a nested scroller pinned at the boundary in
+   the gesture's direction (deltaY>0 wheel at the pane's bottom edge, or a
+   dy<0 touchmove — finger moving up — there) cannot scroll that pane, so the
+   browser passes the gesture on to the transcript itself and the capture
+   survives. The opposite direction still consumes (the pane can scroll that
+   way), and a no-direction call (the keyboard path) fails closed. The
    transcript's own scrollbar and the focused-pane keyboard path are exempt
    from the nested check: the scrollbar belongs to `.messages`, and the keydown
    capture keys off the focused element rather than the event target.
@@ -115,5 +121,9 @@ Desktop, narrow/mobile width, and long streaming content per the UI/UX guide:
    transcript: the reader must NOT be yanked back to the tail — input consumed
    by a nested surface leaves no re-pin authority. Wheeling over a bare
    transcript message still enables a catch-tail re-pin.
+6. While unpinned mid-stream, wheel DOWN over a nested pane that is already
+   scrolled to its bottom edge during a fast stream: the gesture chains to the
+   transcript, so arriving at the tail you were aiming at still re-pins. Wheel
+   UP over that same bottom-pinned pane (consumed by the pane) must not.
 
 Regression suites: run the files listed at the top with `./scripts/test.sh`.
