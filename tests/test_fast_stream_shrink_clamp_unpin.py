@@ -722,6 +722,8 @@ console.log(JSON.stringify({{
   topPinnedWheelUp: _isTranscriptScrollTarget(leafIn(atTop), el, -1),
   topPinnedWheelDown: _isTranscriptScrollTarget(leafIn(atTop), el, 1),
   boundaryEpsilon: _isTranscriptScrollTarget(leafIn(mkPane(599)), el, 1),
+  containedBottom: (() => {{ const p = mkPane(600); p.styles.overscrollBehaviorY = 'contain'; return _isTranscriptScrollTarget(leafIn(p), el, 1); }})(),
+  noneTop: (() => {{ const p = mkPane(0); p.styles.overscrollBehaviorY = 'none'; return _isTranscriptScrollTarget(leafIn(p), el, -1); }})(),
 }}));
 """
     result = subprocess.run([NODE_BIN, "-e", script], capture_output=True, text=True, timeout=30)
@@ -737,4 +739,6 @@ console.log(JSON.stringify({{
         "topPinnedWheelUp": True,
         "topPinnedWheelDown": False,
         "boundaryEpsilon": True,
+        "containedBottom": False,
+        "noneTop": False,
     }, observed

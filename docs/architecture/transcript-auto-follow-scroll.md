@@ -58,8 +58,10 @@ The contract that closes that race:
    the gesture's direction (deltaY>0 wheel at the pane's bottom edge, or a
    dy<0 touchmove — finger moving up — there) cannot scroll that pane, so the
    browser passes the gesture on to the transcript itself and the capture
-   survives. The opposite direction still consumes (the pane can scroll that
-   way), and a no-direction call (the keyboard path) fails closed. The
+   survives unless the nested pane sets `overscroll-behavior-y: contain` or
+   `none` (both block chaining even at the boundary). The opposite direction
+   still consumes (the pane can scroll that way), and a no-direction call
+   (the keyboard path) fails closed. The
    transcript's own scrollbar and the focused-pane keyboard path are exempt
    from the nested check: the scrollbar belongs to `.messages`, and the keydown
    capture keys off the focused element rather than the event target.

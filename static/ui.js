@@ -6434,6 +6434,10 @@ function _isTranscriptScrollTarget(node,el,dir){
         if(!(dir>0
           ?n.scrollTop>=n.scrollHeight-n.clientHeight-1
           :dir<0&&n.scrollTop<=1)) return false;
+        // A nested pane with its own overscroll boundary does not chain into
+        // .messages even when it cannot scroll farther in this direction.
+        const boundary=cs?String(cs.overscrollBehaviorY||''):'';
+        if(boundary==='contain'||boundary==='none') return false;
       }
     }
     n=n.parentElement;
