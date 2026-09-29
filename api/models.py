@@ -3931,6 +3931,7 @@ def _retry_journal_recovery_in_place(
     session,
     *,
     preserve_arriving_budget: bool = False,
+    _skip_cancel_hooks: bool = False,
 ) -> bool:
     """Re-attempt run-journal recovery for the most recent pending marker.
 
@@ -3969,21 +3970,31 @@ def _retry_journal_recovery_in_place(
             )
             return False
 
+    def fall_through_to_interrupted() -> bool:
+        if _skip_cancel_hooks:
+            return False
+        return _retry_journal_recovery_in_place(
+            session,
+            preserve_arriving_budget=preserve_arriving_budget,
+            _skip_cancel_hooks=True,
+        )
+
     try:
         messages = session.messages or []
-        cancel_candidates = [
+        cancel_candidates = [] if _skip_cancel_hooks else [
             (index, message)
             for index, message in enumerate(messages)
             if _is_cancel_journal_retry_marker(message)
         ]
+        idx = None
+        msg = None
+        cancel_hook = False
         if cancel_candidates:
             # Multiple cancelled turns may remain pending in one transcript.
             # A newer hook that is still owned by a live worker (or by a
             # same-process nonterminal journal) must not starve an older hook
             # whose exact stream is already safe to recover.
             active_stream_ids = _active_stream_ids()
-            idx = None
-            msg = None
             for candidate_idx, candidate in reversed(cancel_candidates):
                 candidate_stream_id = str(
                     candidate.get('_journal_retry_stream_id') or ''
@@ -4013,13 +4024,13 @@ def _retry_journal_recovery_in_place(
                     except Exception:
                         continue
                 idx, msg = candidate_idx, candidate
+                cancel_hook = True
                 break
-            if msg is None:
-                return False
-            cancel_hook = True
-        else:
-            idx = None
-            msg = None
+
+        if msg is None:
+            # Cancellation recovery is opportunistic. A newer cancel hook that
+            # is not selectable must not mask the older interrupted-response
+            # recovery contract.
             cancel_hook = False
             for candidate_idx in range(len(messages) - 1, -1, -1):
                 candidate = messages[candidate_idx]
@@ -4055,12 +4066,12 @@ def _retry_journal_recovery_in_place(
             if not stream_id:
                 # A cancellation hook without its exact run identity cannot
                 # safely select a journal. Keep it intact rather than guessing.
-                return False
+                return fall_through_to_interrupted()
             if str(stream_id) in _active_stream_ids():
                 # Stop detaches the browser stream before the worker finishes.
                 # The durable hook belongs to restart/read-side recovery only
                 # after that old runtime owner has disappeared.
-                return False
+                return fall_through_to_interrupted()
             marker_process_token = str(
                 msg.get('_journal_retry_process_token') or ''
             ).strip()
@@ -4068,7 +4079,7 @@ def _retry_journal_recovery_in_place(
             if not marker_process_token or not owner_token:
                 # Unknown process ownership is not permission to consume an
                 # exact cancellation hook.
-                return False
+                return fall_through_to_interrupted()
             if marker_process_token == _JOURNAL_RECOVERY_PROCESS_TOKEN:
                 # ACTIVE_RUNS has a bounded stale reaper, so its absence inside
                 # the same process does not prove a wedged worker is gone. Only
@@ -4082,17 +4093,17 @@ def _retry_journal_recovery_in_place(
                     if not latest_run_summary(
                         session.session_id, str(stream_id)
                     ).get('terminal'):
-                        return False
+                        return fall_through_to_interrupted()
                 except Exception:
-                    return False
+                    return fall_through_to_interrupted()
             cancel_snapshot = snapshot_cancel_projection()
             if give_up:
                 _strip_journal_retry_meta(msg)
                 save_cancel_projection(cancel_snapshot, "retiring expired cancel journal hook")
-                return False
+                return fall_through_to_interrupted()
             owner_index = _cancel_journal_retry_owner_index(session, idx, msg)
             if owner_index is None:
-                return False
+                return fall_through_to_interrupted()
             recovered_output = _append_journaled_partial_output(
                 session,
                 stream_id,
@@ -4195,6 +4206,8 @@ def _retry_journal_recovery_in_place(
                 getattr(session, 'session_id', '?'),
                 stream_id,
             )
+            if cancel_hook:
+                return fall_through_to_interrupted()
             return False
 
         next_attempts = attempts + 1
@@ -4205,7 +4218,7 @@ def _retry_journal_recovery_in_place(
             else:
                 msg['_journal_retry_attempts'] = next_attempts
             save_cancel_projection(cancel_snapshot, "updating cancel journal retry counter")
-            return False
+            return fall_through_to_interrupted()
 
         if next_attempts >= _JOURNAL_RETRY_MAX_ATTEMPTS:
             msg['content'] = _INTERRUPTED_NEUTRAL_WORDING
