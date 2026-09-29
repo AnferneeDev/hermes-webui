@@ -580,6 +580,115 @@ def test_newer_blocked_cancel_does_not_hide_older_recoverable_hook(new_runtime_a
     assert pending_by_stream[new_stream].get("_pending_journal_recovery") is True
 
 
+@pytest.mark.parametrize(
+    ("newer_state", "expected_new_attempts"),
+    [
+        ("live", 0),
+        ("nonterminal", 0),
+        ("terminal-empty", 1),
+    ],
+)
+def test_newer_cancel_hook_does_not_block_older_interrupted_recovery(
+    newer_state, expected_new_attempts
+):
+    sid = f"cancel-vs-interrupted-{newer_state}"
+    old_stream = f"stream-interrupted-old-{newer_state}"
+    new_stream = f"stream-cancel-new-{newer_state}"
+    old_text = "Older interrupted output is already recoverable."
+    new_owner_token = f"new-owner-{newer_state}"
+
+    old_user = {
+        "role": "user",
+        "content": "Older interrupted prompt.",
+        "timestamp": 10,
+    }
+    old_marker = models._build_recovery_marker_with_retry_hook(
+        recovered_output=False,
+        stream_id=old_stream,
+        pending_started_at=10,
+    )
+    new_user = {
+        "role": "user",
+        "content": "Newer cancelled prompt.",
+        "timestamp": 20,
+        "_active_turn_token": new_owner_token,
+    }
+    new_marker = {
+        "role": "assistant",
+        "content": "Task cancelled.",
+        "_error": True,
+        "timestamp": 21,
+        "_pending_journal_recovery": True,
+        "_journal_retry_kind": "cancelled",
+        "_journal_retry_stream_id": new_stream,
+        "_journal_retry_attempts": 0,
+        "_journal_retry_first_seen_ts": int(time.time()),
+        "_journal_retry_process_token": models._JOURNAL_RECOVERY_PROCESS_TOKEN,
+        "_journal_retry_owner_token": new_owner_token,
+    }
+    session = Session(
+        session_id=sid,
+        title="cancel must not mask interrupted recovery",
+        messages=[
+            copy.deepcopy(old_user),
+            copy.deepcopy(old_marker),
+            copy.deepcopy(new_user),
+            copy.deepcopy(new_marker),
+        ],
+        context_messages=[copy.deepcopy(old_user), copy.deepcopy(new_user)],
+    )
+    session.save()
+
+    RunJournalWriter(sid, old_stream).append_sse_event(
+        "token", {"text": old_text}
+    )
+
+    new_writer = RunJournalWriter(sid, new_stream)
+    if newer_state == "live":
+        config.ACTIVE_RUNS[new_stream] = {
+            "session_id": sid,
+            "backend": "legacy",
+            "phase": "cancelling",
+            "started_at": time.time(),
+        }
+    elif newer_state == "nonterminal":
+        new_writer.append_sse_event(
+            "token", {"text": "Newer cancelled output is still arriving."}
+        )
+    else:
+        new_writer.append_sse_event(
+            "cancel", {"message": "Cancelled by user"}
+        )
+
+    models.SESSIONS.clear()
+    recovered = models.get_session(sid)
+
+    old_rows = [
+        row
+        for row in recovered.messages
+        if isinstance(row, dict)
+        and row.get("_recovered_stream_id") == old_stream
+    ]
+    assert [row.get("content") for row in old_rows] == [old_text]
+
+    recovered_old_marker = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict) and row.get("type") == "interrupted"
+    )
+    assert recovered_old_marker.get("_pending_journal_recovery") is None
+    assert recovered_old_marker.get("_journal_retry_stream_id") is None
+
+    pending_new = next(
+        row
+        for row in recovered.messages
+        if isinstance(row, dict)
+        and row.get("_journal_retry_stream_id") == new_stream
+    )
+    assert pending_new.get("_pending_journal_recovery") is True
+    assert pending_new.get("_journal_retry_attempts") == expected_new_attempts
+
+
 def test_cancel_restart_context_fails_closed_for_ambiguous_duplicate_prompt_and_timestamp():
     sid = "cancel-restart-duplicate-user-owner"
     stream_id = "stream-cancel-restart-duplicate-user-owner"
