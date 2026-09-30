@@ -393,6 +393,44 @@ def test_cancel_restart_failed_recovery_save_keeps_hook_for_next_read(monkeypatc
     assert marker.get("_pending_journal_recovery") is None
 
 
+
+def test_cancel_restart_tool_completion_id_falls_back_only_to_idless_start():
+    sid = "cancel-restart-tool-idless-start"
+    stream_id = "stream-cancel-restart-tool-idless-start"
+
+    _start_cancelled_turn(sid, stream_id)
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event(
+        "tool",
+        {"name": "terminal", "preview": "running", "args": {"command": "printf ok"}},
+    )
+    writer.append_sse_event(
+        "tool_complete",
+        {
+            "name": "terminal",
+            "tid": "gateway-completion-id",
+            "preview": "done",
+            "duration": 0.5,
+            "is_error": False,
+        },
+    )
+    assert cancel_stream(stream_id) is True
+
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    tools = [
+        tool for tool in recovered.tool_calls
+        if isinstance(tool, dict) and tool.get("_recovered_stream_id") == stream_id
+    ]
+    assert len(tools) == 1
+    assert tools[0]["done"] is True
+    assert tools[0]["preview"] == "done"
+    assert tools[0]["duration"] == 0.5
+    assert tools[0]["tid"].startswith("journal-")
+    assert "_journal_synthetic_tid" not in tools[0]
+
+
+
 def test_cancel_restart_tool_recovery_does_not_claim_successor_tool():
     sid = "cancel-restart-tool-owner"
     stream_id = "stream-cancel-restart-tool-owner"

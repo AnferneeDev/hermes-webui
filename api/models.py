@@ -3582,6 +3582,7 @@ def _append_journaled_partial_output(
                     tool_id
                     or f"journal-{event.get('seq') or len(recovered_tool_calls) + 1}"
                 ),
+                '_journal_synthetic_tid': not bool(tool_id),
                 'assistant_msg_idx': anchor_idx,
                 'args': _truncate_journal_tool_args(payload.get('args') or {}),
                 'done': False,
@@ -3601,7 +3602,12 @@ def _append_journaled_partial_output(
                     continue
                 if completion_tool_id:
                     if str(tool_call.get('tid') or '') != completion_tool_id:
-                        continue
+                        if not (
+                            tool_call.get('_journal_synthetic_tid')
+                            and name
+                            and tool_call.get('name') == name
+                        ):
+                            continue
                 elif name and tool_call.get('name') != name:
                     continue
                 tool_call['done'] = True
@@ -3618,6 +3624,8 @@ def _append_journaled_partial_output(
 
     flush_assistant()
     if recovered_tool_calls:
+        for tool_call in recovered_tool_calls:
+            tool_call.pop('_journal_synthetic_tid', None)
         session.tool_calls = list(session.tool_calls or []) + recovered_tool_calls
         appended_any = True
     return appended_any
