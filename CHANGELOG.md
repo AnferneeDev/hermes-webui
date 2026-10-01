@@ -44,6 +44,15 @@
 
 ### Fixed
 
+- **Replayed copies of a saved message no longer pile up in the session file.** When a stream reconnect or
+  re-persist wrote the same stored message again (same `id`, same `timestamp`, identical content), each save
+  appended another copy, so a session could grow without bound (#6568). Saving now drops only those exact
+  duplicates. A row whose content changed, rows without a stable `id`/`timestamp`, and repeated turns with
+  the same text but different ids are all kept. The message count, `.bak` backup and sidebar index row are
+  computed from the same cleaned copy, and a same-session save publishes the file and its sidebar row
+  together so an older overlapping save can't overwrite a newer one. If the duplicate check fails while
+  restoring from a backup, the restore stops and leaves the live file untouched. Thanks @stefanpieter, with
+  a fix from @pxxD1998. (#6569)
 - **Pinned title language is honoured.** `auxiliary.title_generation.language` now pins the language of
   WebUI-generated titles, as it already does in Hermes Agent. The title prompt asks for that language,
   and the drift check that rejects a title in the wrong language (#3293) is retargeted to the pin, so
