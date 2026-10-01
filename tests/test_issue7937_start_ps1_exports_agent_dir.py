@@ -132,27 +132,46 @@ def _discovery_block(source: str) -> str:
 
 
 def test_discovery_candidate_order_matches_server():
-    """Candidate appends must follow api/config.py: HOME → sibling → parent → defaults."""
+    """Candidate appends must follow api/config.py through HOME/hermes-agent."""
     block = _discovery_block(_start_ps1_source())
     appends = [
         m.group(0)
         for m in re.finditer(r"\$candidates\s*\+=\s*[^\n]+", block)
     ]
-    assert len(appends) >= 3, f"expected >=3 candidate appends, got {appends!r}"
+    assert len(appends) >= 4, f"expected >=4 candidate appends, got {appends!r}"
     assert "Join-Path $env:HERMES_HOME 'hermes-agent'" in appends[0]
     assert "Join-Path $repoParent 'hermes-agent'" in appends[1]
-    # Sibling must appear before USERPROFILE / Program Files fallbacks
+    # After sibling/parent: platform-default home, then HOME\hermes-agent
+    platform_idx = next(
+        i
+        for i, a in enumerate(appends)
+        if "Join-Path $platformDefaultHermesHome 'hermes-agent'" in a
+    )
+    home_idx = next(
+        i
+        for i, a in enumerate(appends)
+        if re.search(
+            r"Join-Path\s+\$env:USERPROFILE\s+'hermes-agent'",
+            a,
+        )
+    )
     sibling_idx = next(
         i for i, a in enumerate(appends) if "Join-Path $repoParent 'hermes-agent'" in a
     )
-    userprofile_idx = next(
-        i
-        for i, a in enumerate(appends)
-        if "USERPROFILE" in a and "hermes-agent" in a
+    assert sibling_idx < platform_idx < home_idx, (
+        f"order must be sibling → platform-default → HOME/hermes-agent "
+        f"(sibling@{sibling_idx}, platform@{platform_idx}, home@{home_idx})"
     )
-    assert sibling_idx < userprofile_idx, (
-        f"repo sibling must precede USERPROFILE fallback "
-        f"(sibling@{sibling_idx}, userprofile@{userprofile_idx})"
+    # Must not unconditionally prepend USERPROFILE\.hermes among fallbacks
+    unconditional_legacy = [
+        a
+        for a in appends
+        if "USERPROFILE" in a and ".hermes" in a and "hermes-agent" in a
+    ]
+    assert not unconditional_legacy, (
+        "USERPROFILE/.hermes/hermes-agent must not be appended unconditionally; "
+        "it belongs only inside the #2905 platform-default rule. "
+        f"Found: {unconditional_legacy!r}"
     )
 
 
@@ -170,3 +189,42 @@ def test_discovery_uses_two_pass_run_agent_then_hermes_cli():
     assert "if (-not $AgentDir)" in after_run, (
         "second pass must be gated on AgentDir still being empty after run_agent.py"
     )
+
+
+def test_platform_default_home_uses_localappdata_when_established():
+    """Case 1: custom HERMES_HOME empty + Agents in both legacy and LOCALAPPDATA.
+
+    After sibling/parent, the platform-default candidate must prefer
+    LOCALAPPDATA\\hermes (when established) per api.paths._platform_default_hermes_home,
+    not an unconditional USERPROFILE\\.hermes first among fallbacks. Legacy is
+    only chosen when it still holds WebUI state and the new location does not.
+    """
+    source = _start_ps1_source()
+    assert "$platformDefaultHermesHome = Join-Path $env:LOCALAPPDATA 'hermes'" in source
+    assert "$legacyHermesHome = Join-Path $env:USERPROFILE '.hermes'" in source
+    assert "if (-not $newHasWebuiState -and $legacyHasWebuiState)" in source
+    assert "$platformDefaultHermesHome = $legacyHermesHome" in source
+    block = _discovery_block(source)
+    assert "Join-Path $platformDefaultHermesHome 'hermes-agent'" in block
+    # Unconditional legacy append must be gone from the discovery block
+    assert "Join-Path $env:USERPROFILE '.hermes\\hermes-agent'" not in block
+
+
+def test_home_hermes_agent_precedes_program_files_roots():
+    """Case 2: HOME/hermes-agent must beat launcher-only Program Files roots.
+
+    Server candidate #6 is HOME/hermes-agent; Program Files is launcher-only
+    and must be searched last so it cannot preempt a HOME install the server
+    would have used.
+    """
+    block = _discovery_block(_start_ps1_source())
+    home_pos = block.index("Join-Path $env:USERPROFILE 'hermes-agent'")
+    # ${env:ProgramFiles(x86)} nests parens, so match on ProgramW6432 marker.
+    pf_pos = block.index("${env:ProgramW6432}")
+    assert home_pos < pf_pos, (
+        "HOME/hermes-agent must be appended before Program Files roots "
+        f"(home@{home_pos}, pf@{pf_pos})"
+    )
+    # LOCALAPPDATA must not ride along in the Program Files loop anymore
+    assert "@($env:LOCALAPPDATA," not in block
+    assert "$env:LOCALAPPDATA, ${env:ProgramW6432}" not in block

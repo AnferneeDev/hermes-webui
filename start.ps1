@@ -90,20 +90,38 @@ if (-not $Python) {
     exit 1
 }
 
-# === Resolve HERMES_HOME default before agent discovery ================
+# === Resolve platform-default Hermes home before agent discovery =======
 # api/config.py's _discover_agent_dir prefers $HERMES_HOME\hermes-agent
-# after the explicit HERMES_WEBUI_AGENT_DIR override. On Windows the Agent's
-# own default HERMES_HOME is %LOCALAPPDATA%\hermes. Resolving that default
-# here — before we build the candidate list — keeps start.ps1's search
-# order aligned with the server so exporting the discovery result cannot
-# silently prefer a stale %USERPROFILE%\.hermes install over the current
-# %LOCALAPPDATA%\hermes one. Leave an already-set HERMES_HOME alone.
-if (-not $env:HERMES_HOME) {
-    if ($env:LOCALAPPDATA) {
-        $env:HERMES_HOME = Join-Path $env:LOCALAPPDATA 'hermes'
-    } else {
-        $env:HERMES_HOME = Join-Path $env:USERPROFILE '.hermes'
+# after the explicit HERMES_WEBUI_AGENT_DIR override, then later falls back
+# to `_DEFAULT_HERMES_HOME\hermes-agent` from
+# api.paths._platform_default_hermes_home(). Mirror that #2905 rule here:
+# %LOCALAPPDATA%\hermes once established; %USERPROFILE%\.hermes only when
+# the legacy home still holds WebUI state and the new location does not.
+# Resolving before the candidate list keeps the exported discovery result
+# aligned with the server. Leave an already-set HERMES_HOME alone.
+if ($env:LOCALAPPDATA) {
+    $platformDefaultHermesHome = Join-Path $env:LOCALAPPDATA 'hermes'
+    $legacyHermesHome = Join-Path $env:USERPROFILE '.hermes'
+    if ($legacyHermesHome -ne $platformDefaultHermesHome) {
+        $newHasWebuiState = $false
+        $legacyHasWebuiState = $false
+        foreach ($rel in @('webui\sessions', 'webui\settings.json', 'webui')) {
+            if (-not $newHasWebuiState -and (Test-Path (Join-Path $platformDefaultHermesHome $rel))) {
+                $newHasWebuiState = $true
+            }
+            if (-not $legacyHasWebuiState -and (Test-Path (Join-Path $legacyHermesHome $rel))) {
+                $legacyHasWebuiState = $true
+            }
+        }
+        if (-not $newHasWebuiState -and $legacyHasWebuiState) {
+            $platformDefaultHermesHome = $legacyHermesHome
+        }
     }
+} else {
+    $platformDefaultHermesHome = Join-Path $env:USERPROFILE '.hermes'
+}
+if (-not $env:HERMES_HOME) {
+    $env:HERMES_HOME = $platformDefaultHermesHome
 }
 
 # === Find Hermes Agent dir (server.py imports from it) =================
@@ -120,7 +138,8 @@ if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType 
 if (-not $AgentDir) {
     # Mirror api/config.py `_discover_agent_dir` candidate order exactly:
     # HERMES_HOME\hermes-agent → repo sibling → parent (when it looks like an
-    # agent root) → platform defaults / Program Files. Build incrementally —
+    # agent root) → _DEFAULT_HERMES_HOME\hermes-agent → HOME\hermes-agent →
+    # launcher-only Program Files roots last. Build incrementally —
     # ${env:ProgramFiles(x86)} is null on 32-bit Windows and in some constrained
     # environments, and Join-Path throws on a null Path. Skip any system-wide
     # root that isn't set so the launcher stays robust across Windows variants.
@@ -134,8 +153,12 @@ if (-not $AgentDir) {
         (Test-Path (Join-Path $repoParent 'hermes_cli') -PathType Container)) {
         $candidates += $repoParent
     }
-    $candidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
-    foreach ($root in @($env:LOCALAPPDATA, ${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+    # 5. Platform-default home\hermes-agent (api.paths._platform_default_hermes_home)
+    $candidates += (Join-Path $platformDefaultHermesHome 'hermes-agent')
+    # 6. HOME\hermes-agent (Path.home() → %USERPROFILE% on Windows)
+    $candidates += (Join-Path $env:USERPROFILE 'hermes-agent')
+    # Launcher-only Program Files roots last (server uses XDG /opt /usr/local on POSIX)
+    foreach ($root in @(${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
         if ($root) { $candidates += (Join-Path $root 'hermes\hermes-agent') }
     }
     # De-dup: when running in a WOW64 (32-bit-on-64-bit) PowerShell process,
