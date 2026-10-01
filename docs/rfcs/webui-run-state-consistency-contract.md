@@ -92,7 +92,12 @@ writer cannot survive the interpreter restart.
 
 Recovery is owned by the marker's exact stream and exact active-turn token.
 Stop stamps that token onto the owning display user row and the exact matching
-provider-context user row before the hook becomes durable. Rows reconstructed
+provider-context user row before the hook becomes durable. Cancelled owners
+are provisional (`_recovered: true`), so Stop without an answer does not send
+that prompt to the provider on the next turn. Exact-owner context recovery
+clears the provisional flag only after model-visible assistant output is
+recovered; display-only thinking and errors do not promote the owner. The
+visible cancelled prompt remains in the transcript. Rows reconstructed
 after a restart are placed before that cancellation marker and before any
 persisted successor turn. Provider-context projection is inserted only after a
 unique matching token; compression that removed the owner fails closed for

@@ -114,6 +114,85 @@ def _simulate_restart() -> None:
     config.SESSION_AGENT_LOCKS.clear()
 
 
+@pytest.mark.parametrize("previous_exchange", [False, True])
+@pytest.mark.parametrize("context_owner", ["absent", "tokenless", "exact", "missing-context"])
+def test_stop_empty_journal_next_send_omits_unanswered_prompt(previous_exchange, context_owner):
+    from api.streaming import _sanitize_messages_for_agent, build_active_turn_token
+
+    sid = "stop-empty-journal-history"
+    stream_id = "stream-stop-empty-journal-history"
+    session = _start_cancelled_turn(sid, stream_id)
+    previous = [
+        {"role": "user", "content": "Earlier question", "timestamp": 1},
+        {"role": "assistant", "content": "Earlier answer", "timestamp": 2},
+    ] if previous_exchange else []
+    session.messages = copy.deepcopy(previous)
+    session.context_messages = copy.deepcopy(previous)
+    if context_owner in {"tokenless", "exact"}:
+        owner = {"role": "user", "content": session.pending_user_message, "timestamp": 10}
+        models.stamp_message_source(owner, "webui")
+        if context_owner == "exact":
+            owner["_active_turn_token"] = build_active_turn_token(stream_id, 10)
+        session.messages.append(copy.deepcopy(owner))
+        session.context_messages.append(copy.deepcopy(owner))
+    elif context_owner == "missing-context":
+        session.context_messages = None
+    session.save()
+
+    assert cancel_stream(stream_id) is True
+    # Real Stop, a cold sidecar read, then the same history boundaries used by
+    # the next send. No journal assistant output exists to answer this prompt.
+    _simulate_restart()
+    stopped = models.get_session(sid)
+    history = _sanitize_messages_for_agent(
+        models.reconciled_state_db_messages_for_session(
+            stopped, prefer_context=True, state_messages=[],
+        )
+    )
+    next_send = history + [{"role": "user", "content": "Next request"}]
+    assert [(row["role"], row["content"]) for row in next_send] == [
+        *((row["role"], row["content"]) for row in previous),
+        ("user", "Next request"),
+    ]
+    assert any(row.get("content") == "Do the cancellable task." for row in stopped.messages)
+
+
+@pytest.mark.parametrize("previous_exchange", [False, True])
+@pytest.mark.parametrize("journal_output", ["token", "reasoning"])
+def test_stop_journal_owner_promotes_only_after_model_visible_answer(previous_exchange, journal_output):
+    from api.streaming import _sanitize_messages_for_agent
+
+    sid = "stop-journal-answer-history"
+    stream_id = "stream-stop-journal-answer-history"
+    session = _start_cancelled_turn(sid, stream_id)
+    previous = [
+        {"role": "user", "content": "Earlier question", "timestamp": 1},
+        {"role": "assistant", "content": "Earlier answer", "timestamp": 2},
+    ] if previous_exchange else []
+    session.messages = copy.deepcopy(previous)
+    session.context_messages = copy.deepcopy(previous)
+    session.save()
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event(journal_output, {"text": "Recovered answer"})
+    assert cancel_stream(stream_id) is True
+    provisional = Session.load(sid)
+    owner = next(row for row in provisional.context_messages if row.get("role") == "user" and row.get("content") == "Do the cancellable task.")
+    assert owner.get("_recovered") is True
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    owner = next(row for row in recovered.context_messages if row.get("role") == "user" and row.get("content") == "Do the cancellable task.")
+    history = _sanitize_messages_for_agent(
+        models.reconciled_state_db_messages_for_session(recovered, prefer_context=True, state_messages=[])
+    )
+    expected = [(row["role"], row["content"]) for row in previous]
+    if journal_output == "token":
+        assert not owner.get("_recovered")
+        expected += [("user", "Do the cancellable task."), ("assistant", "Recovered answer")]
+    else:
+        assert owner.get("_recovered") is True
+    assert [(row["role"], row["content"]) for row in history] == expected
+
+
 def test_cancel_retry_metadata_stays_server_private():
     sid = "cancel-restart-public-scrub"
     stream_id = "stream-cancel-restart-public-scrub"

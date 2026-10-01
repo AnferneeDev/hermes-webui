@@ -3985,6 +3985,18 @@ def _rehome_cancel_journal_context(
         return
     owner_position = owner_positions[0]
 
+    if any(row.get('role') == 'assistant' for row in recovered):
+        # Only model-visible assistant output promotes the provisional owner.
+        # Display-only reasoning and terminal errors do not answer the prompt.
+        remaining[owner_position].pop('_recovered', None)
+        for row in messages:
+            if (
+                isinstance(row, dict)
+                and row.get('role') == 'user'
+                and str(row.get('_active_turn_token') or '').strip() == owner_token
+            ):
+                row.pop('_recovered', None)
+
     insert_at = len(remaining)
     for index in range(owner_position + 1, len(remaining)):
         if isinstance(remaining[index], dict) and remaining[index].get('role') == 'user':

@@ -15580,6 +15580,10 @@ def cancel_stream(stream_id: str) -> bool:
                             # compression because the two lists may have different
                             # user-row counts.
                             _cancel_owner = _msgs_for_recovery[_cancel_turn_start]
+                            # Provisional recovery boundary, not a queued request.
+                            # Exact journal output must answer this owner before
+                            # the next-send history can include it.
+                            _cancel_owner['_recovered'] = True
                             if _cancel_turn_token:
                                 stamp_message_source(
                                     _cancel_owner,
@@ -15612,6 +15616,8 @@ def cancel_stream(stream_id: str) -> bool:
                                         and _row.get('_active_turn_token') == _cancel_turn_token
                                     )
                                 ]
+                                for _context_owner in _token_matches:
+                                    _context_owner['_recovered'] = True
                                 if not _token_matches:
                                     _strict_matches = [
                                         _row
@@ -15641,6 +15647,7 @@ def cancel_stream(stream_id: str) -> bool:
                                             _pending_source,
                                             active_turn_token=_cancel_turn_token,
                                         )
+                                        _tail['_recovered'] = True
                                     elif not _strict_matches:
                                         # The current pending user is absent from
                                         # provider context. Append the exact
