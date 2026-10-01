@@ -120,3 +120,53 @@ def test_hermes_home_agent_candidate_is_listed_first():
         f"found earlier append at offset {earlier.start()} vs HERMES_HOME at "
         f"{first_append.start()}"
     )
+
+
+def _discovery_block(source: str) -> str:
+    """Auto-discovery block between empty-AgentDir check and the export."""
+    block_start = source.index("if (-not $AgentDir)")
+    block_end = source.index(
+        "[Environment]::SetEnvironmentVariable('HERMES_WEBUI_AGENT_DIR'"
+    )
+    return source[block_start:block_end]
+
+
+def test_discovery_candidate_order_matches_server():
+    """Candidate appends must follow api/config.py: HOME → sibling → parent → defaults."""
+    block = _discovery_block(_start_ps1_source())
+    appends = [
+        m.group(0)
+        for m in re.finditer(r"\$candidates\s*\+=\s*[^\n]+", block)
+    ]
+    assert len(appends) >= 3, f"expected >=3 candidate appends, got {appends!r}"
+    assert "Join-Path $env:HERMES_HOME 'hermes-agent'" in appends[0]
+    assert "Join-Path $repoParent 'hermes-agent'" in appends[1]
+    # Sibling must appear before USERPROFILE / Program Files fallbacks
+    sibling_idx = next(
+        i for i, a in enumerate(appends) if "Join-Path $repoParent 'hermes-agent'" in a
+    )
+    userprofile_idx = next(
+        i
+        for i, a in enumerate(appends)
+        if "USERPROFILE" in a and "hermes-agent" in a
+    )
+    assert sibling_idx < userprofile_idx, (
+        f"repo sibling must precede USERPROFILE fallback "
+        f"(sibling@{sibling_idx}, userprofile@{userprofile_idx})"
+    )
+
+
+def test_discovery_uses_two_pass_run_agent_then_hermes_cli():
+    """First pass prefers run_agent.py; only then accept hermes_cli (pip-style)."""
+    block = _discovery_block(_start_ps1_source())
+    run_agent = block.index("run_agent.py")
+    hermes_cli_pass = block.index(
+        "Test-Path (Join-Path $c 'hermes_cli') -PathType Container"
+    )
+    assert run_agent < hermes_cli_pass, (
+        "run_agent.py pass must precede the hermes_cli pass so source checkouts win"
+    )
+    after_run = block[run_agent:]
+    assert "if (-not $AgentDir)" in after_run, (
+        "second pass must be gated on AgentDir still being empty after run_agent.py"
+    )

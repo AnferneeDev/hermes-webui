@@ -118,20 +118,26 @@ if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType 
     exit 1
 }
 if (-not $AgentDir) {
-    # Build candidate list incrementally — ${env:ProgramFiles(x86)} is null on
-    # 32-bit Windows and in some constrained environments, and Join-Path throws
-    # on a null Path. Skip any system-wide root that isn't set so the launcher
-    # stays robust across Windows variants. First candidate mirrors
-    # api/config.py: $HERMES_HOME\hermes-agent (HERMES_HOME defaulted above).
-    # USERPROFILE / LOCALAPPDATA / Program Files remain as fallbacks; the
-    # dev-checkout sibling is path-derived, not env-based.
+    # Mirror api/config.py `_discover_agent_dir` candidate order exactly:
+    # HERMES_HOME\hermes-agent → repo sibling → parent (when it looks like an
+    # agent root) → platform defaults / Program Files. Build incrementally —
+    # ${env:ProgramFiles(x86)} is null on 32-bit Windows and in some constrained
+    # environments, and Join-Path throws on a null Path. Skip any system-wide
+    # root that isn't set so the launcher stays robust across Windows variants.
     $candidates = @()
     $candidates += (Join-Path $env:HERMES_HOME 'hermes-agent')
+    $repoParent = Split-Path -Parent $RepoRoot
+    $candidates += (Join-Path $repoParent 'hermes-agent')
+    # Parent-is-agent: repo cloned inside hermes-agent/ (same gate as
+    # api/config.py's `_looks_like_agent_source_root` on REPO_ROOT.parent).
+    if ((Test-Path (Join-Path $repoParent 'run_agent.py') -PathType Leaf) -or
+        (Test-Path (Join-Path $repoParent 'hermes_cli') -PathType Container)) {
+        $candidates += $repoParent
+    }
     $candidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
     foreach ($root in @($env:LOCALAPPDATA, ${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
         if ($root) { $candidates += (Join-Path $root 'hermes\hermes-agent') }
     }
-    $candidates += (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent')
     # De-dup: when running in a WOW64 (32-bit-on-64-bit) PowerShell process,
     # $env:ProgramFiles is redirected to C:\Program Files (x86), so without
     # $env:ProgramW6432 (the canonical 64-bit override) we'd miss the real
@@ -139,8 +145,16 @@ if (-not $AgentDir) {
     # Select-Object -Unique collapses any collisions regardless of cause
     # (including HERMES_HOME coinciding with LOCALAPPDATA\hermes).
     $candidates = $candidates | Select-Object -Unique
+    # Two-pass root preference, matching api/config.py: source checkouts
+    # (run_agent.py) win over pip-style roots (hermes_cli) so a home install
+    # cannot preempt a sibling source checkout.
     foreach ($c in $candidates) {
-        if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
+        if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf) { $AgentDir = $c; break }
+    }
+    if (-not $AgentDir) {
+        foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
+        }
     }
 }
 if (-not $AgentDir) {
