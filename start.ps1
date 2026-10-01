@@ -129,6 +129,21 @@ if (-not $AgentDir) {
     exit 1
 }
 
+# === Export the discovered agent dir to the child process ===============
+# server.py calls activate_managed_agent() (managed_agent_startup.py) as its
+# first Agent-related import, and that hook keys off HERMES_WEBUI_AGENT_DIR
+# ONLY - it is what puts the Agent's dependency environment on sys.path.
+# Without this export the value discovered above stays a PowerShell variable,
+# activation silently no-ops, and the very next Agent import dies with
+# ModuleNotFoundError on a dependency the managed environment already
+# provides. api/config.py's own discovery fallback runs too late to help: it
+# is imported after activate_managed_agent() has already returned.
+# bootstrap.py does the equivalent at os.environ["HERMES_WEBUI_AGENT_DIR"];
+# start.ps1 bypasses bootstrap.py, so it owns this export.
+# The two-argument SetEnvironmentVariable form sets the variable for this
+# process and its children, matching how this script already loads .env.
+[Environment]::SetEnvironmentVariable('HERMES_WEBUI_AGENT_DIR', $AgentDir)
+
 # === Prefer the agent's venv Python if available =======================
 $agentVenvPython = Join-Path $AgentDir 'venv\Scripts\python.exe'
 if (Test-Path $agentVenvPython) {
