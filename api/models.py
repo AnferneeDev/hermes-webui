@@ -3290,7 +3290,6 @@ def _append_journaled_partial_output(
     dedupe_existing: bool = False,
     dedupe_min_index: int | None = None,
     dedupe_max_index: int | None = None,
-    mark_partial: bool = False,
     append_context: bool = True,
 ) -> bool:
     """Recover already-emitted visible output from a dead stream journal.
@@ -3461,8 +3460,6 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
-        if mark_partial:
-            recovered_assistant['_partial'] = True
         attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
         append_context_projection(recovered_assistant)
@@ -3511,8 +3508,6 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
-        if mark_partial:
-            recovered_anchor['_partial'] = True
         session.messages.append(recovered_anchor)
         current_assistant_idx = len(session.messages) - 1
         appended_any = True
@@ -3597,19 +3592,26 @@ def _append_journaled_partial_output(
             completion_tool_id = str(
                 payload.get('tid') or payload.get('tool_call_id') or ''
             ).strip()
-            for tool_call in reversed(recovered_tool_calls):
-                if tool_call.get('done'):
-                    continue
-                if completion_tool_id:
-                    if str(tool_call.get('tid') or '') != completion_tool_id:
-                        if not (
-                            tool_call.get('_journal_synthetic_tid')
-                            and name
-                            and tool_call.get('name') == name
-                        ):
-                            continue
-                elif name and tool_call.get('name') != name:
-                    continue
+            unfinished = [call for call in reversed(recovered_tool_calls) if not call.get('done')]
+            matched_tool = None
+            if completion_tool_id:
+                matched_tool = next((
+                    call for call in unfinished
+                    if str(call.get('tid') or '') == completion_tool_id
+                ), None)
+                if matched_tool is None:
+                    matched_tool = next((
+                        call for call in unfinished
+                        if call.get('_journal_synthetic_tid')
+                        and name and call.get('name') == name
+                    ), None)
+            else:
+                matched_tool = next((
+                    call for call in unfinished
+                    if not name or call.get('name') == name
+                ), None)
+            if matched_tool is not None:
+                tool_call = matched_tool
                 tool_call['done'] = True
                 if payload.get('preview'):
                     tool_call['preview'] = str(payload.get('preview') or '')
@@ -3617,7 +3619,6 @@ def _append_journaled_partial_output(
                 if payload.get('duration') is not None:
                     tool_call['duration'] = payload.get('duration')
                 tool_call['is_error'] = bool(payload.get('is_error', False))
-                break
             continue
         if event_name in {'done', 'stream_end', 'cancel', 'apperror', 'error'}:
             flush_assistant()
@@ -4118,7 +4119,6 @@ def _retry_journal_recovery_in_place(
                 dedupe_existing=True,
                 dedupe_min_index=owner_index + 1,
                 dedupe_max_index=idx,
-                mark_partial=True,
                 append_context=False,
             )
             terminal_error_recovered = False
@@ -12055,7 +12055,9 @@ def _sidecar_has_terminal_partial_error(sidecar_messages: list) -> bool:
             segment_start = idx + 1
             break
     for msg in messages[segment_start:latest_error_idx]:
-        if str(msg.get("role") or "").lower() == "assistant" and msg.get("_partial"):
+        if str(msg.get("role") or "").lower() == "assistant" and (
+            msg.get("_partial") or msg.get("_recovered_from_run_journal")
+        ):
             return True
     return False
 

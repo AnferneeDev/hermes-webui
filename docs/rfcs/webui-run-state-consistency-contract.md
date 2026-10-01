@@ -102,6 +102,14 @@ evidence. The hook is retired only in the same successful session save that
 commits the recovered projection; a failed save restores the in-memory hook for
 a later retry.
 
+Journal-recovered segments retain `_recovered_from_run_journal` provenance,
+without the live `_partial` snapshot marker: distinct equal-text segments and
+their tool owner indexes must survive cold loading unchanged. Cancelled-sidecar
+display ownership recognizes that provenance before an error carrier. Tool
+completion searches all unfinished exact IDs before falling back to the latest
+same-name start that originally had no ID; an ID-bearing start is never a
+name-only fallback for another completion ID.
+
 ## Inactive compression continuation recovery
 
 The Agent profile's SQLite compression lineage owns the canonical continuation,

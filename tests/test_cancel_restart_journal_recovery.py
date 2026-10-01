@@ -1082,3 +1082,54 @@ def test_cancel_restart_context_uses_exact_owner_token_after_compression():
         if isinstance(row, dict) and row.get("content") == "Successor prompt 0."
     )
     assert owner_index < recovered_index < successor_index
+
+
+@pytest.mark.parametrize("completion_key", ["tid", "tool_call_id"])
+def test_overlapping_tool_completion_prefers_exact_id_before_idless_fallback(completion_key):
+    sid = "cancel-overlap-exact-id"
+    stream_id = "stream-cancel-overlap-exact-id"
+    _start_cancelled_turn(sid, stream_id)
+    writer = RunJournalWriter(sid, stream_id)
+    writer.append_sse_event("tool", {"name": "terminal", "tid": "A", "preview": "start A"})
+    writer.append_sse_event("tool", {"name": "terminal", "preview": "start B"})
+    writer.append_sse_event("tool_complete", {"name": "terminal", completion_key: "A", "preview": "done A"})
+    writer.append_sse_event("tool_complete", {"name": "terminal", completion_key: "B", "preview": "done B"})
+    assert cancel_stream(stream_id)
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    tools = recovered.tool_calls
+    assert [(tool["tid"], tool["preview"], tool["done"]) for tool in tools] == [
+        ("A", "done A", True), ("journal-2", "done B", True),
+    ]
+    assert all("_journal_synthetic_tid" not in tool for tool in tools)
+
+
+def test_recovered_equal_segments_and_tool_owners_survive_cold_load():
+    sid = "cancel-equal-segments-cold-load"
+    stream_id = "stream-cancel-equal-segments-cold-load"
+    _start_cancelled_turn(sid, stream_id)
+    writer = RunJournalWriter(sid, stream_id)
+    for tid in ("A", "B"):
+        writer.append_sse_event("token", {"text": "Checking…"})
+        writer.append_sse_event("tool", {"name": "terminal", "tid": tid})
+        writer.append_sse_event("tool_complete", {"name": "terminal", "tid": tid, "preview": f"done {tid}"})
+    assert cancel_stream(stream_id)
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    before_messages = copy.deepcopy(recovered.messages)
+    before_tools = copy.deepcopy(recovered.tool_calls)
+    models.SESSIONS.clear()
+    cold = models.get_session(sid)
+    rows = [row for row in cold.messages if row.get("_recovered_stream_id") == stream_id]
+    assert len(rows) == 2
+    assert all(row["content"] == "Checking…" and not row.get("_partial") for row in rows)
+    assert cold.messages == before_messages
+    assert cold.tool_calls == before_tools
+    assert models._sidecar_has_terminal_partial_error(cold.messages)
+    assert not models._sidecar_has_terminal_partial_error(rows)
+    owner_indexes = [tool["assistant_msg_idx"] for tool in cold.tool_calls]
+    assert len(set(owner_indexes)) == 2
+    for index in owner_indexes:
+        assert cold.messages[index]["_recovered_stream_id"] == stream_id
+        assert cold.messages[index]["content"] == "Checking…"
+    assert not _cancel_marker(cold)[1].get("_pending_journal_recovery")
