@@ -115,6 +115,104 @@ def _simulate_restart() -> None:
 
 
 @pytest.mark.parametrize("previous_exchange", [False, True])
+@pytest.mark.parametrize("saved_context", [False, True])
+@pytest.mark.parametrize("state_db_owner", [False, True])
+@pytest.mark.parametrize("partial", [
+    "A useful partial answer",
+    "```python\nprint(42)\n```",
+    "- first\n- second\n\n1. third",
+])
+def test_stop_saved_partial_survives_next_send(
+    previous_exchange, saved_context, state_db_owner, partial,
+):
+    from api.streaming import (
+        _build_partial_message,
+        _sanitize_messages_for_agent,
+        build_active_turn_token,
+    )
+
+    sid = "stop-saved-partial-history"
+    stream_id = "stream-stop-saved-partial-history"
+    session = _start_cancelled_turn(sid, stream_id)
+    previous = [
+        {"role": "user", "content": "Earlier question", "timestamp": 1},
+        {"role": "assistant", "content": "Earlier answer", "timestamp": 2},
+    ] if previous_exchange else []
+    owner = {"role": "user", "content": session.pending_user_message, "timestamp": 10}
+    models.stamp_message_source(
+        owner, "webui", active_turn_token=build_active_turn_token(stream_id, 10),
+    )
+    session.messages = copy.deepcopy(previous)
+    session.context_messages = (
+        copy.deepcopy(previous + [owner, _build_partial_message(partial, "", [])])
+        if saved_context else []
+    )
+    original_context = copy.deepcopy(session.context_messages)
+    session.save()
+    config.STREAM_PARTIAL_TEXT[stream_id] = partial
+
+    assert cancel_stream(stream_id) is True
+    # Stop must not change the authoritative provider snapshot for the live
+    # partial path, or create the journal-only provisional user boundary.
+    stopped = Session.load(sid)
+    assert stopped.context_messages == original_context
+    visible_owner = next(row for row in stopped.messages if row.get("content") == owner["content"])
+    assert not visible_owner.get("_recovered")
+    _, marker = _cancel_marker(stopped)
+    assert not marker.get("_pending_journal_recovery")
+
+    _simulate_restart()
+    stopped = models.get_session(sid)
+    state_messages = copy.deepcopy(previous + [owner]) if state_db_owner else []
+    history = _sanitize_messages_for_agent(
+        models.reconciled_state_db_messages_for_session(
+            stopped, prefer_context=True, state_messages=state_messages,
+        )
+    )
+    next_send = history + [{"role": "user", "content": "Next request"}]
+    assert [(row["role"], row["content"]) for row in next_send] == [
+        *((row["role"], row["content"]) for row in previous),
+        ("user", owner["content"]),
+        ("assistant", partial),
+        ("user", "Next request"),
+    ]
+
+
+@pytest.mark.parametrize("previous_exchange", [False, True])
+@pytest.mark.parametrize("raw_partial", ["   \n", "<think>unfinished trace</think>"])
+def test_stop_without_model_visible_partial_keeps_journal_owner_provisional(
+    previous_exchange, raw_partial,
+):
+    from api.streaming import _sanitize_messages_for_agent
+
+    sid = "stop-empty-partial-history"
+    stream_id = "stream-stop-empty-partial-history"
+    session = _start_cancelled_turn(sid, stream_id)
+    previous = [
+        {"role": "user", "content": "Earlier question", "timestamp": 1},
+        {"role": "assistant", "content": "Earlier answer", "timestamp": 2},
+    ] if previous_exchange else []
+    session.messages = copy.deepcopy(previous)
+    session.context_messages = copy.deepcopy(previous)
+    session.save()
+    config.STREAM_PARTIAL_TEXT[stream_id] = raw_partial
+    assert cancel_stream(stream_id) is True
+    stopped = Session.load(sid)
+    _, marker = _cancel_marker(stopped)
+    assert marker.get("_pending_journal_recovery") is True
+    _simulate_restart()
+    stopped = models.get_session(sid)
+    history = _sanitize_messages_for_agent(
+        models.reconciled_state_db_messages_for_session(
+            stopped, prefer_context=True, state_messages=[],
+        )
+    )
+    assert [(row["role"], row["content"]) for row in history] == [
+        (row["role"], row["content"]) for row in previous
+    ]
+
+
+@pytest.mark.parametrize("previous_exchange", [False, True])
 @pytest.mark.parametrize("context_owner", ["absent", "tokenless", "exact", "missing-context"])
 def test_stop_empty_journal_next_send_omits_unanswered_prompt(previous_exchange, context_owner):
     from api.streaming import _sanitize_messages_for_agent, build_active_turn_token

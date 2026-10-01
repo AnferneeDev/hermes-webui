@@ -15502,6 +15502,12 @@ def cancel_stream(stream_id: str) -> bool:
                     )
                     _emit_cancel_event = False
                     return True
+                # Decide the saved-partial path before creating a provisional
+                # journal-only owner. Existing partials must remain available
+                # to the next-send history through the established projection.
+                _partial_msg = _build_partial_message(
+                    _cancel_partial_text, _cancel_reasoning, _cancel_tool_calls,
+                )
                 # ── Preserve the user's typed message before clearing pending state (#1298) ──
                 # The agent's internal messages list (where the user message was appended at
                 # the start of run_conversation()) may not have been merged back into
@@ -15580,10 +15586,6 @@ def cancel_stream(stream_id: str) -> bool:
                             # compression because the two lists may have different
                             # user-row counts.
                             _cancel_owner = _msgs_for_recovery[_cancel_turn_start]
-                            # Provisional recovery boundary, not a queued request.
-                            # Exact journal output must answer this owner before
-                            # the next-send history can include it.
-                            _cancel_owner['_recovered'] = True
                             if _cancel_turn_token:
                                 stamp_message_source(
                                     _cancel_owner,
@@ -15591,71 +15593,76 @@ def cancel_stream(stream_id: str) -> bool:
                                     active_turn_token=_cancel_turn_token,
                                 )
 
-                            # Keep the cancelled user boundary in provider context
-                            # so a later exact-stream recovery can be inserted before
-                            # a successor instead of becoming orphaned display state.
-                            from api.models import (
-                                _append_recovered_turn_to_context,
-                                _message_matches_pending_checkpoint,
-                            )
+                            if _partial_msg is None:
+                                # Provisional recovery boundary, not a queued
+                                # request. Only journal-only Stop needs an owner
+                                # awaiting durable model-visible output.
+                                _cancel_owner['_recovered'] = True
+                                # Keep the cancelled user boundary in provider context
+                                # so a later exact-stream recovery can be inserted before
+                                # a successor instead of becoming orphaned display state.
+                                from api.models import (
+                                    _append_recovered_turn_to_context,
+                                    _message_matches_pending_checkpoint,
+                                )
 
-                            _context_messages = getattr(_cs, 'context_messages', None)
-                            if not _cancel_turn_token:
-                                _append_recovered_turn_to_context(_cs, _cancel_owner)
-                            elif not isinstance(_context_messages, list):
-                                # Let the existing helper initialize context from
-                                # the now-token-bearing display history.
-                                _append_recovered_turn_to_context(_cs, _cancel_owner)
-                            else:
-                                _token_matches = [
-                                    _row
-                                    for _row in _context_messages
-                                    if (
-                                        isinstance(_row, dict)
-                                        and _row.get('role') == 'user'
-                                        and _row.get('_active_turn_token') == _cancel_turn_token
-                                    )
-                                ]
-                                for _context_owner in _token_matches:
-                                    _context_owner['_recovered'] = True
-                                if not _token_matches:
-                                    _strict_matches = [
+                                _context_messages = getattr(_cs, 'context_messages', None)
+                                if not _cancel_turn_token:
+                                    _append_recovered_turn_to_context(_cs, _cancel_owner)
+                                elif not isinstance(_context_messages, list):
+                                    # Let the existing helper initialize context from
+                                    # the now-token-bearing display history.
+                                    _append_recovered_turn_to_context(_cs, _cancel_owner)
+                                else:
+                                    _token_matches = [
                                         _row
                                         for _row in _context_messages
-                                        if _message_matches_pending_checkpoint(
-                                            _row,
-                                            _pending_user,
-                                            _pending_started,
-                                            _pending_source,
-                                            _pending_atts,
+                                        if (
+                                            isinstance(_row, dict)
+                                            and _row.get('role') == 'user'
+                                            and _row.get('_active_turn_token') == _cancel_turn_token
                                         )
                                     ]
-                                    _tail = _context_messages[-1] if _context_messages else None
-                                    if (
-                                        len(_strict_matches) == 1
-                                        and _strict_matches[0] is _tail
-                                        and isinstance(_tail, dict)
-                                        and not _tail.get('_active_turn_token')
-                                    ):
-                                        # Only a unique tokenless checkpoint at
-                                        # the exact context tail may be upgraded.
-                                        # Repeated equal prompts or a row already
-                                        # owned by another token are ambiguous and
-                                        # must remain untouched.
-                                        stamp_message_source(
-                                            _tail,
-                                            _pending_source,
-                                            active_turn_token=_cancel_turn_token,
-                                        )
-                                        _tail['_recovered'] = True
-                                    elif not _strict_matches:
-                                        # The current pending user is absent from
-                                        # provider context. Append the exact
-                                        # token-bearing owner rather than binding
-                                        # an older content-equal row.
-                                        _append_recovered_turn_to_context(
-                                            _cs, _cancel_owner
-                                        )
+                                    for _context_owner in _token_matches:
+                                        _context_owner['_recovered'] = True
+                                    if not _token_matches:
+                                        _strict_matches = [
+                                            _row
+                                            for _row in _context_messages
+                                            if _message_matches_pending_checkpoint(
+                                                _row,
+                                                _pending_user,
+                                                _pending_started,
+                                                _pending_source,
+                                                _pending_atts,
+                                            )
+                                        ]
+                                        _tail = _context_messages[-1] if _context_messages else None
+                                        if (
+                                            len(_strict_matches) == 1
+                                            and _strict_matches[0] is _tail
+                                            and isinstance(_tail, dict)
+                                            and not _tail.get('_active_turn_token')
+                                        ):
+                                            # Only a unique tokenless checkpoint at
+                                            # the exact context tail may be upgraded.
+                                            # Repeated equal prompts or a row already
+                                            # owned by another token are ambiguous and
+                                            # must remain untouched.
+                                            stamp_message_source(
+                                                _tail,
+                                                _pending_source,
+                                                active_turn_token=_cancel_turn_token,
+                                            )
+                                            _tail['_recovered'] = True
+                                        elif not _strict_matches:
+                                            # The current pending user is absent from
+                                            # provider context. Append the exact
+                                            # token-bearing owner rather than binding
+                                            # an older content-equal row.
+                                            _append_recovered_turn_to_context(
+                                                _cs, _cancel_owner
+                                            )
                 except Exception:
                     logger.debug(
                         "Failed to recover pending user message on cancel for %s",
@@ -15686,9 +15693,6 @@ def cancel_stream(stream_id: str) -> bool:
                 # call and strict providers would 400 on the malformed entries.
                 # The underscore-prefixed key is not in the whitelist, so sanitize
                 # strips it. The UI reads it via static/messages.js. (v0.50.251.)
-                _partial_msg = _build_partial_message(
-                    _cancel_partial_text, _cancel_reasoning, _cancel_tool_calls,
-                )
                 _cancel_marker_exists = _session_has_cancel_marker(_cs)
                 _cancel_marker_idx = len(_cs.messages)
                 if _cancel_marker_exists:

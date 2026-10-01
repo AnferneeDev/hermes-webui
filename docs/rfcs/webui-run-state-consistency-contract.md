@@ -92,9 +92,13 @@ writer cannot survive the interpreter restart.
 
 Recovery is owned by the marker's exact stream and exact active-turn token.
 Stop stamps that token onto the owning display user row and the exact matching
-provider-context user row before the hook becomes durable. Cancelled owners
-are provisional (`_recovered: true`), so Stop without an answer does not send
-that prompt to the provider on the next turn. Exact-owner context recovery
+provider-context user row before the hook becomes durable. Journal-only cancelled
+owners are provisional (`_recovered: true`), so Stop without an answer does not
+send that prompt to the provider on the next turn. Stop computes the saved
+in-memory partial first: when one exists, it does not create a provisional owner
+or mutate provider context for journal recovery. The existing saved-partial
+history projection retains the saved user turn and assistant output rather than
+replacing them with an unanswered recovery boundary. Exact-owner context recovery
 clears the provisional flag only after model-visible assistant output is
 recovered; display-only thinking and errors do not promote the owner. The
 visible cancelled prompt remains in the transcript. Rows reconstructed
