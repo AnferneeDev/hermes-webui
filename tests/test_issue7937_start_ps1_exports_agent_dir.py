@@ -77,3 +77,46 @@ def test_bootstrap_owns_the_same_export_for_the_posix_launcher():
     """Guards the pairing this fix restores: bootstrap.py exports it for start.sh."""
     bootstrap = (REPO_ROOT / "bootstrap.py").read_text(encoding="utf-8")
     assert 'os.environ["HERMES_WEBUI_AGENT_DIR"]' in bootstrap
+
+
+
+def test_hermes_home_default_precedes_agent_discovery():
+    """HERMES_HOME must be defaulted before the candidate list is built.
+
+    Exporting the discovery result makes start.ps1's order win over the
+    server's _discover_agent_dir. Resolving HERMES_HOME first (matching
+    api/config.py) keeps %LOCALAPPDATA%\\hermes ahead of a stale
+    %USERPROFILE%\\.hermes install.
+    """
+    source = _start_ps1_source()
+    home_default = source.index("if (-not $env:HERMES_HOME)")
+    discovery = source.index("$AgentDir = $env:HERMES_WEBUI_AGENT_DIR")
+    assert home_default < discovery, (
+        "HERMES_HOME default must be resolved before agent discovery so the "
+        "exported HERMES_WEBUI_AGENT_DIR matches api/config.py"
+    )
+
+
+def test_hermes_home_agent_candidate_is_listed_first():
+    """First auto-discovery candidate must be $HERMES_HOME\\hermes-agent."""
+    source = _start_ps1_source()
+    # Narrow to the auto-discovery block (between empty-AgentDir check and export).
+    block_start = source.index("if (-not $AgentDir)")
+    block_end = source.index(
+        "[Environment]::SetEnvironmentVariable('HERMES_WEBUI_AGENT_DIR'"
+    )
+    block = source[block_start:block_end]
+    first_append = re.search(
+        r"\$candidates\s*\+=\s*\(Join-Path\s+\$env:HERMES_HOME\s+'hermes-agent'\)",
+        block,
+    )
+    assert first_append is not None, (
+        "auto-discovery must Join-Path $env:HERMES_HOME 'hermes-agent' as a candidate"
+    )
+    earlier = re.search(r"\$candidates\s*\+=", block)
+    assert earlier is not None
+    assert earlier.start() == first_append.start(), (
+        "Join-Path $env:HERMES_HOME 'hermes-agent' must be the first candidate append; "
+        f"found earlier append at offset {earlier.start()} vs HERMES_HOME at "
+        f"{first_append.start()}"
+    )

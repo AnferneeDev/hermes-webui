@@ -90,6 +90,22 @@ if (-not $Python) {
     exit 1
 }
 
+# === Resolve HERMES_HOME default before agent discovery ================
+# api/config.py's _discover_agent_dir prefers $HERMES_HOME\hermes-agent
+# after the explicit HERMES_WEBUI_AGENT_DIR override. On Windows the Agent's
+# own default HERMES_HOME is %LOCALAPPDATA%\hermes. Resolving that default
+# here — before we build the candidate list — keeps start.ps1's search
+# order aligned with the server so exporting the discovery result cannot
+# silently prefer a stale %USERPROFILE%\.hermes install over the current
+# %LOCALAPPDATA%\hermes one. Leave an already-set HERMES_HOME alone.
+if (-not $env:HERMES_HOME) {
+    if ($env:LOCALAPPDATA) {
+        $env:HERMES_HOME = Join-Path $env:LOCALAPPDATA 'hermes'
+    } else {
+        $env:HERMES_HOME = Join-Path $env:USERPROFILE '.hermes'
+    }
+}
+
 # === Find Hermes Agent dir (server.py imports from it) =================
 # When HERMES_WEBUI_AGENT_DIR is set we still validate it on disk —
 # an explicit override pointing at a missing dir should fail FAST
@@ -105,9 +121,12 @@ if (-not $AgentDir) {
     # Build candidate list incrementally — ${env:ProgramFiles(x86)} is null on
     # 32-bit Windows and in some constrained environments, and Join-Path throws
     # on a null Path. Skip any system-wide root that isn't set so the launcher
-    # stays robust across Windows variants. USERPROFILE is always set so it
-    # stays unguarded; the dev-checkout sibling is path-derived, not env-based.
+    # stays robust across Windows variants. First candidate mirrors
+    # api/config.py: $HERMES_HOME\hermes-agent (HERMES_HOME defaulted above).
+    # USERPROFILE / LOCALAPPDATA / Program Files remain as fallbacks; the
+    # dev-checkout sibling is path-derived, not env-based.
     $candidates = @()
+    $candidates += (Join-Path $env:HERMES_HOME 'hermes-agent')
     $candidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
     foreach ($root in @($env:LOCALAPPDATA, ${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
         if ($root) { $candidates += (Join-Path $root 'hermes\hermes-agent') }
@@ -117,7 +136,8 @@ if (-not $AgentDir) {
     # $env:ProgramFiles is redirected to C:\Program Files (x86), so without
     # $env:ProgramW6432 (the canonical 64-bit override) we'd miss the real
     # C:\Program Files\hermes\hermes-agent AND duplicate the x86 entry.
-    # Select-Object -Unique collapses any collisions regardless of cause.
+    # Select-Object -Unique collapses any collisions regardless of cause
+    # (including HERMES_HOME coinciding with LOCALAPPDATA\hermes).
     $candidates = $candidates | Select-Object -Unique
     foreach ($c in $candidates) {
         if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
@@ -174,13 +194,8 @@ $PortFinal = if ($Port) {
 }
 $env:HERMES_WEBUI_HOST = $BindHostFinal
 $env:HERMES_WEBUI_PORT = "$PortFinal"
-if (-not $env:HERMES_HOME) {
-    if ($env:LOCALAPPDATA) {
-        $env:HERMES_HOME = Join-Path $env:LOCALAPPDATA 'hermes'
-    } else {
-        $env:HERMES_HOME = Join-Path $env:USERPROFILE '.hermes'
-    }
-}
+# HERMES_HOME default was resolved before agent discovery above so the
+# exported HERMES_WEBUI_AGENT_DIR matches api/config.py's search order.
 if (-not $env:HERMES_WEBUI_STATE_DIR) {
     $env:HERMES_WEBUI_STATE_DIR = Join-Path $env:HERMES_HOME 'webui'
 }
