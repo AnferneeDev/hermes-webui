@@ -1310,3 +1310,261 @@ def test_recovered_equal_segments_and_tool_owners_survive_cold_load():
         assert cold.messages[index]["_recovered_stream_id"] == stream_id
         assert cold.messages[index]["content"] == "Checking…"
     assert not _cancel_marker(cold)[1].get("_pending_journal_recovery")
+
+
+
+def _persist_multi_retry_turns(sid, kinds, outputs):
+    """Persist actual Stop hooks and production interrupted markers/journals."""
+    session = Session(session_id=sid, title="multiple retry turns", messages=[], context_messages=[])
+    session.save()
+    models.SESSIONS[sid] = session
+    streams = []
+    for number, kind in enumerate(kinds):
+        stream_id = f"{sid}-stream-{number}"
+        streams.append(stream_id)
+        started = 10 * (number + 1)
+        owner = {"role": "user", "content": f"Prompt {number}", "timestamp": started}
+        session.messages.append(copy.deepcopy(owner))
+        session.context_messages.append(copy.deepcopy(owner))
+        if kind == "ordinary":
+            answer = {"role": "assistant", "content": f"Ordinary answer {number}", "timestamp": started + 1}
+            session.messages.append(copy.deepcopy(answer))
+            session.context_messages.append(copy.deepcopy(answer))
+        elif kind == "interrupted":
+            marker = models._build_recovery_marker_with_retry_hook(
+                recovered_output=False, stream_id=stream_id, pending_started_at=started,
+            )
+            marker["timestamp"] = started + 1
+            session.messages.append(marker)
+        else:
+            assert kind == "cancelled"
+            session.pending_user_message = owner["content"]
+            session.pending_started_at = started
+            session.pending_user_source = "webui"
+            session.active_stream_id = stream_id
+            config.STREAMS[stream_id] = queue.Queue()
+            config.CANCEL_FLAGS[stream_id] = threading.Event()
+            agent = Mock()
+            agent.session_id = sid
+            config.AGENT_INSTANCES[stream_id] = agent
+            config.ACTIVE_RUNS[stream_id] = {
+                "session_id": sid, "phase": "running", "started_at": time.time(),
+            }
+            session.save()
+            assert cancel_stream(stream_id) is True
+        session.save()
+    # Journals arrive after all markers, exactly the lazy-recovery condition.
+    for number, events in enumerate(outputs):
+        writer = RunJournalWriter(sid, streams[number])
+        for event, payload in events:
+            writer.append_sse_event(event, payload)
+        if kinds[number] != "ordinary" and (not events or events[-1][0] not in {"apperror", "error", "done", "cancel"}):
+            writer.append_sse_event("cancel", {"message": "Terminal journal"})
+    _simulate_restart()
+    return streams
+
+
+def _stream_output(session, stream_id):
+    return [row for row in session.messages if row.get("_recovered_stream_id") == stream_id]
+
+
+def _pending_stream_hook(session, stream_id):
+    return next((row for row in session.messages if row.get("_journal_retry_stream_id") == stream_id), None)
+
+
+def _assert_retry_turn_ownership(session, kinds, streams):
+    user_positions = [i for i, row in enumerate(session.messages) if row.get("role") == "user"]
+    assert len(user_positions) == len(kinds)
+    for number, stream_id in enumerate(streams):
+        end = user_positions[number + 1] if number + 1 < len(kinds) else len(session.messages)
+        for index, row in enumerate(session.messages):
+            if row.get("_recovered_stream_id") == stream_id:
+                assert user_positions[number] < index < end
+    for tool in session.tool_calls or []:
+        owner = session.messages[tool["assistant_msg_idx"]]
+        assert owner.get("_recovered_stream_id") == tool.get("_recovered_stream_id")
+
+
+def test_newer_recovered_cancel_does_not_hide_older_interrupted_output():
+    sid = "round4-older-interrupted-newer-cancel"
+    kinds = ["interrupted", "cancelled"]
+    streams = _persist_multi_retry_turns(sid, kinds, [
+        [("token", {"text": "Older interrupted answer"})],
+        [("token", {"text": "Newer cancelled answer"})],
+    ])
+    first = models.get_session(sid)
+    assert [row["content"] for row in _stream_output(first, streams[1])] == ["Newer cancelled answer"]
+    models.SESSIONS.clear()
+    second = models.get_session(sid)
+    assert [row["content"] for row in _stream_output(second, streams[0])] == ["Older interrupted answer"]
+    assert _pending_stream_hook(second, streams[0]) is None
+    _assert_retry_turn_ownership(second, kinds, streams)
+
+
+def test_newer_empty_cancel_does_not_spend_older_ready_cancel_retry():
+    sid = "round4-older-ready-newer-empty-cancel"
+    streams = _persist_multi_retry_turns(sid, ["cancelled", "cancelled"], [
+        [("token", {"text": "Older ready cancelled answer"})], [],
+    ])
+    first = models.get_session(sid)
+    assert [row["content"] for row in _stream_output(first, streams[0])] == ["Older ready cancelled answer"]
+    assert _pending_stream_hook(first, streams[0]) is None
+    assert _pending_stream_hook(first, streams[1])["_journal_retry_attempts"] == 1
+
+
+@pytest.mark.parametrize("cache_hits", [False, True], ids=["cold", "cached"])
+@pytest.mark.parametrize("older_kind", ["interrupted", "cancelled"])
+@pytest.mark.parametrize("ordinary_boundary", [False, True])
+@pytest.mark.parametrize("newer_state", ["empty", "ready", "reasoning", "live", "nonterminal", "arriving", "expired"])
+def test_mixed_multiple_retry_turns_keep_boundaries_and_independent_budgets(
+    cache_hits, older_kind, ordinary_boundary, newer_state,
+):
+    sid = f"round4-mixed-{cache_hits}-{older_kind}-{ordinary_boundary}-{newer_state}"
+    kinds = [older_kind, "cancelled"]
+    outputs = [
+        [("token", {"text": "Oldest output"}),
+         ("tool", {"name": "read_file", "tid": "old-tool", "args": {"path": "old.txt"}}),
+         ("tool_complete", {"name": "read_file", "tid": "old-tool", "preview": "Old full result"})],
+        [("token", {"text": "Middle cancelled output"}),
+         ("tool", {"name": "read_file", "tid": "middle-tool", "args": {"path": "middle.txt"}})],
+    ]
+    if ordinary_boundary:
+        kinds.append("ordinary")
+        outputs.append([])
+    kinds.append("cancelled")
+    newer_events = []
+    if newer_state == "ready":
+        newer_events = [("token", {"text": "Newest output"})]
+    elif newer_state == "reasoning":
+        newer_events = [("reasoning", {"text": "Newest private thought"})]
+    outputs.append(newer_events)
+    streams = _persist_multi_retry_turns(sid, kinds, outputs)
+    newer_stream = streams[-1]
+    if newer_state == "live":
+        config.ACTIVE_RUNS[newer_stream] = {"session_id": sid, "phase": "cancelling", "started_at": time.time()}
+    elif newer_state == "nonterminal":
+        # A distinct same-process nonterminal journal is not permission to read
+        # cancellation output, even when registry bookkeeping is absent.
+        session = Session.load(sid)
+        _pending_stream_hook(session, newer_stream)["_journal_retry_process_token"] = models._JOURNAL_RECOVERY_PROCESS_TOKEN
+        session.save()
+        from api.run_journal import _run_path
+        _run_path(sid, newer_stream).unlink()
+        RunJournalWriter(sid, newer_stream).append_sse_event("token", {"text": "Still owned output"})
+    elif newer_state == "arriving":
+        from api.run_journal import _run_path
+        _run_path(sid, newer_stream).unlink()
+    elif newer_state == "expired":
+        session = Session.load(sid)
+        _pending_stream_hook(session, newer_stream)["_journal_retry_attempts"] = models._JOURNAL_RETRY_MAX_ATTEMPTS
+        session.save()
+
+    for _ in range(4):
+        if not cache_hits:
+            models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+    old_should_recover = older_kind == "cancelled" or not ordinary_boundary
+    assert bool(_stream_output(recovered, streams[0])) is old_should_recover
+    assert [row["content"] for row in _stream_output(recovered, streams[1]) if row.get("content")] == ["Middle cancelled output"]
+    _assert_retry_turn_ownership(recovered, kinds, streams)
+    if not old_should_recover:
+        assert _pending_stream_hook(recovered, streams[0])["_journal_retry_attempts"] == 0
+    if newer_state in {"empty", "live", "nonterminal", "arriving"}:
+        expected = 4 if newer_state == "empty" else 0
+        assert _pending_stream_hook(recovered, newer_stream)["_journal_retry_attempts"] == expected
+    else:
+        assert _pending_stream_hook(recovered, newer_stream) is None
+    if newer_state == "reasoning":
+        assert not any("Newest private thought" in str(row.get("content")) for row in recovered.context_messages)
+    # Recovered cancellation output belongs to its exact user even when a
+    # genuine ordinary assistant boundary prevents older interruption retry.
+    context_middle = next(i for i, row in enumerate(recovered.context_messages) if row.get("content") == "Prompt 1")
+    assert recovered.context_messages[context_middle + 1]["content"] == "Middle cancelled output"
+    if old_should_recover:
+        from api.streaming import _sanitize_messages_for_agent
+        history = _sanitize_messages_for_agent(
+            models.reconciled_state_db_messages_for_session(
+                recovered, prefer_context=True, state_messages=[],
+            )
+        )
+        assert any(row.get("content") == "Oldest output" for row in history)
+
+
+@pytest.mark.parametrize("expiry", ["attempts", "age"])
+def test_multiple_empty_cancel_hooks_have_separate_retry_budgets(expiry):
+    sid = f"round4-independent-budgets-{expiry}"
+    streams = _persist_multi_retry_turns(sid, ["cancelled"] * 3, [
+        [("token", {"text": "Old ready output"})], [], [],
+    ])
+    session = Session.load(sid)
+    _pending_stream_hook(session, streams[1])["_journal_retry_attempts"] = 3
+    newest = _pending_stream_hook(session, streams[2])
+    if expiry == "attempts":
+        newest["_journal_retry_attempts"] = models._JOURNAL_RETRY_MAX_ATTEMPTS
+    else:
+        newest["_journal_retry_first_seen_ts"] = time.time() - models._JOURNAL_RETRY_GIVEUP_SECONDS - 1
+    session.save()
+    recovered = models.get_session(sid)
+    assert [row["content"] for row in _stream_output(recovered, streams[0])] == ["Old ready output"]
+    assert _pending_stream_hook(recovered, streams[2]) is None
+    assert _pending_stream_hook(recovered, streams[1])["_journal_retry_attempts"] == 4
+    assert _pending_stream_hook(recovered, streams[0]) is None
+    models.SESSIONS.clear()
+    again = models.get_session(sid)
+    assert _pending_stream_hook(again, streams[1])["_journal_retry_attempts"] == 5
+    assert [row["content"] for row in _stream_output(again, streams[0])] == ["Old ready output"]
+
+
+def test_multiple_cancel_retry_counter_save_failure_aborts_pass(monkeypatch):
+    sid = "round4-multiple-hooks-counter-rollback"
+    streams = _persist_multi_retry_turns(sid, ["cancelled", "cancelled"], [
+        [("token", {"text": "Older output waits for a durable retry transaction"})], [],
+    ])
+    original_save = Session.save
+    failed = False
+
+    def fail_first_budget_save(session, *args, **kwargs):
+        nonlocal failed
+        marker = _pending_stream_hook(session, streams[1])
+        if not failed and marker and marker.get("_journal_retry_attempts") == 1:
+            failed = True
+            raise OSError("synthetic retry budget save failure")
+        return original_save(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", fail_first_budget_save)
+    first = models.get_session(sid)
+    assert failed
+    assert not _stream_output(first, streams[0])
+    assert _pending_stream_hook(first, streams[1])["_journal_retry_attempts"] == 0
+    durable = Session.load(sid)
+    assert _pending_stream_hook(durable, streams[1])["_journal_retry_attempts"] == 0
+    assert not _stream_output(durable, streams[0])
+    monkeypatch.setattr(Session, "save", original_save)
+    second = models.get_session(sid)
+    assert len(_stream_output(second, streams[0])) == 1
+    assert _pending_stream_hook(second, streams[1])["_journal_retry_attempts"] == 1
+
+
+def test_older_interrupted_terminal_error_keeps_newer_cancel_tool_owner():
+    sid = "round4-old-terminal-new-cancel-tool"
+    kinds = ["interrupted", "cancelled"]
+    streams = _persist_multi_retry_turns(sid, kinds, [
+        [("token", {"text": "Old progress before terminal error"}),
+         ("tool", {"name": "read_file", "tid": "old-error-tool", "args": {"path": "old.txt"}}),
+         ("apperror", {"session_id": sid, "terminal_session_persisted": False,
+                       "session": {"session_id": sid, "messages": [
+                           {"role": "user", "content": "Prompt 0"},
+                           {"role": "assistant", "content": "Old terminal failure", "_error": True},
+                       ]}})],
+        [("token", {"text": "New cancel output"}),
+         ("tool", {"name": "read_file", "tid": "new-tool", "args": {"path": "new.txt"}})],
+    ])
+    models.get_session(sid)
+    models.SESSIONS.clear()
+    recovered = models.get_session(sid)
+    assert any(row.get("content") == "Old terminal failure" for row in _stream_output(recovered, streams[0]))
+    assert not any(row.get("type") == "interrupted" for row in recovered.messages)
+    _assert_retry_turn_ownership(recovered, kinds, streams)
+    assert {tool["tid"] for tool in recovered.tool_calls} == {"old-error-tool", "new-tool"}
+    models.SESSIONS.clear()
+    _assert_retry_turn_ownership(models.get_session(sid), kinds, streams)

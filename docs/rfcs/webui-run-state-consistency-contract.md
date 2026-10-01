@@ -119,6 +119,21 @@ completion searches all unfinished exact IDs before falling back to the latest
 same-name start that originally had no ID; an ID-bearing start is never a
 name-only fallback for another completion ID.
 
+A full session read may try multiple eligible cancellation hooks, newest first,
+when earlier selections yield no output. Each hook keeps its own attempt and age
+budget and is visited at most once per read; live, same-process nonterminal,
+and still-arriving hooks do not consume that budget. One successful recovery
+ends the pass. A failed cancellation save restores the projection and ends the
+pass before any stale marker reference can be reused.
+
+Interrupted-hook scans pass journal-recovered assistant rows, so newer recovered
+cancellation output does not hide an older interrupted hook. Ordinary assistant
+turns retain the existing stopping boundary. Reordering moves only the selected
+stream's rows, and tools retain their exact display owner after both movement
+and terminal-marker removal. Cancelled provider context remains exact-token
+owned; tokenless legacy interrupted context uses its existing projection rules,
+without inferring cross-turn ownership from text, timestamps, or display ordinals.
+
 ## Inactive compression continuation recovery
 
 The Agent profile's SQLite compression lineage owns the canonical continuation,
