@@ -44,6 +44,12 @@
 
 ### Fixed
 
+- **Reloading a session keeps each thinking block's identity, and your formatting.** When a reply had no
+  tool calls (or its tool metadata was missing), reload rebuilt thinking blocks from the transcript and dropped
+  the identity of the saved Thinking event, so a distinct saved thought could be merged away. Saved thinking
+  now keeps its identity on reload. When saved prose matches transcript prose, only the identity is carried
+  over; the transcript's exact Markdown (code blocks, indentation, lists) is what renders. Thanks
+  @franksong2702. (#7825)
 - **A chat start that fails before the agent runs no longer leaves a phantom message behind.** With eager
   session saving on, the submitted prompt was written to disk before setup finished. If the start was then
   rejected, that prompt stayed in the transcript as a turn that never ran, and a retry showed it twice. A
