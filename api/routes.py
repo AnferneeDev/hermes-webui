@@ -5577,6 +5577,58 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     return s
 
 
+def _apply_cli_source_meta_to_session(session, cli_meta):
+    """Apply CLI source identity from ``cli_meta`` onto an in-memory session.
+
+    Mirrors the ``_apply_source_meta`` closure inside ``_get_or_materialize_session``
+    (api/routes.py:~5535) so the rename/move/archive handlers can re-stamp the
+    full source-identity field set on a session that was reloaded via
+    ``Session.load(sid)`` inside their per-session lock.
+
+    #7776 Finding 2: the pre-lock materialization path
+    (``_get_or_materialize_session``) writes a sidecar for the regular
+    CLI/agent branch through ``import_cli_session`` (which saves with default
+    source identity) and then applies source meta to the in-memory object
+    WITHOUT a follow-up ``save()``. The lock-held ``Session.load(sid)`` reload
+    then reads that source-stripped sidecar, and the handler's ``s.save()``
+    persists a WebUI-native copy with ``is_cli_session=False`` + null source
+    identity. Persisting the source meta from the captured ``cli_meta`` BEFORE
+    the lock-held reload — or re-applying it to the freshly loaded session
+    after the reload — closes that gap. This helper does the latter.
+
+    #7776 Finding 3 (SILENT regression on forks): ``cli_meta`` comes from
+    ``_lookup_cli_session_metadata`` → ``get_cli_sessions()``, which projects
+    state.db rows for EVERY source — including WebUI-origin rows
+    (``session_source="webui"``). A WebUI fork is one of those rows, so a
+    blanket re-stamp turns the fork into a WebUI-native session on the
+    rename/move/archive save. Two guards:
+      1. Early-return when the row is WebUI-origin. It is not a CLI row
+         (``is_cli_session_row`` returns False for it), so there is nothing
+         to re-stamp; the reloaded sidecar already has the right identity.
+      2. Never overwrite an existing ``session_source == "fork"`` — a
+         WebUI-created fork (/api/session/branch, compression recovery)
+         owns its own provenance and must stay a fork even if a same-id
+         state.db row claims some other source.
+    """
+    if not cli_meta:
+        return
+    if _session_source_is_webui(cli_meta):
+        return
+    if str(getattr(session, "session_source", None) or "").strip().lower() == "fork":
+        return
+    session.is_cli_session = is_cli_session_row(cli_meta)
+    session.source_tag = cli_meta.get("source_tag")
+    session.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
+    session.session_source = cli_meta.get("session_source")
+    session.source_label = cli_meta.get("source_label")
+    session.user_id = cli_meta.get("user_id")
+    session.chat_id = cli_meta.get("chat_id")
+    session.chat_type = cli_meta.get("chat_type")
+    session.thread_id = cli_meta.get("thread_id")
+    session.session_key = cli_meta.get("session_key")
+    session.platform = cli_meta.get("platform")
+
+
 def _share_snapshot_messages_for_session(session, *, cli_meta: dict | None = None) -> list:
     """Return the visible transcript that a public share should snapshot.
 
@@ -16287,21 +16339,56 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id", "title")
         except ValueError as e:
             return bad(handler, str(e))
+        sid = body["session_id"]
+        # #7738: pre-validate OUTSIDE the lock (404 / 403 contracts), then
+        # re-resolve the canonical session INSIDE the lock. Between an outside
+        # resolve and the lock acquire, _evict_sessions_over_cap can drop the
+        # resolved object from SESSIONS, so the stale, evicted object's save()
+        # would otherwise clobber a newer save on disk. Mirrors the
+        # SESSIONS.get -> Session.load -> _ensure_full_session_before_mutation
+        # pattern in _persist_generated_session_title.
         try:
-            s = _get_or_materialize_session(body["session_id"])
+            _get_or_materialize_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
-        with _get_session_agent_lock(body["session_id"]):
+        # #7776 Finding 2: capture the CLI source identity BEFORE acquiring
+        # the lock so the lock-held Session.load(sid) reload (which materializes
+        # a brand-new WebUI session without the pre-lock CLI metadata) cannot
+        # drop it on the way back to disk.
+        _rename_cli_meta = _lookup_cli_session_metadata(sid) or {}
+        with _get_session_agent_lock(sid):
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
+            if getattr(s, "read_only", False):
+                return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
+            # #7776 Finding 2: re-stamp CLI source identity on the freshly
+            # loaded session before mutating it.
+            if _rename_cli_meta:
+                _apply_cli_source_meta_to_session(s, _rename_cli_meta)
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
             s.save()
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_rename",
             profile=getattr(s, "profile", None),
-            session_id=getattr(s, "session_id", body["session_id"]),
+            session_id=getattr(s, "session_id", sid),
         )
         return j(handler, {"session": s.compact()})
 
@@ -17711,6 +17798,11 @@ def handle_post(handler, parsed) -> bool:
         sid = body["session_id"]
         if _session_is_subagent_view_only(sid):
             return bad(handler, "Subagent sessions are view-only and cannot be archived from WebUI", 400)
+        # #7776 Finding 2: capture the CLI source identity BEFORE the lock so
+        # the lock-held Session.load(sid) reload (which materializes a brand
+        # new WebUI session without the pre-lock CLI metadata) cannot drop it
+        # on the way back to disk. The materialize path below also uses it.
+        _archive_cli_meta = _lookup_cli_session_metadata(sid) or {}
         try:
             s = get_session(sid)
             # #1558: save() refuses metadata-only session stubs because their
@@ -17724,7 +17816,7 @@ def handle_post(handler, parsed) -> bool:
                 with LOCK:
                     SESSIONS[sid] = s
         except KeyError:
-            cli_meta = _lookup_cli_session_metadata(sid)
+            cli_meta = _archive_cli_meta
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
             if cli_meta.get("read_only"):
@@ -17785,8 +17877,40 @@ def handle_post(handler, parsed) -> bool:
                 s.session_key = cli_meta.get("session_key")
                 s.platform = cli_meta.get("platform")
         with _get_session_agent_lock(sid):
+            # #7738: re-resolve the canonical session under the lock so the
+            # object we mutate is the resident one (not a stale, evicted one).
+            # For the in-cache path the outer get_session(sid) above can drop
+            # out of SESSIONS via _evict_sessions_over_cap before this lock is
+            # acquired; for the materialize path the just-saved object could
+            # likewise be evicted by a concurrent cap-1 request. Either way,
+            # the session we archive must be the freshest one.
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
+            # #7776 Finding 2: re-stamp CLI source identity on the freshly
+            # loaded session before mutating it. ``_archive_cli_meta`` was
+            # captured above (before the lock); for the regular CLI/agent
+            # materialize path the on-disk sidecar that Session.load(sid)
+            # just read is the import_cli_session save WITHOUT source meta,
+            # so without this re-stamp the save() below would persist a
+            # WebUI-native copy with is_cli_session=False + null source.
+            if _archive_cli_meta:
+                _apply_cli_source_meta_to_session(s, _archive_cli_meta)
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),
@@ -17800,30 +17924,40 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        sid = body["session_id"]
+        # #7738: pre-validate OUTSIDE the lock (404 / 403 contracts) so we can
+        # still answer with a 404 before the lock is acquired. The actual
+        # mutation re-resolves INSIDE the lock (see #7738 same-shape fix as
+        # /api/session/rename) to avoid saving a stale, evicted object over a
+        # newer save.
         try:
-            s = _get_or_materialize_session(body["session_id"])
+            s = _get_or_materialize_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be moved from WebUI", 403)
-        # #1614: refuse moves into a project owned by another profile.
+        # #7776 Finding 1: the pre-lock ``s`` may be stale (issue #7738's
+        # exact race). The 1614 cross-profile authorization MUST be
+        # re-evaluated against the canonical session resolved INSIDE the
+        # lock — using the stale pre-lock ``s.profile`` would let a
+        # profile-beta session be assigned to a profile-alpha project.
+        # We still need ``target_pid`` and the project-not-found 404
+        # outside the lock (so the early-exit is honored), but the
+        # authoritative profile match waits for the canonical session.
         target_pid = body.get("project_id") or None
+        target = None
         if target_pid:
-            # Use the session's own profile for authorization, not the global
-            # active profile. A session belongs to a specific profile set at
-            # creation; projects from that profile should always be assignable,
-            # regardless of which profile is "active" at the process level.
-            # Matches the same principle as the profile chip fix — prefer
-            # session-scoped state over global active profile. (#3325 follow-up)
-            _session_profile = getattr(s, 'profile', None) or get_active_profile_name()
             target = next(
                 (p for p in load_projects() if p["project_id"] == target_pid),
                 None,
             )
             if not target:
                 return bad(handler, "Project not found", 404)
-            if not _profiles_match(target.get("profile"), _session_profile):
-                return bad(handler, "Project not found", 404)
+        # #7776 Finding 2: capture the CLI source identity BEFORE acquiring
+        # the lock so the lock-held reload (which materializes a new WebUI
+        # session via Session.load(sid)) cannot drop it on the way back to
+        # disk. Applied after the reload below.
+        _move_cli_meta = _lookup_cli_session_metadata(sid) or {}
         # #3746: acquire the per-session agent lock with a bounded timeout
         # instead of blocking indefinitely. The streaming thread holds this same
         # lock during checkpoint saves; on slow file I/O (e.g. WSL/DrvFs) a bare
@@ -17832,7 +17966,7 @@ def handle_post(handler, parsed) -> bool:
         # the wait converts that into an actionable HTTP 503 the client can retry.
         # We keep the lock (rather than dropping it for this metadata-only write)
         # because s.save() still races the streaming thread's atomic writer.
-        _move_lock = _get_session_agent_lock(body["session_id"])
+        _move_lock = _get_session_agent_lock(sid)
         if not _move_lock.acquire(timeout=5):
             return j(
                 handler,
@@ -17840,14 +17974,53 @@ def handle_post(handler, parsed) -> bool:
                 status=503,
             )
         try:
+            # #7738: re-resolve the canonical session under the lock so the
+            # object we mutate is the resident one (not a stale, evicted one).
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
+            # #7776 Finding 2: re-stamp CLI source identity on the freshly
+            # loaded session (the lock-held Session.load(sid) read the
+            # source-stripped sidecar that _get_or_materialize_session's
+            # import_cli_session path produced).
+            if _move_cli_meta:
+                _apply_cli_source_meta_to_session(s, _move_cli_meta)
+            # #7776 Finding 1: re-run the #1614 profile authorization with
+            # the canonical session's profile. The pre-lock check above was
+            # only a 404/404 contract gate; the authoritative cross-profile
+            # move guard runs here, with ``s`` guaranteed to be the resident
+            # object (issue #7738's stale hazard closed).
+            if target_pid:
+                # Use the session's own profile for authorization, not the global
+                # active profile. A session belongs to a specific profile set at
+                # creation; projects from that profile should always be assignable,
+                # regardless of which profile is "active" at the process level.
+                # Matches the same principle as the profile chip fix — prefer
+                # session-scoped state over global active profile. (#3325 follow-up)
+                _session_profile = getattr(s, 'profile', None) or get_active_profile_name()
+                if not _profiles_match(target.get("profile"), _session_profile):
+                    return bad(handler, "Project not found", 404)
             s.project_id = target_pid
             s.save()
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         finally:
             _move_lock.release()
         publish_session_list_changed(
             "session_move",
             profile=getattr(s, "profile", None),
-            session_id=getattr(s, "session_id", body["session_id"]),
+            session_id=getattr(s, "session_id", sid),
         )
         return j(handler, {"ok": True, "session": s.compact()})
 
@@ -23428,52 +23601,145 @@ def _prepare_chat_start_session_for_stream(
         s.save()
 
 
-def _cleanup_chat_start_launch_failure(session, stream_id: str) -> None:
-    """Release state registered before a worker thread successfully starts."""
-    clear_session_writeback_owner_if_owned(session.session_id, stream_id)
-    unregister_stream_owner(stream_id)
-    with STREAMS_LOCK:
-        STREAMS.pop(stream_id, None)
-    STREAM_GOAL_RELATED.pop(stream_id, None)
-    # The session-field reset needs the same concurrency discipline as the
-    # registry half: hold the per-session lock and re-resolve the canonical
-    # session before clearing anything. Mutating the passed-in stale object
-    # could wipe a concurrent successor turn's pending fields, and saving it
-    # could resurrect a session deleted while the launch was failing. Same
-    # pattern as the #1533 race fix (routes.py:3077) and the anchor-scene
-    # write guard (routes.py:5140).
-    #
-    # This runs while the original launch failure is being handled, so it must
-    # never raise. Lock acquisition and session resolution can fail on their own
-    # (I/O, deserialization), and an escaping error here would mask the launch
-    # failure the caller is about to report while leaving the reset half done.
+def _atomic_write_chat_start_bytes(path: Path, payload: bytes) -> None:
+    """Replace one chat-start recovery file without exposing a partial write."""
+    tmp = path.with_suffix(
+        f"{path.suffix}.restore.tmp.{os.getpid()}.{threading.current_thread().ident}"
+    )
     try:
-        with _get_session_agent_lock(session.session_id):
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        from api.models import _safe_replace
+
+        _safe_replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _restore_chat_start_backup_provenance(provenance, *, compensation_succeeded: bool) -> None:
+    """Restore the backup state that existed before rejected admission."""
+    if provenance is None:
+        return
+    _sidecar_path, sidecar_bytes, backup_path, had_backup, backup_bytes, _sidecar_unknown = provenance
+    try:
+        if had_backup:
+            if backup_bytes is not None:
+                _atomic_write_chat_start_bytes(backup_path, backup_bytes)
+            return
+        elif compensation_succeeded:
+            backup_path.unlink(missing_ok=True)
+        elif sidecar_bytes is not None:
+            _atomic_write_chat_start_bytes(backup_path, sidecar_bytes)
+    except Exception:
+        logger.debug(
+            "Failed to restore chat-start recovery backup %s",
+            backup_path,
+            exc_info=True,
+        )
+
+
+def _restore_chat_start_entry_sidecar(provenance) -> None:
+    """Restore the entry sidecar before saving when backup bytes are unknown."""
+    sidecar_path, sidecar_bytes, _backup_path, _had_backup, _backup_bytes, sidecar_unknown = provenance
+    if sidecar_unknown:
+        raise OSError("chat-start entry sidecar bytes are unavailable")
+    if sidecar_bytes is None:
+        sidecar_path.unlink(missing_ok=True)
+    else:
+        _atomic_write_chat_start_bytes(sidecar_path, sidecar_bytes)
+
+
+def _cleanup_chat_start_launch_failure(
+    session,
+    stream_id: str,
+    snapshot,
+    *,
+    backup_provenance=None,
+    lock_held: bool = False,
+) -> None:
+    """Release state registered before a worker thread successfully starts."""
+    cleanup_result = {
+        "backup_provenance": backup_provenance,
+        "backup_unknown": (
+            backup_provenance is not None
+            and backup_provenance[3]
+            and backup_provenance[4] is None
+        ),
+        "sidecar_restored": False,
+    }
+    try:
+        clear_session_writeback_owner_if_owned(session.session_id, stream_id)
+        unregister_stream_owner(stream_id)
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+        STREAM_GOAL_RELATED.pop(stream_id, None)
+    except Exception:
+        logger.debug(
+            "Failed to clear chat-start registries after chat-start failure for %s",
+            stream_id,
+            exc_info=True,
+        )
+    def restore_locked() -> None:
+        # Re-resolve the canonical session before clearing anything. Mutating
+        # the passed-in object could wipe a successor turn or resurrect a
+        # session deleted while the launch was failing.
+        try:
+            canonical = get_session(session.session_id)
+        except KeyError:
+            return
+        if getattr(canonical, "active_stream_id", None) != stream_id:
+            return
+        from api.session_ops import restore_session_state
+
+        restore_session_state(canonical, snapshot)
+        compensation_succeeded = False
+        if cleanup_result["backup_unknown"]:
             try:
-                canonical = get_session(session.session_id)
-            except KeyError:
-                return  # session deleted while the thread launch was failing
-            if getattr(canonical, "active_stream_id", None) != stream_id:
-                return  # a successor turn already owns the session
-            canonical.active_stream_id = None
-            canonical.pending_user_message = None
-            canonical.pending_attachments = []
-            canonical.pending_started_at = None
-            canonical.pending_user_source = None
-            try:
-                canonical.save()
+                _restore_chat_start_entry_sidecar(backup_provenance)
+                cleanup_result["sidecar_restored"] = True
             except Exception:
                 logger.debug(
-                    "Failed to persist chat-start cleanup after worker launch failure for %s",
+                    "Failed to restore chat-start entry sidecar for %s",
                     stream_id,
                     exc_info=True,
                 )
+                return
+        try:
+            canonical.save(touch_updated_at=False)
+            compensation_succeeded = True
+            cleanup_result["sidecar_restored"] = True
+        except Exception:
+            logger.debug(
+                "Failed to persist chat-start cleanup after chat-start failure for %s",
+                stream_id,
+                exc_info=True,
+            )
+        _restore_chat_start_backup_provenance(
+            backup_provenance,
+            compensation_succeeded=compensation_succeeded,
+        )
+
+    # This runs while the original launch failure is being handled, so it must
+    # never raise. Lock acquisition and session resolution can fail on their own,
+    # and an escaping error here would mask the launch failure.
+    try:
+        if lock_held:
+            restore_locked()
+        else:
+            with _get_session_agent_lock(session.session_id):
+                restore_locked()
     except Exception:
         logger.debug(
             "Failed to reset session state after worker launch failure for %s",
             stream_id,
             exc_info=True,
         )
+    return cleanup_result
 
 
 def _is_hidden_empty_session(s) -> bool:
@@ -23921,23 +24187,32 @@ def _start_chat_stream_for_session(
         diag.stage("stale_stream_cleanup") if diag else None
         _clear_stale_stream_state(s)
 
-    # #1932: check if this session has a pending goal continuation flag.
-    # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
-    # so the next chat/start for this session is automatically treated as goal-related.
-    if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
-        goal_related = True
-        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+    consumed_goal_continuation = False
+    consumed_bg_task_completion = False
 
-    # process_complete wakeup (ours-original, Option B): if this session has a
-    # pending process_complete marker (set by api/background_process.py drain),
-    # discard it atomically here. Mirrors the goal_continue pattern (#1932).
-    # The marker is server-internal telemetry; the actual wakeup is delivered
-    # either server-side (Option Z) or via the PR #2279 next-turn drain.
-    if s.session_id in PENDING_BG_TASK_COMPLETIONS:
-        PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
+    def consume_continuation_markers() -> None:
+        nonlocal goal_related, consumed_goal_continuation, consumed_bg_task_completion
+        if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+            goal_related = True
+            PENDING_GOAL_CONTINUATION.discard(s.session_id)
+            consumed_goal_continuation = True
+        if s.session_id in PENDING_BG_TASK_COMPLETIONS:
+            PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
+            consumed_bg_task_completion = True
+
+    def restore_consumed_continuation_markers() -> None:
+        if consumed_goal_continuation:
+            PENDING_GOAL_CONTINUATION.add(s.session_id)
+        if consumed_bg_task_completion:
+            PENDING_BG_TASK_COMPLETIONS.add(s.session_id)
 
     session_lock = _get_session_agent_lock(s.session_id)
     diag.stage("session_lock_wait") if diag else None
+    snapshot = None
+    stream_id = None
+    backup_provenance = None
+    was_hidden_empty_session = False
+    journal_event = {}
     while True:
         with session_lock:
             locked_stream_id = getattr(s, "active_stream_id", None)
@@ -23961,32 +24236,175 @@ def _start_chat_stream_for_session(
                     }
                 needs_stale_cleanup = False
                 if regeneration is not None:
-                    return _start_regeneration_stream_locked(
+                    consume_continuation_markers()
+                    try:
+                        regeneration_response = _start_regeneration_stream_locked(
+                            s,
+                            turn=regeneration,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            normalized_model=normalized_model,
+                            diag=diag,
+                            goal_related=goal_related,
+                            source=source,
+                            moa_config=moa_config,
+                            backend_is_gateway=backend_is_gateway,
+                        )
+                    except Exception:
+                        restore_consumed_continuation_markers()
+                        raise
+                    if (
+                        isinstance(regeneration_response, dict)
+                        and int(regeneration_response.get("_status", 200) or 200) >= 400
+                    ):
+                        restore_consumed_continuation_markers()
+                    return regeneration_response
+                stream_id = uuid.uuid4().hex
+                from api.session_ops import snapshot_session_state
+
+                snapshot = snapshot_session_state(s)
+                sidecar_path = getattr(s, "path", None)
+                if sidecar_path is not None:
+                    sidecar_path = Path(sidecar_path)
+                    backup_path = sidecar_path.with_suffix(".json.bak")
+                    sidecar_bytes = None
+                    sidecar_unknown = False
+                    if sidecar_path.exists():
+                        try:
+                            sidecar_bytes = sidecar_path.read_bytes()
+                        except OSError:
+                            sidecar_unknown = True
+                            logger.debug(
+                                "Failed to capture chat-start entry sidecar %s",
+                                sidecar_path,
+                                exc_info=True,
+                            )
+                    backup_exists = backup_path.exists()
+                    backup_bytes = None
+                    if backup_exists:
+                        try:
+                            backup_bytes = backup_path.read_bytes()
+                        except OSError:
+                            logger.debug(
+                                "Failed to capture chat-start recovery backup %s",
+                                backup_path,
+                                exc_info=True,
+                            )
+                    backup_provenance = (
+                        sidecar_path,
+                        sidecar_bytes,
+                        backup_path,
+                        backup_exists,
+                        backup_bytes,
+                        sidecar_unknown,
+                    )
+                consume_continuation_markers()
+                diag.stage("save_pending_state") if diag else None
+                was_hidden_empty_session = _is_hidden_empty_session(s)
+                try:
+                    _prepare_chat_start_session_for_stream(
                         s,
-                        turn=regeneration,
+                        msg=msg,
+                        attachments=attachments,
                         workspace=workspace,
                         model=model,
                         model_provider=model_provider,
-                        normalized_model=normalized_model,
-                        diag=diag,
-                        goal_related=goal_related,
+                        stream_id=stream_id,
                         source=source,
-                        moa_config=moa_config,
-                        backend_is_gateway=backend_is_gateway,
                     )
-                stream_id = uuid.uuid4().hex
-                diag.stage("save_pending_state") if diag else None
-                was_hidden_empty_session = _is_hidden_empty_session(s)
-                _prepare_chat_start_session_for_stream(
-                    s,
-                    msg=msg,
-                    attachments=attachments,
-                    workspace=workspace,
-                    model=model,
-                    model_provider=model_provider,
-                    stream_id=stream_id,
-                    source=source,
-                )
+                    diag.stage("turn_journal_submitted") if diag else None
+                    try:
+                        from api.turn_journal import append_turn_journal_event
+
+                        journal_event = append_turn_journal_event(
+                            s.session_id,
+                            {
+                                "event": "submitted",
+                                "stream_id": stream_id,
+                                "role": "user",
+                                "content": msg,
+                                "attachments": attachments,
+                                "workspace": workspace,
+                                "model": model,
+                                "model_provider": model_provider,
+                                "created_at": s.pending_started_at,
+                            },
+                        )
+                    except Exception:
+                        logger.warning("Failed to append submitted turn journal event", exc_info=True)
+                    diag.stage("stream_registration") if diag else None
+                    stream = create_stream_channel()
+                    register_stream_owner(stream_id, s.session_id)
+                    with STREAMS_LOCK:
+                        STREAMS[stream_id] = stream
+                    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
+                    if goal_related:
+                        STREAM_GOAL_RELATED[stream_id] = True
+                    diag.stage("worker_thread_start") if diag else None
+                    worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
+                    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
+                    if moa_config and not backend_is_gateway:
+                        worker_kwargs["moa_config"] = moa_config
+                    if backend_is_gateway:
+                        from api.gateway_chat import _mark_gateway_run_starting
+
+                        _mark_gateway_run_starting(stream_id)
+                    thr = threading.Thread(
+                        target=worker_target,
+                        args=(s.session_id, msg, model, workspace, stream_id, attachments),
+                        kwargs=worker_kwargs,
+                        daemon=True,
+                    )
+                    thr.start()
+                except Exception as exc:
+                    if backend_is_gateway and stream_id:
+                        try:
+                            from api.gateway_chat import _finish_gateway_run_starting
+                            from api.gateway_chat import _clear_gateway_run_starting
+
+                            _finish_gateway_run_starting(stream_id)
+                            _clear_gateway_run_starting(stream_id)
+                        except Exception:
+                            logger.debug(
+                                "Failed to record gateway run-start failure for stream %s",
+                                stream_id,
+                                exc_info=True,
+                            )
+                    cleanup_result = None
+                    if snapshot is not None and stream_id:
+                        cleanup_result = _cleanup_chat_start_launch_failure(
+                            s,
+                            stream_id,
+                            snapshot,
+                            backup_provenance=backup_provenance,
+                            lock_held=True,
+                        )
+                    if cleanup_result is not None:
+                        try:
+                            exc._chat_start_cleanup_result = cleanup_result
+                        except Exception:
+                            pass
+                    restore_consumed_continuation_markers()
+                    if journal_event:
+                        try:
+                            from api.turn_journal import append_turn_journal_event
+
+                            append_turn_journal_event(
+                                s.session_id,
+                                {
+                                    "event": "interrupted",
+                                    "stream_id": stream_id,
+                                    "turn_id": journal_event.get("turn_id"),
+                                    "reason": "start_compensated",
+                                },
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to close compensated turn journal event",
+                                exc_info=True,
+                            )
+                    raise
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None
@@ -23999,68 +24417,19 @@ def _start_chat_stream_for_session(
                     "_status": 409,
                 }
     if was_hidden_empty_session:
-        publish_session_list_changed(
-            "session_new",
-            profile=getattr(s, "profile", None),
-            session_id=getattr(s, "session_id", None),
-        )
-    diag.stage("turn_journal_submitted") if diag else None
-    journal_event = {}
-    try:
-        from api.turn_journal import append_turn_journal_event
-        journal_event = append_turn_journal_event(
-            s.session_id,
-            {
-                "event": "submitted",
-                "stream_id": stream_id,
-                "role": "user",
-                "content": msg,
-                "attachments": attachments,
-                "workspace": workspace,
-                "model": model,
-                "model_provider": model_provider,
-                "created_at": s.pending_started_at,
-            },
-        )
-    except Exception:
-        logger.warning("Failed to append submitted turn journal event", exc_info=True)
+        try:
+            publish_session_list_changed(
+                "session_new",
+                profile=getattr(s, "profile", None),
+                session_id=getattr(s, "session_id", None),
+            )
+        except Exception:
+            logger.debug("Failed to publish session_new after chat start", exc_info=True)
     diag.stage("set_last_workspace") if diag else None
-    set_last_workspace(workspace, profile=getattr(s, "profile", None))
-    diag.stage("stream_registration") if diag else None
-    stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
-    if goal_related:
-        STREAM_GOAL_RELATED[stream_id] = True
-    diag.stage("worker_thread_start") if diag else None
-    worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
-    if moa_config and not backend_is_gateway:
-        worker_kwargs["moa_config"] = moa_config
-    if backend_is_gateway:
-        from api.gateway_chat import _mark_gateway_run_starting
-        _mark_gateway_run_starting(stream_id)
-    thr = threading.Thread(
-        target=worker_target,
-        args=(s.session_id, msg, model, workspace, stream_id, attachments),
-        kwargs=worker_kwargs,
-        daemon=True,
-    )
     try:
-        thr.start()
+        set_last_workspace(workspace, profile=getattr(s, "profile", None))
     except Exception:
-        if backend_is_gateway:
-            try:
-                from api.gateway_chat import _finish_gateway_run_starting
-                _finish_gateway_run_starting(stream_id)
-                from api.gateway_chat import _clear_gateway_run_starting
-                _clear_gateway_run_starting(stream_id)
-            except Exception:
-                logger.debug("Failed to record gateway run-start failure for stream %s", stream_id, exc_info=True)
-        _cleanup_chat_start_launch_failure(s, stream_id)
-        raise
+        logger.debug("Failed to persist last workspace after chat start", exc_info=True)
     response = {
         "stream_id": stream_id,
         "session_id": s.session_id,
@@ -24262,7 +24631,7 @@ def _process_wakeup_provider_has_recovery_credential(
     if not provider_id:
         return False
     profile_name = str(getattr(session, "profile", "") or "").strip()
-    if profile_name and not _is_root_profile(profile_name):
+    if profile_name:
         with profile_scope_for_detached_worker(
             profile_name,
             "process_wakeup credential revalidation",
@@ -24879,6 +25248,50 @@ def _is_silent_control_message(message) -> bool:
     return str(message or "").strip() == "[SILENT]"
 
 
+def _restore_chat_start_compression_recovery(session, recovery, cleanup_result=None):
+    """Restore recovery metadata without replacing an unreadable backup."""
+    session.compression_recovery = recovery
+    session.recommended_recovery_action = recovery.get("recommended_action")
+    if cleanup_result and cleanup_result.get("backup_provenance") is not None:
+        if not cleanup_result.get("sidecar_restored"):
+            try:
+                _restore_chat_start_entry_sidecar(cleanup_result["backup_provenance"])
+                cleanup_result["sidecar_restored"] = True
+            except Exception:
+                logger.debug(
+                    "Skipped compression recovery save because sidecar restore failed for %s",
+                    getattr(session, "session_id", None),
+                    exc_info=True,
+                )
+                return None
+        return _save_chat_start_compression_recovery(session)
+    backup_path = Path(session.path).with_suffix(".json.bak")
+    try:
+        backup_path.read_bytes()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug(
+            "Skipped compression recovery save because backup is unreadable for %s",
+            getattr(session, "session_id", None),
+            exc_info=True,
+        )
+        return None
+    return _save_chat_start_compression_recovery(session)
+
+
+def _save_chat_start_compression_recovery(session):
+    try:
+        session.save()
+    except Exception as restore_err:
+        logger.exception(
+            "failed to restore compression recovery after chat start rejection for %s",
+            getattr(session, "session_id", None),
+        )
+        return restore_err
+    return None
+
+
 def _handle_chat_start(handler, body, diag=None):
     try:
         diag.stage("validate_session_id") if diag else None
@@ -25174,17 +25587,15 @@ def _handle_chat_start(handler, body, diag=None):
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
         recovery_cleared_for_start = None
+        recovery_restore_error = None
         def _restore_cleared_recovery():
             if recovery_cleared_for_start is None:
                 return None
-            s.compression_recovery = recovery_cleared_for_start
-            s.recommended_recovery_action = recovery_cleared_for_start.get("recommended_action")
-            try:
-                s.save()
-            except Exception as restore_err:
-                logger.exception("failed to restore compression recovery after chat start rejection for %s", getattr(s, "session_id", None))
-                return restore_err
-            return None
+            return _restore_chat_start_compression_recovery(
+                s,
+                recovery_cleared_for_start,
+                getattr(recovery_restore_error, "_chat_start_cleanup_result", None),
+            )
 
         if recovery and regeneration is None:
             recovery_cleared_for_start = copy.deepcopy(recovery)
@@ -25195,6 +25606,7 @@ def _handle_chat_start(handler, body, diag=None):
                 **start_run_kwargs,
             )
         except Exception as exc:
+            recovery_restore_error = exc
             if not getattr(exc, "_regeneration_accepted", False):
                 _restore_cleared_recovery()
             raise

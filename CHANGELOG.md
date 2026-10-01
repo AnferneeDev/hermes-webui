@@ -44,6 +44,24 @@
 
 ### Fixed
 
+- **A chat start that fails before the agent runs no longer leaves a phantom message behind.** With eager
+  session saving on, the submitted prompt was written to disk before setup finished. If the start was then
+  rejected, that prompt stayed in the transcript as a turn that never ran, and a retry showed it twice. A
+  rejected start now restores the session as it was before the attempt, keeps any recovery backup that
+  already existed, and puts back pending wake-up markers it had consumed. (#7193, #7249 by @rodboev)
+- **Renaming, moving or archiving a session no longer overwrites a newer save.** These three actions looked the
+  session up before taking its lock. If the in-memory cache evicted it in between and something else (a draft
+  autosave, for example) saved a newer copy, the action then saved its stale copy over it, silently undoing the
+  newer change (#7738). The session is now resolved again inside the lock, and the move check runs against that
+  copy. CLI/TUI sessions keep their source identity through the reload, and a WebUI fork stays a fork. Thanks
+  @happy5318. (#7776)
+- **Background workers for the default profile keep their own profile.** A detached worker (a model-catalog
+  rebuild, the process-wakeup credential check) entered for the default/root profile used to skip binding the
+  request profile entirely, so it ran with whatever profile the thread last had or the process default. It now
+  binds the default profile explicitly (without copying a named profile's environment), and on exit restores
+  the exact profile that was active before, rather than clearing it. Nested scopes, exceptions and reused
+  executor threads all end with the outer profile intact. Part of #6326. Thanks @webtecnica for the original
+  diagnosis.
 - **Replayed copies of a saved message no longer pile up in the session file.** When a stream reconnect or
   re-persist wrote the same stored message again (same `id`, same `timestamp`, identical content), each save
   appended another copy, so a session could grow without bound (#6568). Saving now drops only those exact
