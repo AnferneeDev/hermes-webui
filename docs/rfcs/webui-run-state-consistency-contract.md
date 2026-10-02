@@ -126,13 +126,20 @@ and still-arriving hooks do not consume that budget. One successful recovery
 ends the pass. A failed cancellation save restores the projection and ends the
 pass before any stale marker reference can be reused.
 
-Interrupted-hook scans pass journal-recovered assistant rows, so newer recovered
-cancellation output does not hide an older interrupted hook. Ordinary assistant
-turns retain the existing stopping boundary. Reordering moves only the selected
-stream's rows, and tools retain their exact display owner after both movement
-and terminal-marker removal. Cancelled provider context remains exact-token
-owned; tokenless legacy interrupted context uses its existing projection rules,
-without inferring cross-turn ownership from text, timestamps, or display ordinals.
+Interrupted-hook scans bypass only assistant rows carrying the explicit
+`_recovered_from_cancel_journal: true` provenance stamped by successful exact-stream
+cancellation recovery. Other recovered and ordinary assistant turns retain the
+existing stopping boundary; a stream ID alone does not authorize bypass.
+Interrupted output recovered behind a later user remains display-only
+(`_recovered_display_only: true`), including during empty-context seeding and
+Agent/API replay sanitization. It must not be appended as the newer turn's answer.
+Latest-turn interrupted output retains its existing provider-context projection.
+Display deduplication stays within the selected interrupted user/marker window;
+that window is not provider-context ownership evidence. Reordering moves only
+the selected stream's rows, and tools retain their exact display owner after
+both movement and terminal-marker removal. Cancelled provider context remains
+exact-token owned; no cross-turn context ownership is inferred from text,
+timestamps, or display ordinals.
 
 ## Inactive compression continuation recovery
 

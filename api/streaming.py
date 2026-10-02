@@ -6955,6 +6955,11 @@ def _sanitize_messages_for_api(
         allowed_keys = _API_SAFE_MSG_KEYS | {"api_content"}
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
+    # Late recovery can restore display rows without proving a context owner.
+    # Filter before tool-ID collection and metadata stripping on both paths.
+    messages = [message for message in messages if not (
+        isinstance(message, dict) and message.get('_recovered_display_only') is True
+    )]
     valid_tool_call_ids: set = set()
     for msg in messages:
         if not isinstance(msg, dict):
@@ -7122,7 +7127,7 @@ def _api_safe_message_positions(messages):
     """Return [(original_index, sanitized_message)] for API-safe messages."""
     valid_tool_call_ids: set = set()
     for msg in messages:
-        if not isinstance(msg, dict):
+        if not isinstance(msg, dict) or msg.get('_recovered_display_only') is True:
             continue
         if msg.get('role') == 'assistant':
             for tc in msg.get('tool_calls') or []:
@@ -7133,7 +7138,7 @@ def _api_safe_message_positions(messages):
 
     out = []
     for idx, msg in enumerate(messages):
-        if not isinstance(msg, dict):
+        if not isinstance(msg, dict) or msg.get('_recovered_display_only') is True:
             continue
         if _is_reasoning_only_assistant_message(msg):
             continue

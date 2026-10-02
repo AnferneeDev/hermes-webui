@@ -917,7 +917,7 @@ def _active_stream_ids():
 
 
 def _recovered_model_context_projection(message: dict) -> dict | None:
-    if not isinstance(message, dict):
+    if not isinstance(message, dict) or message.get('_recovered_display_only') is True:
         return None
     projected = dict(message)
     projected.pop('reasoning', None)
@@ -3383,12 +3383,19 @@ def _recover_journaled_output_and_terminal_error(
     *,
     dedupe_existing: bool = False,
     terminal_recovery: dict | None = None,
+    append_context: bool = True,
+    dedupe_min_index: int | None = None,
+    dedupe_max_index: int | None = None,
 ) -> tuple[bool, bool]:
     """Recover readable activity first, then append its authoritative terminal error."""
     recovered_output = _append_journaled_partial_output(
         session,
         stream_id,
         dedupe_existing=dedupe_existing,
+        dedupe_min_index=dedupe_min_index,
+        dedupe_max_index=dedupe_max_index,
+        append_context=append_context,
+        display_only=not append_context,
     )
     terminal_error_recovered = _materialize_unsaved_gateway_terminal_error(
         session,
@@ -3439,6 +3446,7 @@ def _append_journaled_partial_output(
     dedupe_min_index: int | None = None,
     dedupe_max_index: int | None = None,
     append_context: bool = True,
+    display_only: bool = False,
 ) -> bool:
     """Recover already-emitted visible output from a dead stream journal.
 
@@ -3609,6 +3617,8 @@ def _append_journaled_partial_output(
             '_recovered_stream_id': stream_id,
         }
         attach_display_reasoning(recovered_assistant, reasoning)
+        if display_only:
+            recovered_assistant['_recovered_display_only'] = True
         session.messages.append(recovered_assistant)
         append_context_projection(recovered_assistant)
         current_assistant_idx = len(session.messages) - 1
@@ -3656,6 +3666,8 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
+        if display_only:
+            recovered_anchor['_recovered_display_only'] = True
         session.messages.append(recovered_anchor)
         current_assistant_idx = len(session.messages) - 1
         appended_any = True
@@ -4024,7 +4036,7 @@ def _session_has_pending_journal_retry(session) -> bool:
         if msg.get('_pending_journal_recovery'):
             return True
         if msg.get('role') == 'assistant' and not msg.get('_error') \
-                and not msg.get('_recovered_stream_id'):
+                and msg.get('_recovered_from_cancel_journal') is not True:
             # A normal assistant turn after any pending marker — nothing to
             # retry above this point.
             return False
@@ -4209,7 +4221,7 @@ def _retry_journal_recovery_in_place(
                         continue
                     if candidate.get('role') == 'assistant' and not candidate.get('_error') \
                             and not candidate.get('_pending_journal_recovery') \
-                            and not candidate.get('_recovered_stream_id'):
+                            and candidate.get('_recovered_from_cancel_journal') is not True:
                         # Walked past the pending marker without finding it.
                         return False
                     if (
@@ -4313,16 +4325,41 @@ def _retry_journal_recovery_in_place(
                             exc_info=True,
                         )
                     return False
+                # A display marker proves where to restore its rows, not where
+                # to insert them into provider context behind a successor user.
+                has_successor = any(
+                    isinstance(row, dict) and row.get('role') == 'user'
+                    for row in messages[idx + 1:]
+                )
+                owner_index = next((
+                    index for index in range(idx - 1, -1, -1)
+                    if isinstance(messages[index], dict)
+                    and messages[index].get('role') == 'user'
+                ), None)
                 recovered_output, terminal_error_recovered = (
                     _recover_journaled_output_and_terminal_error(
                         session,
                         stream_id,
                         dedupe_existing=True,
+                        append_context=not has_successor,
+                        dedupe_min_index=owner_index + 1 if owner_index is not None else idx,
+                        dedupe_max_index=idx,
                     )
                 )
 
             if recovered_output or terminal_error_recovered:
                 if cancel_hook:
+                    # Only this successful cancellation action can authorize
+                    # scans past its exact-stream recovered assistant rows.
+                    for row in session.messages:
+                        if (
+                            isinstance(row, dict)
+                            and row.get('role') == 'assistant'
+                            and not row.get('_error')
+                            and row.get('_recovered_from_run_journal') is True
+                            and str(row.get('_recovered_stream_id') or '') == str(stream_id)
+                        ):
+                            row['_recovered_from_cancel_journal'] = True
                     _rehome_cancel_journal_rows(session, idx, str(stream_id))
                     _rehome_cancel_journal_context(
                         session,

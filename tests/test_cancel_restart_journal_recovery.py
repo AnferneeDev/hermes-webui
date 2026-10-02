@@ -1487,7 +1487,7 @@ def test_mixed_multiple_retry_turns_keep_boundaries_and_independent_budgets(
                 recovered, prefer_context=True, state_messages=[],
             )
         )
-        assert any(row.get("content") == "Oldest output" for row in history)
+        assert any(row.get("content") == "Oldest output" for row in history) is (older_kind == "cancelled")
 
 
 @pytest.mark.parametrize("expiry", ["attempts", "age"])
@@ -1568,3 +1568,129 @@ def test_older_interrupted_terminal_error_keeps_newer_cancel_tool_owner():
     assert {tool["tid"] for tool in recovered.tool_calls} == {"old-error-tool", "new-tool"}
     models.SESSIONS.clear()
     _assert_retry_turn_ownership(models.get_session(sid), kinds, streams)
+
+
+@pytest.mark.parametrize("cache_hits", [False, True], ids=["cold", "cached"])
+@pytest.mark.parametrize("later_cancel", [False, True])
+@pytest.mark.parametrize("newer_output", ["prose", "reasoning", "tool"])
+def test_two_interrupted_hooks_keep_newest_assistant_cutoff(cache_hits, later_cancel, newer_output):
+    """A later interrupted recovery is an answer boundary, not a cancel recovery."""
+    sid = f"round5-two-interrupts-{cache_hits}-{later_cancel}-{newer_output}"
+    kinds = ["interrupted", "interrupted"]
+    new_events = {
+        "prose": [("token", {"text": "New interrupted answer"})],
+        "reasoning": [("reasoning", {"text": "New interrupted thought"})],
+        "tool": [("tool", {"name": "read_file", "tid": "new-interrupted-tool", "args": {"path": "new.txt"}})],
+    }[newer_output]
+    outputs = [[("token", {"text": "Old interrupted answer"})], new_events]
+    if later_cancel:
+        # A pending cancellation forces the retry selector to run even after
+        # the scan-only fast path has a newer non-cancel assistant boundary.
+        kinds.append("cancelled")
+        outputs.append([])
+    streams = _persist_multi_retry_turns(sid, kinds, outputs)
+    first = models.get_session(sid)
+    assert _stream_output(first, streams[1])
+    initial_context = copy.deepcopy(first.context_messages)
+    for _ in range(3):
+        if not cache_hits:
+            models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        assert not _stream_output(recovered, streams[0])
+        assert _pending_stream_hook(recovered, streams[0])["_journal_retry_attempts"] == 0
+        assert recovered.context_messages == initial_context
+        _assert_retry_turn_ownership(recovered, kinds, streams)
+    from api.streaming import _sanitize_messages_for_agent
+    history = _sanitize_messages_for_agent(models.reconciled_state_db_messages_for_session(
+        recovered, prefer_context=True, state_messages=[],
+    ))
+    assert not any(row.get("content") == "Old interrupted answer" for row in history)
+
+
+@pytest.mark.parametrize("cache_hits", [False, True], ids=["cold", "cached"])
+@pytest.mark.parametrize("context_shape", ["full", "empty", "compressed"])
+@pytest.mark.parametrize("equal_prose", [False, True])
+def test_older_interrupted_recovery_is_display_only_behind_cancelled_successor(
+    cache_hits, context_shape, equal_prose,
+):
+    sid = f"round5-display-only-{cache_hits}-{context_shape}-{equal_prose}"
+    old_text = "Repeated answer" if equal_prose else "Old display-only answer"
+    new_text = "Repeated answer" if equal_prose else "New cancelled answer"
+    kinds = ["interrupted", "cancelled"]
+    streams = _persist_multi_retry_turns(sid, kinds, [
+        [("token", {"text": old_text}),
+         ("tool", {"name": "read_file", "tid": "old-display-tool", "args": {"path": "old.txt"}})],
+        [("token", {"text": new_text}),
+         ("tool", {"name": "read_file", "tid": "new-display-tool", "args": {"path": "new.txt"}})],
+    ])
+    first = models.get_session(sid)
+    assert _stream_output(first, streams[1])
+    if context_shape == "empty":
+        first.context_messages = []
+    elif context_shape == "compressed":
+        first.context_messages = [{"role": "system", "content": "Context compression: newer work only."}]
+    first.save()
+    if not cache_hits:
+        models.SESSIONS.clear()
+    recovered = models.get_session(sid)
+    assert [row["content"] for row in _stream_output(recovered, streams[0]) if row.get("content")] == [old_text]
+    assert _pending_stream_hook(recovered, streams[0]) is None
+    _assert_retry_turn_ownership(recovered, kinds, streams)
+    from api.streaming import _sanitize_messages_for_agent, _sanitize_messages_for_api, _api_safe_message_positions
+    for _ in range(3):
+        if not cache_hits:
+            models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        _assert_retry_turn_ownership(recovered, kinds, streams)
+        # Exercise the real next-send reconciliation, as well as raw display
+        # fallbacks used by replay/compression and empty-context seeding.
+        inputs = [models.reconciled_state_db_messages_for_session(
+            recovered, prefer_context=True, state_messages=[],
+        ), recovered.messages]
+        for rows in inputs:
+            histories = [_sanitize_messages_for_agent(rows), _sanitize_messages_for_api(rows),
+                         [row for _, row in _api_safe_message_positions(rows)]]
+            for history in histories:
+                expected = int(equal_prose and (context_shape != "compressed" or rows is recovered.messages))
+                assert sum(row.get("content") == old_text for row in history) == expected
+        seeded = []
+        models._seed_recovered_context_from_messages(recovered, seeded)
+        assert sum(row.get("content") == old_text for row in seeded) == (1 if equal_prose else 0)
+
+
+def test_latest_interrupted_recovery_still_feeds_provider_context():
+    sid = "round5-latest-interrupted-context"
+    streams = _persist_multi_retry_turns(sid, ["interrupted"], [[("token", {"text": "Current interrupted answer"})]])
+    recovered = models.get_session(sid)
+    assert [row["content"] for row in _stream_output(recovered, streams[0])] == ["Current interrupted answer"]
+    from api.streaming import _sanitize_messages_for_agent
+    history = _sanitize_messages_for_agent(models.reconciled_state_db_messages_for_session(
+        recovered, prefer_context=True, state_messages=[],
+    ))
+    assert [(row["role"], row["content"]) for row in history] == [
+        ("user", "Prompt 0"), ("assistant", "Current interrupted answer"),
+    ]
+
+
+@pytest.mark.parametrize("tag_value", [None, False, "true"])
+def test_unproven_cancel_recovery_rows_keep_interrupted_scan_boundary(tag_value):
+    sid = f"round5-unproven-cancel-{tag_value}"
+    kinds = ["interrupted", "cancelled"]
+    streams = _persist_multi_retry_turns(sid, kinds, [
+        [("token", {"text": "Old interrupted answer"})],
+        [("token", {"text": "New cancellation answer"})],
+    ])
+    recovered = models.get_session(sid)
+    for row in _stream_output(recovered, streams[1]):
+        if tag_value is None:
+            row.pop("_recovered_from_cancel_journal", None)
+        else:
+            row["_recovered_from_cancel_journal"] = tag_value
+    recovered.save()
+    original_context = copy.deepcopy(recovered.context_messages)
+    for _ in range(2):
+        models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        assert not _stream_output(recovered, streams[0])
+        assert recovered.context_messages == original_context
+        assert _pending_stream_hook(recovered, streams[0])["_journal_retry_attempts"] == 0
