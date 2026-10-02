@@ -5203,8 +5203,73 @@ def _models_rebuild_superseded(rebuild_seq: int) -> bool:
     then release the build flag that already belongs to the newer rebuild — the
     invalidation has to fence against the latest allocated generation to be a
     real freshness boundary.
+
+    Invalidation advances the allocated generation itself, so a build that was
+    already running when the cache was invalidated is superseded even when no
+    successor rebuild is ever allocated. Without that, the delayed worker stayed
+    eligible and repopulated the catalog that had just been cleared.
     """
     return rebuild_seq < _models_rebuild_seq
+
+
+def _models_build_identity_current(
+    build_fingerprint, build_profile
+) -> bool:
+    """True when a build's source/profile identity is still the current one.
+
+    A catalog is only an answer for the config, auth state and provider catalog
+    it was *read from*. A build that started before a config edit and publishes
+    afterwards would otherwise stamp its stale catalog with the fingerprint of
+    the sources it never saw — a fresh-looking provenance on stale data — and on
+    the disk path that is exactly what makes the stale file look loadable
+    (#7481 review). So the identity captured when the build started is compared
+    again at publication and at the durable commit; a mismatch means the result
+    is dropped and the next caller rebuilds.
+
+    ``build_fingerprint`` / ``build_profile`` are ``None`` for the legacy caller
+    that has no rebuild to fence (nothing is validated then). A ``None``
+    profile — single-profile installs, or a runtime where ``api.profiles`` could
+    not be imported — skips the profile axis; the fingerprint's
+    ``config_yaml`` axis is the profile-specific config path, so a foreign
+    profile's catalog still fails that comparison.
+
+    Fails CLOSED: an identity that cannot be read is not treated as a match.
+    """
+    if build_fingerprint is None:
+        return True
+    try:
+        if _models_cache_source_fingerprint() != build_fingerprint:
+            return False
+    except Exception:
+        return False
+    if build_profile is not None:
+        try:
+            from api.profiles import get_active_profile_name
+
+            if (get_active_profile_name() or "").strip() != build_profile:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+# Serializes the durable (on-disk) catalog commit. The in-memory generation
+# fence alone cannot order two *file* writers: a publisher decides under
+# ``_cache_build_cv`` and then writes the file with that lock released (a disk
+# write must not run inside the catalog lock), so an older publisher can reach
+# the filesystem after a newer one has already committed and revert the durable
+# catalog — valid-looking JSON from a superseded build (#7481 review). The
+# commit is therefore taken under this lock and re-validated against the
+# generation and the sources it was built from, immediately before the rename.
+_models_cache_disk_commit_lock = threading.Lock()
+# Generation of the newest rebuild whose payload actually reached the durable
+# file, guarded by ``_models_cache_disk_commit_lock``. The generation fence alone
+# leaves one check-then-use window on the disk path: a publisher can pass its
+# check, be descheduled, let a newer build commit, and only then take the commit
+# lock — reverting the file it just lost to. Remembering the last committed
+# generation inside the lock closes that window without holding the catalog lock
+# across a file write.
+_models_disk_committed_seq: int = 0
 
 
 # Memoized (snapshot_ref, {provider_slug: frozenset(model_ids)}) derived from
@@ -5381,18 +5446,37 @@ class _CustomProbeSchedule:
     for any chain length is the total: the probes can never between them spend
     past the window, so the foreground caller still receives a published catalog
     rather than the over-budget fallback.
+
+    The window is the CALLER's window, not this chain's: ``deadline`` is an
+    absolute instant captured once before the worker and the foreground wait
+    start (see ``__init__``), so work that happens earlier in the rebuild is paid
+    out of the same window instead of being re-granted to the chain.
     """
 
-    def __init__(self, endpoint_count: int, *, out_of_band=None) -> None:
+    def __init__(self, endpoint_count: int, *, out_of_band=None, deadline=None) -> None:
+        """``deadline`` is the ABSOLUTE ``time.monotonic()`` instant the shared
+        window ends — the same instant the foreground caller stops waiting on
+        (#7481 review). The caller that owns the rebuild captures it once, before
+        the worker and the foreground wait start, because a deadline minted here
+        would be minted at construction time: any discovery work that ran before
+        the custom-probe phase (provider detection, the live id lookups, the
+        profile rebind) would be spent twice — once against the caller's wait and
+        again against a fresh window handed to this chain — so the chain could
+        still be probing for seconds after the caller had been served a fallback.
+        ``None`` falls back to "one window from now" for standalone callers.
+        """
         self._remaining = max(1, int(endpoint_count))
         self._cap = float(CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS)
         self._attempt_only = float(CUSTOM_MODELS_ATTEMPT_ONLY_TIMEOUT_SECONDS)
         self._out_of_band = out_of_band
-        self._deadline = (
-            time.monotonic() + float(_LIVE_REBUILD_BUDGET_SECONDS)
-            if _LIVE_REBUILD_BUDGET_SECONDS > 0
-            else None
-        )
+        if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
+            # Legacy unbounded path: there is no window to share, so an absolute
+            # deadline is meaningless and the explicit one (if any) is ignored.
+            self._deadline = None
+        elif deadline is not None:
+            self._deadline = float(deadline)
+        else:
+            self._deadline = time.monotonic() + float(_LIVE_REBUILD_BUDGET_SECONDS)
 
     def next_timeout(self) -> float:
         """Timeout for the next probe in the chain, then advance the schedule."""
@@ -6617,7 +6701,9 @@ def _load_stale_models_cache_from_disk() -> dict | None:
         return None
 
 
-def _save_models_cache_to_disk(cache: dict) -> None:
+def _save_models_cache_to_disk(
+    cache: dict, *, rebuild_seq=None, build_fingerprint=None, build_profile=None
+) -> None:
     """Save cache to disk so it survives server restarts.
 
     Stamps the payload with `_webui_version` and `_schema_version` (#1633) so
@@ -6632,13 +6718,31 @@ def _save_models_cache_to_disk(cache: dict) -> None:
     a mismatch (since runtime_version is non-None on every subsequent call),
     so this is safe — at worst we write one cache file that gets rejected
     once on the next boot.
+
+    The commit is fenced (#7481 review). Two overlapping publishers used to
+    pick the SAME ``.<pid>.tmp`` path, so the newer writer's rename could be
+    undone by the older writer's still-open descriptor, leaving stale-but-valid
+    JSON as the durable catalog; and there was no re-check between the in-memory
+    generation decision and the rename. So the temp file is unique per build, and
+    the rename is taken under ``_models_cache_disk_commit_lock`` after
+    re-validating that this build is still the newest allocated generation and is
+    still publishing for the sources it read. A superseded or re-sourced commit
+    discards its temp file and leaves the durable catalog to the build that won.
+    ``_source_fingerprint`` records the fingerprint the build READ, so the file
+    can never claim provenance it did not have.
     """
+    global _models_disk_committed_seq
+    tmp = None
     try:
         if not _is_valid_models_cache(cache):
             return
         payload = {
             "_schema_version": _MODELS_CACHE_SCHEMA_VERSION,
-            "_source_fingerprint": _models_cache_source_fingerprint(),
+            "_source_fingerprint": (
+                build_fingerprint
+                if build_fingerprint is not None
+                else _models_cache_source_fingerprint()
+            ),
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
             "configured_model_badges": cache["configured_model_badges"],
@@ -6648,12 +6752,64 @@ def _save_models_cache_to_disk(cache: dict) -> None:
         if runtime_version is not None:
             payload["_webui_version"] = runtime_version
         cache_path = _get_models_cache_path()
-        tmp = str(cache_path) + f".{os.getpid()}.tmp"
+        # Unique per build AND per thread: a shared per-pid name is what let two
+        # concurrent publishers collide on one temp path. Same directory, so the
+        # commit stays a same-filesystem (atomic) rename.
+        tmp = "{}.{}.{}.{}.tmp".format(
+            cache_path,
+            os.getpid(),
+            threading.get_ident(),
+            "unfenced" if rebuild_seq is None else int(rebuild_seq),
+        )
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
-        os.rename(tmp, str(cache_path))
+        with _models_cache_disk_commit_lock:
+            # Commit-time fence, not merely a pre-write check: the write above is
+            # slow enough for a newer build to publish in the meantime, and the
+            # durable file must never be reverted to an older catalog.
+            #
+            # Lock order is commit lock -> catalog lock; nothing takes them the
+            # other way round (the publishers call this with `_cache_build_cv`
+            # released, because a file write must not run inside the catalog
+            # lock).
+            with _cache_build_cv:
+                superseded = rebuild_seq is not None and _models_rebuild_superseded(
+                    rebuild_seq
+                )
+            if superseded or (
+                rebuild_seq is not None
+                and (
+                    # A publisher that passed its check, was descheduled while a
+                    # newer build committed, and only then reached this lock would
+                    # otherwise revert the file it just lost to.
+                    int(rebuild_seq) < _models_disk_committed_seq
+                    or not _models_build_identity_current(
+                        build_fingerprint, build_profile
+                    )
+                )
+            ):
+                logger.debug(
+                    "discarding models-cache disk commit from superseded rebuild "
+                    "#%s (latest allocated rebuild #%s, latest committed #%s)",
+                    rebuild_seq,
+                    _models_rebuild_seq,
+                    _models_disk_committed_seq,
+                )
+                return
+            os.replace(tmp, str(cache_path))
+            tmp = None
+            if rebuild_seq is not None:
+                _models_disk_committed_seq = max(
+                    _models_disk_committed_seq, int(rebuild_seq)
+                )
     except Exception:
         pass  # Non-fatal -- cache will rebuild on next call
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass  # already gone / never created
 
 
 def _get_fresh_memory_models_cache(now: float) -> dict | None:
@@ -6700,6 +6856,16 @@ def invalidate_models_cache():
     that call invalidate_models_cache() still get back the previous test's
     result from the disk cache because the disk hit is checked before the memory
     cache rebuild runs.
+
+    It also REVOKES any rebuild that is already in flight (#7481 review):
+    clearing the cache and the build flag without cancelling the running worker
+    left that worker eligible, so it repopulated the catalog that had just been
+    cleared — memory, provenance and the durable file — and stamped the stale
+    result with the *current* source fingerprint, making it look freshly built.
+    Advancing the allocated generation here makes every build that started before
+    this call superseded (see _models_rebuild_superseded), which is the freshness
+    boundary this function has to be, even when no successor rebuild is ever
+    allocated.
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
@@ -6709,6 +6875,10 @@ def invalidate_models_cache():
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
         _sync_models_cache_provenance()
+        # Fence the in-flight generation first: taken under
+        # _available_models_cache_lock, which _allocate_models_rebuild_seq
+        # requires.
+        _allocate_models_rebuild_seq()
         _cache_build_in_progress = False
         _cache_build_cv.notify_all()
         # Clear the credential pool cache too (all profiles). Without this,
@@ -7044,6 +7214,21 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     # closure so the closure can capture it as a free variable; on the legacy
     # synchronous path it is simply never set and there is no window to share.
     _models_rebuild_abandoned = threading.Event()
+
+    # ONE absolute deadline for this whole rebuild (#7481 review). Captured
+    # before the worker and the foreground wait start, then read by BOTH: by
+    # ``_CustomProbeSchedule`` (so the custom-probe chain spends what is LEFT of
+    # the caller's window rather than minting a fresh one after whatever
+    # discovery work already ran) and by the foreground ``build_done.wait``
+    # below. A schedule that minted its own deadline let earlier discovery work
+    # — provider detection, live id lookups, the profile rebind — be paid twice:
+    # once against the caller's wait, again against the chain's fresh window, so
+    # the chain could still be probing seconds after the caller had been served
+    # the over-budget fallback. ``None`` means the legacy unbounded path
+    # (budget <= 0), where there is no window to share. Defined before the
+    # builder closure so the closure can capture it as a free variable; assigned
+    # in the cold path below, before either caller runs.
+    _models_rebuild_deadline: float | None = None
 
     def _build_available_models_uncached() -> dict:
         active_provider = None
@@ -7780,6 +7965,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         custom_probe_schedule = _CustomProbeSchedule(
             _pending_custom_probe_count(),
             out_of_band=_models_rebuild_abandoned.is_set,
+            deadline=_models_rebuild_deadline,
         )
 
         # 4. Fetch models from custom endpoint if base_url is configured
@@ -8837,6 +9023,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # and used to keep a late out-of-band publisher from overwriting a newer
         # catalog (#7481).
         rebuild_seq = _allocate_models_rebuild_seq()
+        # The one absolute deadline this rebuild runs against: the custom-probe
+        # schedule and the foreground wait below both measure THIS instant, so
+        # discovery work done before the probe chain is spent out of the caller's
+        # window instead of being re-granted to the chain (#7481 review).
+        if _LIVE_REBUILD_BUDGET_SECONDS > 0:
+            _models_rebuild_deadline = (
+                time.monotonic() + float(_LIVE_REBUILD_BUDGET_SECONDS)
+            )
 
         # Capture the active per-request profile (#3957). The live provider
         # probe inside the rebuild resolves credentials from os.environ /
@@ -8849,6 +9043,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         _active_profile_name = ""
         _prof_env_request = None
         _prof_scope_worker = None
+        _profile_resolver = None
         try:
             from api.profiles import (
                 get_active_profile_name as _gapn,
@@ -8856,9 +9051,41 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 profile_scope_for_detached_worker as _prof_scope_worker,
             )
             _active_profile_name = (_gapn() or "").strip()
+            _profile_resolver = _gapn
         except Exception:
             _prof_env_request = None
             _prof_scope_worker = None
+
+        # The sources and the profile this build is reading (#7481 review). The
+        # result is only an answer for THESE inputs, so both are captured here —
+        # on the request thread, where the profile TLS is valid, before the
+        # worker starts — and re-validated at publication and at the durable
+        # commit. Without that, a build that outlives a config edit publishes its
+        # stale catalog stamped with the *current* fingerprint, which is exactly
+        # how stale data acquires fresh-looking provenance. ``None`` profile
+        # means the resolver was unavailable; the fingerprint's config-path axis
+        # still fences a foreign profile.
+        rebuild_source_fingerprint = _models_cache_source_fingerprint()
+        rebuild_profile = (
+            _active_profile_name if _profile_resolver is not None else None
+        )
+
+        def _clear_build_in_progress(rebuild_seq: int):
+            """Release the single-flight slot only if this build still owns it.
+
+            Defined before both publishers (the legacy synchronous path and the
+            bounded worker path) because both use it on their exit paths.
+            """
+            global _cache_build_in_progress
+            with _cache_build_cv:
+                if _models_rebuild_superseded(rebuild_seq):
+                    # A newer rebuild owns the flag now; releasing it here would
+                    # wake waiters to an empty cache and let another cold rebuild
+                    # start concurrently with the newer one (#7481 review).
+                    return
+                _cache_build_in_progress = False
+                _cache_build_cv.notify_all()
+
 
         # Legacy synchronous (unbounded) rebuild — opt-in via budget<=0.
         if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
@@ -8877,20 +9104,21 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             except BaseException:
                 # Always reset the flag so waiting threads don't block for 60s —
                 # unless a newer rebuild has been allocated in the meantime, in
-                # which case the flag now belongs to it (#7481 review).
-                with _cache_build_cv:
-                    if not _models_rebuild_superseded(rebuild_seq):
-                        _cache_build_in_progress = False
-                        _cache_build_cv.notify_all()
+                # which case the flag now belongs to it (#7481 review). Same
+                # ownership rule as the success path, one implementation.
+                _clear_build_in_progress(rebuild_seq)
                 raise
             with _cache_build_cv:
                 _superseded = _models_rebuild_superseded(rebuild_seq)
-                if not _superseded:
+                _identity_current = _models_build_identity_current(
+                    rebuild_source_fingerprint, rebuild_profile
+                )
+                if not _superseded and _identity_current:
                     published_at = time.monotonic()
                     _available_models_cache = result
                     _available_models_cache_ts = published_at
                     _available_models_live_rebuild_ts = published_at
-                    _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                    _available_models_cache_source_fingerprint = rebuild_source_fingerprint
                     _models_published_seq = rebuild_seq
                     _sync_models_cache_provenance()
             if _superseded:
@@ -8903,12 +9131,27 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _models_rebuild_seq,
                 )
                 return copy.deepcopy(result)
+            if not _identity_current:
+                # The config/auth/catalog this build read changed while it ran, so
+                # it describes sources that no longer exist. Publishing it would
+                # stamp stale data with the current fingerprint; drop it and let
+                # the next caller rebuild (#7481 review).
+                logger.debug(
+                    "discarding models-catalog rebuild result for changed sources "
+                    "(rebuild #%d)",
+                    rebuild_seq,
+                )
+                _clear_build_in_progress(rebuild_seq)
+                return copy.deepcopy(result)
             try:
-                _save_models_cache_to_disk(result)
+                _save_models_cache_to_disk(
+                    result,
+                    rebuild_seq=rebuild_seq,
+                    build_fingerprint=rebuild_source_fingerprint,
+                    build_profile=rebuild_profile,
+                )
             finally:
-                with _cache_build_cv:
-                    _cache_build_in_progress = False
-                    _cache_build_cv.notify_all()
+                _clear_build_in_progress(rebuild_seq)
             return copy.deepcopy(result)
 
         # ── Bounded rebuild (defense-in-depth) ───────────────────────────────
@@ -8940,59 +9183,75 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         publish_lock = threading.Lock()
         box: dict = {}
 
-        def _publish_models_result(result, *, rebuild_seq: int):
+        def _publish_models_result(
+            result, *, rebuild_seq: int, build_fingerprint, build_profile
+        ):
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
             global _available_models_cache_source_fingerprint, _models_published_seq
-            with _cache_build_cv:
-                if _models_rebuild_superseded(rebuild_seq):
-                    # #7481 failure isolation: a newer rebuild has been allocated
-                    # since this one started, so this result is superseded and
-                    # must not overwrite the cache or the disk. Invalidation
-                    # clears _cache_build_in_progress without cancelling an
-                    # in-flight worker, which is how a newer build can be
-                    # allocated while this one is still running; the flag now
-                    # belongs to that newer build, so it is deliberately left set
-                    # rather than released for a build that is not ours. Ordered
-                    # by allocated generation, not by wall clock: an older build
-                    # can publish *after* a newer one started, and a timestamp
-                    # comparison would misread that as newer and drop the newer
-                    # result instead.
-                    logger.debug(
-                        "discarding superseded models-catalog rebuild result "
-                        "(rebuild #%d, latest allocated rebuild #%d)",
-                        rebuild_seq,
-                        _models_rebuild_seq,
-                    )
-                    return
-                published_at = time.monotonic()
-                _available_models_cache = result
-                _available_models_cache_ts = published_at
-                _available_models_live_rebuild_ts = published_at
-                _available_models_cache_source_fingerprint = (
-                    _models_cache_source_fingerprint()
-                )
-                _models_published_seq = rebuild_seq
-                _sync_models_cache_provenance()
             try:
-                _save_models_cache_to_disk(result)
-            except Exception:
-                logger.debug("models cache disk save failed", exc_info=True)
-            finally:
                 with _cache_build_cv:
-                    _cache_build_in_progress = False
-                    _cache_build_cv.notify_all()
-
-        def _clear_build_in_progress(rebuild_seq: int):
-            global _cache_build_in_progress
-            with _cache_build_cv:
-                if _models_rebuild_superseded(rebuild_seq):
-                    # A newer rebuild owns the flag now; releasing it here would
-                    # wake waiters to an empty cache and let another cold rebuild
-                    # start concurrently with the newer one (#7481 review).
-                    return
-                _cache_build_in_progress = False
-                _cache_build_cv.notify_all()
+                    if _models_rebuild_superseded(rebuild_seq):
+                        # #7481 failure isolation: a newer rebuild has been
+                        # allocated since this one started, so this result is
+                        # superseded and must not overwrite the cache or the
+                        # disk. Invalidation revokes the running generation and
+                        # clears _cache_build_in_progress without cancelling this
+                        # worker, which is how a newer build can be allocated while
+                        # this one is still running; the flag now belongs to that
+                        # newer build, so the ``finally`` below deliberately leaves
+                        # it set rather than releasing it for a build that is not
+                        # ours. Ordered by allocated generation, not by wall clock:
+                        # an older build can publish *after* a newer one started,
+                        # and a timestamp comparison would misread that as newer
+                        # and drop the newer result instead.
+                        logger.debug(
+                            "discarding superseded models-catalog rebuild result "
+                            "(rebuild #%d, latest allocated rebuild #%d)",
+                            rebuild_seq,
+                            _models_rebuild_seq,
+                        )
+                        return
+                    if not _models_build_identity_current(
+                        build_fingerprint, build_profile
+                    ):
+                        # The sources this build read are gone (config/auth/catalog
+                        # edit) or the publishing thread is no longer in the
+                        # profile the build belonged to. Publishing would hand the
+                        # catalog the CURRENT fingerprint — fresh-looking
+                        # provenance on data that was never built from it — so it
+                        # is dropped instead. Fail closed (#7481 review).
+                        logger.debug(
+                            "discarding models-catalog rebuild result for changed "
+                            "sources (rebuild #%d)",
+                            rebuild_seq,
+                        )
+                        return
+                    published_at = time.monotonic()
+                    _available_models_cache = result
+                    _available_models_cache_ts = published_at
+                    _available_models_live_rebuild_ts = published_at
+                    _available_models_cache_source_fingerprint = build_fingerprint
+                    _models_published_seq = rebuild_seq
+                    _sync_models_cache_provenance()
+                try:
+                    _save_models_cache_to_disk(
+                        result,
+                        rebuild_seq=rebuild_seq,
+                        build_fingerprint=build_fingerprint,
+                        build_profile=build_profile,
+                    )
+                except Exception:
+                    logger.debug("models cache disk save failed", exc_info=True)
+            finally:
+                # Release the single-flight slot only when this build still owns
+                # it. A newer rebuild may have been allocated while the disk write
+                # above ran with the catalog lock released; clearing the flag
+                # unconditionally there ended that rebuild's single-flight
+                # ownership and let a third rebuild in beside it (#7481 review).
+                # This also covers the error paths, including anything raised
+                # after the disk I/O.
+                _clear_build_in_progress(rebuild_seq)
 
         def _claim_publish() -> bool:
             """Return True iff the caller won the right to publish."""
@@ -9029,7 +9288,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if budget_exceeded.is_set() and _claim_publish():
                         if "result" in box:
                             _publish_models_result(
-                                box["result"], rebuild_seq=rebuild_seq
+                                box["result"],
+                                rebuild_seq=rebuild_seq,
+                                build_fingerprint=rebuild_source_fingerprint,
+                                build_profile=rebuild_profile,
                             )
                         else:
                             _clear_build_in_progress(rebuild_seq)
@@ -9041,14 +9303,30 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         )
         _worker.start()
 
-        if build_done.wait(timeout=_LIVE_REBUILD_BUDGET_SECONDS):
+        # Wait on the SAME absolute deadline the probe schedule draws its slices
+        # from (#7481 review), not on a fresh full window started here: with two
+        # windows, discovery work that ran before the custom-probe phase was paid
+        # by the caller but re-granted to the chain, so the chain could still be
+        # probing after this caller had already been served the over-budget
+        # fallback. Computed after start() so thread-launch time counts too.
+        timeout_remaining = (
+            max(0.0, _models_rebuild_deadline - time.monotonic())
+            if _models_rebuild_deadline is not None
+            else float(_LIVE_REBUILD_BUDGET_SECONDS)
+        )
+        if build_done.wait(timeout=timeout_remaining):
             # Build finished within budget — foreground publishes
             # synchronously, exactly like the legacy path.
             if "error" in box:
                 _clear_build_in_progress(rebuild_seq)
                 raise box["error"]
             if _claim_publish():
-                _publish_models_result(box["result"], rebuild_seq=rebuild_seq)
+                _publish_models_result(
+                    box["result"],
+                    rebuild_seq=rebuild_seq,
+                    build_fingerprint=rebuild_source_fingerprint,
+                    build_profile=rebuild_profile,
+                )
             return copy.deepcopy(box["result"])
 
         # Budget elapsed. Mark it so the worker knows it owns out-of-band
@@ -9061,7 +9339,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         _models_rebuild_abandoned.set()
         if build_done.is_set() and "error" not in box and "result" in box:
             if _claim_publish():
-                _publish_models_result(box["result"], rebuild_seq=rebuild_seq)
+                _publish_models_result(
+                    box["result"],
+                    rebuild_seq=rebuild_seq,
+                    build_fingerprint=rebuild_source_fingerprint,
+                    build_profile=rebuild_profile,
+                )
             return copy.deepcopy(box["result"])
 
         # Genuinely slow/hung probe: serve the best fallback now; the worker

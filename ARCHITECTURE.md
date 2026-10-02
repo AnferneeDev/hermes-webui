@@ -450,6 +450,13 @@ in-band probe at all (#7481).
   the chain's cumulative spend grow with the endpoint count, and `custom_providers` has no
   count limit, so a long enough chain of dead endpoints could again outspend the window and
   push the reachable providers behind it out of the in-band rebuild.
+- The window belongs to the **caller, not to the chain**. One absolute deadline is captured
+  before the worker and the foreground wait start and is handed to `_CustomProbeSchedule`;
+  the foreground waits only `max(0, deadline - now)`. A schedule that minted its own deadline
+  at construction — deep inside the worker, after provider detection, the live id lookups and
+  the profile rebind — charged that discovery work to the caller's wait *and* granted it to
+  the chain again, so the chain could still be probing after the caller had already been
+  served the over-budget fallback, and the reachable provider landed out-of-band at best.
 - The two states that keep the unthrottled per-endpoint cap are stated explicitly rather
   than inferred from the clock, because a spent window says nothing about whether anyone is
   still waiting:
@@ -493,6 +500,36 @@ invalidated catalog and release the flag that now belongs to the newer rebuild. 
 against the allocated generation rejects it, so invalidation is a real freshness boundary,
 and a newer rebuild that then fails leaves the cache empty instead of resurrecting the
 invalidated catalog.
+
+`invalidate_models_cache()` therefore **advances the allocated generation itself**. Every
+build already running when the cache was invalidated becomes superseded *even when no
+successor rebuild is ever allocated*; otherwise the delayed worker stayed eligible and
+repopulated the catalog that had just been cleared — memory, provenance and the durable file
+alike — and stamped it with a *new* source fingerprint, which is exactly how stale data
+acquires fresh-looking provenance.
+
+A build's **identity is captured when it starts and re-validated when it publishes**, in
+memory and at the durable commit: the source fingerprint (`_models_cache_source_fingerprint`
+— config, auth store and provider catalog; its `config_yaml` axis is the profile-specific
+config path, so it fences a foreign profile too) plus the profile name. A build that outlives
+a config edit describes sources that no longer exist, so its result is dropped instead of
+being published under the *current* fingerprint. The check fails closed — an identity that
+cannot be read is not a match — and disk publication records the fingerprint the build READ,
+never a recomputed one.
+
+Ownership of the single-flight slot is explicit too: the completion path clears
+`_cache_build_in_progress` only when the completing build is still the newest allocated
+generation, including on the error paths and after the disk I/O. A superseded publisher
+therefore cannot admit a third rebuild beside the newer one it lost to.
+
+The **durable commit is fenced separately from the in-memory one**, because the file write
+runs with the catalog lock released (a disk write must not hold it). Each build writes its
+own temp file — unique per build and thread, in the destination directory so the commit stays
+a same-filesystem atomic rename — and the rename is serialized by
+`_models_cache_disk_commit_lock` after re-checking the accepted generation, the last
+committed generation (`_models_disk_committed_seq`, which closes the remaining check-then-use
+window between "validated" and "rename") and the build's source identity. A superseded or
+re-sourced commit discards its temp file and leaves the durable catalog to the build that won.
 
 ---
 
