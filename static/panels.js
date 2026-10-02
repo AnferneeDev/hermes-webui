@@ -13199,7 +13199,7 @@ async function _runCronPollTick(){
           }
         }
         _cronPollSince=Math.max(_cronPollSince,c.completed_at);
-        if(c.job_id) _cronNewJobIds.add(String(c.job_id));
+        if(c.job_id && c.badge_notifications !== false) _cronNewJobIds.add(String(c.job_id));
         if(c.session_id && typeof _markSessionCompletionUnreadIfBackground === 'function'){
           const activeProfile=(typeof S!=='undefined'&&S&&S.activeProfile)||'default';
           _markSessionCompletionUnreadIfBackground(c.session_id, c.message_count, {
