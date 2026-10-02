@@ -99,10 +99,16 @@ if (-not $Python) {
 # the legacy home still holds WebUI state and the new location does not.
 # Resolving before the candidate list keeps the exported discovery result
 # aligned with the server. Leave an already-set HERMES_HOME alone.
+#
+# Explicit HERMES_WEBUI_STATE_DIR: WebUI state is already located elsewhere,
+# so a leftover %USERPROFILE%\.hermes\webui must NOT yank HERMES_HOME to the
+# legacy path. Master keeps %LOCALAPPDATA%\hermes in that shape; switching
+# would make api/profiles.py read provider settings from the wrong home.
 if ($env:LOCALAPPDATA) {
     $platformDefaultHermesHome = Join-Path $env:LOCALAPPDATA 'hermes'
     $legacyHermesHome = Join-Path $env:USERPROFILE '.hermes'
-    if ($legacyHermesHome -ne $platformDefaultHermesHome) {
+    # Migration heuristic only when state dir is NOT explicitly overridden.
+    if (-not $env:HERMES_WEBUI_STATE_DIR -and $legacyHermesHome -ne $platformDefaultHermesHome) {
         $newHasWebuiState = $false
         $legacyHasWebuiState = $false
         foreach ($rel in @('webui\sessions', 'webui\settings.json', 'webui')) {
@@ -136,49 +142,62 @@ if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType 
     exit 1
 }
 if (-not $AgentDir) {
-    # Mirror api/config.py `_discover_agent_dir` candidate order exactly:
+    # Mirror api/config.py `_discover_agent_dir` for server-equivalent candidates:
     # HERMES_HOME\hermes-agent → repo sibling → parent (when it looks like an
-    # agent root) → _DEFAULT_HERMES_HOME\hermes-agent → HOME\hermes-agent →
-    # launcher-only Program Files roots last. Build incrementally —
+    # agent root) → _DEFAULT_HERMES_HOME\hermes-agent → HOME\hermes-agent.
+    # Complete BOTH source (run_agent.py) and pip-style (hermes_cli) passes over
+    # that list BEFORE trying launcher-only Program Files roots. Folding Program
+    # Files into the same candidate list lets a stale Program Files source outrank
+    # a working LOCALAPPDATA pip Agent on the all-source first pass — the server
+    # never searches Program Files at all. Build incrementally —
     # ${env:ProgramFiles(x86)} is null on 32-bit Windows and in some constrained
     # environments, and Join-Path throws on a null Path. Skip any system-wide
     # root that isn't set so the launcher stays robust across Windows variants.
-    $candidates = @()
-    $candidates += (Join-Path $env:HERMES_HOME 'hermes-agent')
+    $serverCandidates = @()
+    $serverCandidates += (Join-Path $env:HERMES_HOME 'hermes-agent')
     $repoParent = Split-Path -Parent $RepoRoot
-    $candidates += (Join-Path $repoParent 'hermes-agent')
+    $serverCandidates += (Join-Path $repoParent 'hermes-agent')
     # Parent-is-agent: repo cloned inside hermes-agent/ (same gate as
     # api/config.py's `_looks_like_agent_source_root` on REPO_ROOT.parent).
     if ((Test-Path (Join-Path $repoParent 'run_agent.py') -PathType Leaf) -or
         (Test-Path (Join-Path $repoParent 'hermes_cli') -PathType Container)) {
-        $candidates += $repoParent
+        $serverCandidates += $repoParent
     }
     # 5. Platform-default home\hermes-agent (api.paths._platform_default_hermes_home)
-    $candidates += (Join-Path $platformDefaultHermesHome 'hermes-agent')
+    $serverCandidates += (Join-Path $platformDefaultHermesHome 'hermes-agent')
     # 6. HOME\hermes-agent (Path.home() → %USERPROFILE% on Windows)
-    $candidates += (Join-Path $env:USERPROFILE 'hermes-agent')
-    # Launcher-only Program Files roots last (server uses XDG /opt /usr/local on POSIX)
-    foreach ($root in @(${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
-        if ($root) { $candidates += (Join-Path $root 'hermes\hermes-agent') }
-    }
-    # De-dup: when running in a WOW64 (32-bit-on-64-bit) PowerShell process,
-    # $env:ProgramFiles is redirected to C:\Program Files (x86), so without
-    # $env:ProgramW6432 (the canonical 64-bit override) we'd miss the real
-    # C:\Program Files\hermes\hermes-agent AND duplicate the x86 entry.
-    # Select-Object -Unique collapses any collisions regardless of cause
-    # (including HERMES_HOME coinciding with LOCALAPPDATA\hermes).
-    $candidates = $candidates | Select-Object -Unique
-    # Two-pass root preference, matching api/config.py: source checkouts
-    # (run_agent.py) win over pip-style roots (hermes_cli) so a home install
-    # cannot preempt a sibling source checkout.
-    foreach ($c in $candidates) {
+    $serverCandidates += (Join-Path $env:USERPROFILE 'hermes-agent')
+    # De-dup server-equivalent list (HERMES_HOME may coincide with platform default).
+    $serverCandidates = $serverCandidates | Select-Object -Unique
+    # Two-pass over server-equivalent candidates first (matches api/config.py).
+    foreach ($c in $serverCandidates) {
         if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf) { $AgentDir = $c; break }
     }
     if (-not $AgentDir) {
-        foreach ($c in $candidates) {
+        foreach ($c in $serverCandidates) {
             if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
         }
     }
+    # Launcher-only Program Files fallbacks — only after both server passes.
+    # (Server uses XDG /opt /usr/local on POSIX; these have no server equivalent.)
+    $pfCandidates = @()
+    foreach ($root in @(${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        if ($root) { $pfCandidates += (Join-Path $root 'hermes\hermes-agent') }
+    }
+    # De-dup: WOW64 can make ProgramFiles == ProgramFiles(x86).
+    $pfCandidates = $pfCandidates | Select-Object -Unique
+    if (-not $AgentDir) {
+        foreach ($c in $pfCandidates) {
+            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf) { $AgentDir = $c; break }
+        }
+    }
+    if (-not $AgentDir) {
+        foreach ($c in $pfCandidates) {
+            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
+        }
+    }
+    # Combined list for the not-found error message.
+    $candidates = @($serverCandidates) + @($pfCandidates)
 }
 if (-not $AgentDir) {
     $searched = $candidates -join ', '

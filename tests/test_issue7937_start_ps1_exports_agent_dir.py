@@ -107,13 +107,13 @@ def test_hermes_home_agent_candidate_is_listed_first():
     )
     block = source[block_start:block_end]
     first_append = re.search(
-        r"\$candidates\s*\+=\s*\(Join-Path\s+\$env:HERMES_HOME\s+'hermes-agent'\)",
+        r"\$serverCandidates\s*\+=\s*\(Join-Path\s+\$env:HERMES_HOME\s+'hermes-agent'\)",
         block,
     )
     assert first_append is not None, (
-        "auto-discovery must Join-Path $env:HERMES_HOME 'hermes-agent' as a candidate"
+        "auto-discovery must Join-Path $env:HERMES_HOME 'hermes-agent' as a server candidate"
     )
-    earlier = re.search(r"\$candidates\s*\+=", block)
+    earlier = re.search(r"\$serverCandidates\s*\+=", block)
     assert earlier is not None
     assert earlier.start() == first_append.start(), (
         "Join-Path $env:HERMES_HOME 'hermes-agent' must be the first candidate append; "
@@ -132,13 +132,13 @@ def _discovery_block(source: str) -> str:
 
 
 def test_discovery_candidate_order_matches_server():
-    """Candidate appends must follow api/config.py through HOME/hermes-agent."""
+    """Server-equivalent appends must follow api/config.py through HOME/hermes-agent."""
     block = _discovery_block(_start_ps1_source())
     appends = [
         m.group(0)
-        for m in re.finditer(r"\$candidates\s*\+=\s*[^\n]+", block)
+        for m in re.finditer(r"\$serverCandidates\s*\+=\s*[^\n]+", block)
     ]
-    assert len(appends) >= 4, f"expected >=4 candidate appends, got {appends!r}"
+    assert len(appends) >= 4, f"expected >=4 server candidate appends, got {appends!r}"
     assert "Join-Path $env:HERMES_HOME 'hermes-agent'" in appends[0]
     assert "Join-Path $repoParent 'hermes-agent'" in appends[1]
     # After sibling/parent: platform-default home, then HOME\hermes-agent
@@ -172,6 +172,10 @@ def test_discovery_candidate_order_matches_server():
         "USERPROFILE/.hermes/hermes-agent must not be appended unconditionally; "
         "it belongs only inside the #2905 platform-default rule. "
         f"Found: {unconditional_legacy!r}"
+    )
+    # Program Files must not be mixed into the server-equivalent list
+    assert not any("ProgramW6432" in a or "ProgramFiles" in a for a in appends), (
+        "Program Files roots must not be appended to $serverCandidates"
     )
 
 
@@ -208,6 +212,11 @@ def test_platform_default_home_uses_localappdata_when_established():
     assert "Join-Path $platformDefaultHermesHome 'hermes-agent'" in block
     # Unconditional legacy append must be gone from the discovery block
     assert "Join-Path $env:USERPROFILE '.hermes\\hermes-agent'" not in block
+    # Migration must be gated on STATE_DIR not being explicit
+    assert (
+        "if (-not $env:HERMES_WEBUI_STATE_DIR -and $legacyHermesHome -ne $platformDefaultHermesHome)"
+        in source
+    )
 
 
 def test_home_hermes_agent_precedes_program_files_roots():
@@ -228,3 +237,58 @@ def test_home_hermes_agent_precedes_program_files_roots():
     # LOCALAPPDATA must not ride along in the Program Files loop anymore
     assert "@($env:LOCALAPPDATA," not in block
     assert "$env:LOCALAPPDATA, ${env:ProgramW6432}" not in block
+
+
+def test_program_files_only_after_both_server_passes():
+    """CORE: stale Program Files source must not beat LOCALAPPDATA pip Agent.
+
+    Both run_agent.py and hermes_cli passes over $serverCandidates must complete
+    before any Program Files fallback pass. Otherwise an all-source first pass
+    over a combined list picks Program Files over a working LOCALAPPDATA pip root.
+    """
+    block = _discovery_block(_start_ps1_source())
+    assert "$serverCandidates = @()" in block
+    assert "$pfCandidates = @()" in block
+    server_run = block.index("foreach ($c in $serverCandidates)")
+    server_pip = block.index(
+        "Test-Path (Join-Path $c 'hermes_cli') -PathType Container"
+    )
+    pf_marker = block.index("${env:ProgramW6432}")
+    pf_run = block.index("foreach ($c in $pfCandidates)")
+    assert server_run < server_pip < pf_marker < pf_run, (
+        "server source+pip passes must both precede Program Files fallbacks "
+        f"(server_run@{server_run}, server_pip@{server_pip}, "
+        f"pf_list@{pf_marker}, pf_run@{pf_run})"
+    )
+    between = block[server_pip:pf_run]
+    assert "if (-not $AgentDir)" in between, (
+        "Program Files source pass must be gated on AgentDir still empty "
+        "after both server-equivalent passes"
+    )
+    before_pf = block[:pf_marker]
+    assert "$serverCandidates += (Join-Path $root" not in before_pf
+    assert "$pfCandidates += (Join-Path $root" in block[pf_marker:]
+
+
+def test_explicit_webui_state_dir_skips_legacy_home_migration():
+    """CORE: explicit STATE_DIR must preserve LOCALAPPDATA HERMES_HOME default.
+
+    With custom HERMES_WEBUI_STATE_DIR, a valid LOCALAPPDATA Agent/profile home,
+    and leftover %USERPROFILE%/.hermes/webui, the #2905 heuristic must NOT
+    switch HERMES_HOME to the legacy home (master keeps LOCALAPPDATA).
+    """
+    source = _start_ps1_source()
+    assert (
+        "if (-not $env:HERMES_WEBUI_STATE_DIR -and $legacyHermesHome -ne $platformDefaultHermesHome)"
+        in source
+    ), (
+        "legacy WebUI-state migration must be gated on HERMES_WEBUI_STATE_DIR "
+        "not already being set"
+    )
+    # Ungated form from the prior revision must be gone
+    assert (
+        "if ($legacyHermesHome -ne $platformDefaultHermesHome) {" not in source
+    )
+    # Comment documents the explicit-state exception
+    assert "Explicit HERMES_WEBUI_STATE_DIR" in source
+    assert "must NOT yank HERMES_HOME" in source
