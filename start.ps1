@@ -237,6 +237,29 @@ if (-not $AgentDir) {
     }
     # Combined list for the not-found error message.
     $candidates = @($serverCandidates) + @($launcherOnlyCandidates)
+
+    # A source checkout that cannot supply its own dependencies is not a safe
+    # pick while an installed Agent with a usable venv is also on the list.
+    # The export below runs hermes_bootstrap.py from $AgentDir through
+    # activate_managed_agent(), and that hook lets SystemExit propagate (it is
+    # a BaseException, so `except Exception` there does not catch it) — a stale
+    # sibling checkout can therefore take down startup for a machine whose
+    # installed Agent would have started fine, which is exactly what master's
+    # hermes_cli-only pass avoided. Mirror that here: when the source-first pass
+    # lands on a root with no venv, prefer an installed Agent that has one, in
+    # candidate order, so $AgentDir and $Python stay the same install.
+    if ($AgentDir -and $candidates) {
+        if (-not (Test-Path (Join-Path $AgentDir 'venv\Scripts\python.exe'))) {
+            foreach ($c in $candidates) {
+                if ((Test-Path (Join-Path $c 'hermes_cli') -PathType Container) -and
+                    (Test-Path (Join-Path $c 'venv\Scripts\python.exe'))) {
+                    Write-Warning "Agent dir '$AgentDir' has no venv of its own, so its dependencies would come from hermes_bootstrap.py, which can exit before the server starts; using the installed Agent at '$c' instead."
+                    $AgentDir = $c
+                    break
+                }
+            }
+        }
+    }
 }
 if (-not $AgentDir) {
     $searched = $candidates -join ', '
@@ -267,16 +290,14 @@ if (-not $AgentDir) {
 $agentVenvPython = Join-Path $AgentDir 'venv\Scripts\python.exe'
 if (-not (Test-Path $agentVenvPython) -and
     -not (Test-Path (Join-Path $AgentDir 'hermes_bootstrap.py'))) {
-    # Neither. This is a bare source checkout, and it can be selected ahead of
-    # an install that does have the dependencies: the source-first pass (which
-    # mirrors api/config.py) reaches a sibling checkout before the platform
-    # default, while master's single hermes_cli-only pass skipped source roots
-    # entirely and so kept using the LOCALAPPDATA venv. Without this the first
-    # Agent import after activate_managed_agent() no-ops and dies with
-    # ModuleNotFoundError. Fall back to the first candidate that does have a
-    # venv, in candidate order, so the dependency import still resolves.
-    # Only applies to discovery — an explicit HERMES_WEBUI_AGENT_DIR is the
-    # caller's choice and is left alone.
+    # Neither. This is a bare source checkout. Discovery already prefers an
+    # installed Agent when both are on the candidate list and only the install
+    # has a venv, so reaching here means no candidate was an install either
+    # (e.g. a venv next to a checkout that has no hermes_cli/ yet). The first
+    # Agent import after activate_managed_agent() would no-op and die with
+    # ModuleNotFoundError, so take the first candidate that does have a venv,
+    # in candidate order. Only applies to discovery — an explicit
+    # HERMES_WEBUI_AGENT_DIR is the caller's choice and is left alone.
     if ($candidates) {
         foreach ($c in $candidates) {
             $fallback = Join-Path $c 'venv\Scripts\python.exe'

@@ -14,9 +14,12 @@ actually runs the script:
   `%USERPROFILE%\\.hermes` and the only Agent at `%LOCALAPPDATA%\\hermes`, the
   LOCALAPPDATA path never entered the candidate list and startup failed with
   "hermes-agent not found".
-- The source-first pass (mirroring api/config.py) can select a bare sibling
-  checkout that has no venv and no hermes_bootstrap.py, which is an Agent that
-  cannot supply its own dependencies.
+- The source-first pass (mirroring api/config.py) can select a sibling source
+  checkout that cannot supply the Agent's dependencies, shadowing an installed
+  Agent that would have started: with `hermes_cli/`+venv next to a sibling
+  `run_agent.py`+`hermes_bootstrap.py`, the export made the launcher run that
+  sibling's bootstrap, and activate_managed_agent() lets its SystemExit
+  propagate, so the server never bound.
 
 So these tests execute the script under a real pwsh with disposable fixtures and
 assert on the launcher output. They skip when pwsh is unavailable, and on
@@ -37,6 +40,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,9 +140,51 @@ def _stage_repo(fixture: Path) -> Path:
     return repo
 
 
-def _run_start_ps1(fixture: Path, extra_env: dict[str, str] | None = None) -> tuple[int, str]:
+def _stage_repo_with_activation(fixture: Path) -> Path:
+    """Stage the repo with a server.py that performs the real Agent activation.
+
+    `server.py` calls activate_managed_agent() as its first Agent-related
+    import, and that hook is what runs the selected root's hermes_bootstrap.py.
+    With the default empty stub server.py that hook is never reached, so a
+    bootstrap that exits would look like a successful launch. Copying the real
+    module in and calling it the way server.py does is what makes the
+    bootstrap-exit layout observable.
+    """
+    repo = _stage_repo(fixture)
+    shutil.copy2(REPO_ROOT / "managed_agent_startup.py", repo / "managed_agent_startup.py")
+    (repo / "server.py").write_text(
+        "from managed_agent_startup import activate_managed_agent\n"
+        "\n"
+        "activate_managed_agent()\n"
+        "print('SERVER_BOUND')\n",
+        encoding="utf-8",
+    )
+    return repo
+
+
+def _make_venv_interpreter(root: Path) -> Path:
+    """A venv interpreter stand-in that really runs the server stub.
+
+    _make_agent(venv=True) only writes the path start.ps1 looks for. When the
+    test needs the selected interpreter to reach server.py, the file has to be
+    an executable that forwards to the interpreter running the tests.
+    """
+    venv_python = root / "venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True, exist_ok=True)
+    venv_python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    venv_python.chmod(0o755)
+    return venv_python
+
+
+def _run_start_ps1(
+    fixture: Path,
+    extra_env: dict[str, str] | None = None,
+    *,
+    activate: bool = False,
+) -> tuple[int, str]:
     """Execute start.ps1 against a disposable fixture tree."""
-    start_ps1 = _stage_repo(fixture) / "start.ps1"
+    repo = _stage_repo_with_activation(fixture) if activate else _stage_repo(fixture)
+    start_ps1 = repo / "start.ps1"
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(fixture / "user"),
@@ -147,6 +193,11 @@ def _run_start_ps1(fixture: Path, extra_env: dict[str, str] | None = None) -> tu
         "HERMES_WEBUI_PYTHON": str(_write_stub_python(fixture)),
     }
     env.update(extra_env or {})
+    # A None value means "unset", so a layout that must fall through to the
+    # Agent's own venv (or to PATH) can be expressed without touching the base
+    # environment.
+    for key in [k for k, v in env.items() if v is None]:
+        del env[key]
     completed = subprocess.run(
         [shutil.which("pwsh"), "-NoProfile", "-File", str(start_ps1)],
         capture_output=True,
@@ -246,13 +297,17 @@ def test_explicit_agent_dir_override_wins(tmp_path):
     assert code == 0, output
 
 
-def test_bare_source_checkout_falls_back_to_a_candidate_venv(tmp_path):
-    """A source checkout with no venv and no bootstrap needs the deps from elsewhere.
+def test_bare_source_checkout_yields_to_the_installed_agent(tmp_path):
+    """A source checkout with no venv and no bootstrap is not a usable pick.
 
     The source-first pass reaches a sibling checkout before the platform
-    default. Selecting it is right (it is what api/config.py does, and the
-    export makes the server agree), but on its own it cannot import the Agent's
-    dependencies: activate_managed_agent() no-ops without hermes_bootstrap.py.
+    default, which is what api/config.py does. But on its own that checkout
+    cannot import the Agent's dependencies: activate_managed_agent() no-ops
+    without hermes_bootstrap.py, and with the export in place the launcher's
+    whole job is to point the server at an Agent that can. When an installed
+    Agent with a venv is also on the candidate list, master's hermes_cli-only
+    pass picked that one, so discovery does too — as $AgentDir, not only as the
+    interpreter, so the exported HERMES_WEBUI_AGENT_DIR and $Python agree.
     """
     fixture = tmp_path / "fx"
     (fixture / "user" / ".hermes" / "webui").mkdir(parents=True)
@@ -261,42 +316,87 @@ def test_bare_source_checkout_falls_back_to_a_candidate_venv(tmp_path):
     )
     # The sibling of the staged repo root, i.e. inside the fixture. Never
     # REPO_ROOT.parent: that is the real checkout for a side-by-side developer.
-    sibling = _make_agent(fixture / "hermes-agent", source=True)
+    _make_agent(fixture / "hermes-agent", source=True)
 
     code, output = _run_start_ps1(fixture)
 
+    assert _agent_dir(output) == str(installed), (
+        "a bare source checkout cannot supply the Agent's dependencies, so "
+        "discovery must prefer the installed Agent and export it; got:\n" + output
+    )
     expected = installed / "venv" / "Scripts" / "python.exe"
     assert _python(output) == str(expected), (
-        "a bare source checkout has no dependencies of its own, so the launcher "
-        "must fall back to a candidate venv instead of starting a Python that "
-        "cannot import them; got:\n" + output
-    )
-    assert "hermes_bootstrap.py" in output, (
-        "the fallback is a fallback: it should say which Agent it is covering\n"
-        + output
-    )
-    assert _agent_dir(output) == str(sibling), (
-        "the discovered Agent should stay the source checkout so the exported "
-        "HERMES_WEBUI_AGENT_DIR matches api/config.py; got:\n" + output
+        "$Python has to be the venv of the exported Agent, otherwise the server "
+        "imports from one install and runs on another; got:\n" + output
     )
     assert code == 0, output
 
 
-def test_source_checkout_with_bootstrap_keeps_its_own_interpreter(tmp_path):
-    """The fallback must not fire when the checkout can supply its own deps."""
+def test_source_checkout_with_its_own_venv_still_wins(tmp_path):
+    """Source-first must survive when the checkout can actually be launched."""
     fixture = tmp_path / "fx"
     (fixture / "user" / ".hermes" / "webui").mkdir(parents=True)
     _make_agent(fixture / "local" / "hermes" / "hermes-agent", venv=True)
-    sibling = _make_agent(fixture / "hermes-agent", source=True, bootstrap=True)
+    sibling = _make_agent(fixture / "hermes-agent", source=True, venv=True)
 
     code, output = _run_start_ps1(fixture)
 
-    assert _agent_dir(output) == str(sibling), output
-    assert _python(output) == str(_write_stub_python(fixture)), (
-        "hermes_bootstrap.py activates the checkout's dependencies, so the venv "
-        "fallback must stay out of the way; got:\n" + output
+    assert _agent_dir(output) == str(sibling), (
+        "a source checkout with its own venv is launchable and is what "
+        "api/config.py selects, so it keeps priority over the install; got:\n"
+        + output
     )
+    assert _python(output) == str(sibling / "venv" / "Scripts" / "python.exe"), output
     assert code == 0, output
+
+
+@pytest.mark.parametrize("hermes_home_set", [True, False])
+def test_sibling_bootstrap_exit_still_reaches_the_server(tmp_path, hermes_home_set):
+    """The reported layout: pip-style install + sibling source checkout.
+
+    A normal install is pip-style (hermes_cli/, no run_agent.py) and has its own
+    venv. A developer who also keeps a source checkout next to the repo gets
+    the sibling picked by the source-first pass, and the launcher then runs that
+    checkout's hermes_bootstrap.py. activate_managed_agent() only catches
+    Exception, so a bootstrap that exits takes the launch down with it and the
+    server never binds — even though the installed Agent would have started.
+
+    Both HERMES_HOME shapes from the report are covered, because that decides
+    whether the install is candidate 1 or further down the list.
+    """
+    fixture = tmp_path / "fx"
+    installed = _make_agent(fixture / "local" / "hermes" / "hermes-agent", venv=True)
+    venv_python = _make_venv_interpreter(installed)
+    sibling = _make_agent(fixture / "hermes-agent", source=True, bootstrap=True)
+    (sibling / "hermes_bootstrap.py").write_text(
+        "raise SystemExit(7)\n", encoding="utf-8"
+    )
+
+    extra_env: dict[str, str | None] = {
+        # Unset, so $Python comes from the selected Agent's venv rather than
+        # from a stub — that is what makes the sibling's SystemExit(7) visible
+        # as the process exit code instead of being masked by a stub.
+        "HERMES_WEBUI_PYTHON": None,
+    }
+    if hermes_home_set:
+        (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+        extra_env["HERMES_HOME"] = str(fixture / "local" / "hermes")
+
+    code, output = _run_start_ps1(fixture, extra_env=extra_env, activate=True)
+
+    assert code == 0, (
+        "the sibling checkout's bootstrap exits 7 and must not decide the "
+        "launch; got:\n" + output
+    )
+    assert _agent_dir(output) == str(installed), (
+        "the installed Agent is the one that can start, and the export has to "
+        "name it; got:\n" + output
+    )
+    assert _python(output) == str(venv_python), output
+    assert "SERVER_BOUND" in output, (
+        "activate_managed_agent() returned early because the installed Agent is "
+        "pip-style, so the server reached its own code; got:\n" + output
+    )
 
 
 def test_explicit_state_dir_keeps_the_legacy_agent_ahead_of_home(tmp_path):
