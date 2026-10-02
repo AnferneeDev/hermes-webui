@@ -2848,6 +2848,65 @@ function _mdImageHtml(alt, url){
   return `<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`;
 }
 
+function _mediaTokenParts(source, matchOffset, rawRef){
+  let ref=String(rawRef||'');
+  let suffix='';
+  const before=String(source||'').slice(0,Number(matchOffset)||0);
+  // Quotes are valid path/URL bytes, so detach one only when the prose has the
+  // same opener immediately before MEDIA:. The entity forms are what the real
+  // streaming parser passes after escaping text nodes.
+  for(const family of [
+    {value:'"', forms:['"','&quot;']},
+    {value:"'", forms:["'",'&#39;']},
+  ]){
+    if(!family.forms.some(form=>before.endsWith(form))) continue;
+    let quote='', closeAt=-1;
+    for(const form of family.forms){
+      const index=ref.lastIndexOf(form);
+      if(index>closeAt){ quote=form; closeAt=index; }
+    }
+    if(closeAt<=0) continue;
+    const afterQuote=ref.slice(closeAt+quote.length);
+    if(!/^[.,;:!?]*$/.test(afterQuote)) continue;
+    ref=ref.slice(0,closeAt);
+    suffix=family.value+afterQuote;
+    break;
+  }
+  let punctuationStart=ref.length;
+  while(punctuationStart>0&&'.,;:!?'.includes(ref.charAt(punctuationStart-1))){
+    punctuationStart-=1;
+  }
+  const trailingPunctuation=ref.slice(punctuationStart);
+  for(const delimiter of ['***','___','**','__','*','_','`']){
+    if(!before.endsWith(delimiter)) continue;
+    const openerStart=before.length-delimiter.length;
+    if(openerStart>0&&before.charAt(openerStart-1)===delimiter.charAt(0)) continue;
+    let candidate=ref;
+    let afterDelimiter='';
+    if(trailingPunctuation&&candidate.slice(0,-trailingPunctuation.length).endsWith(delimiter)){
+      candidate=candidate.slice(0,-trailingPunctuation.length);
+      afterDelimiter=trailingPunctuation;
+    }
+    if(candidate===delimiter) return null;
+    if(candidate.endsWith(delimiter)&&candidate.length>delimiter.length){
+      const closerStart=candidate.length-delimiter.length;
+      if(candidate.charAt(closerStart-1)===delimiter.charAt(0)) continue;
+      ref=candidate.slice(0,-delimiter.length);
+      // The matching closer proves only its own bytes are outside the
+      // reference. Punctuation immediately before it may be a legal
+      // filename or URL byte and must remain bound to the ref.
+      suffix=delimiter+afterDelimiter;
+      break;
+    }
+  }
+  // A bare trailing punctuation byte is ambiguous: it may be prose, but it
+  // may also be part of a real local filename or remote URL. Only the quote
+  // and delimiter branches above have evidence from a matching opener that a
+  // closer is outside the MEDIA ref, so preserve every other byte verbatim.
+  if(!ref) return null;
+  return [ref,suffix];
+}
+
 function _inlineMediaHtmlForRef(ref, sessionId, altText){
   if(ref==null) return '';
   // data:image/* → inline <img>; any other data: scheme renders as inert
@@ -4877,19 +4936,17 @@ function renderModelDropdown(){
         const row=document.createElement('div');
         row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
         let badgeLabel = '';
-        let modelName = m.name;
         if (m.badge) {
           // 直接用badge的原始key（即config.yaml里的ID）
           const rawId = badgeKeyMap.get(m.badge) || m.value || m.badge.label || 'Configured';
           badgeLabel = rawId;
-          modelName = rawId; // model-opt-name直接用原始ID
           if(m.badge.provider){
             const providerName=m.badge.provider.replace(/^custom:/,'').split('/')[0];
             badgeLabel += ` (${providerName})`;
           }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}${_selectedModelBadge(m)}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${m.name}</span>${badgeHtml}${_selectedModelBadge(m)}</div><span class="model-opt-id">${esc(m.id)}</span>`;
         row.onclick=()=>selectFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
         dd.appendChild(row);
       }
@@ -7904,19 +7961,11 @@ function renderMd(raw){
   // generated images) and replace them with inline <img> or download links.
   // Stashed so the path/URL is never processed as markdown.
   const media_stash=[];
-  // #7680 re-gate (9/22): two-pass scan.
-  //   1. `` `MEDIA:path` `` (backtick-wrapped, inline-code form) → strip
-  //      the wrapping backticks so the bare-token pass below sees a
-  //      plain ``MEDIA:path`` and the closing backtick is not consumed
-  //      as part of the path.
-  //   2. ``MEDIA:[^\s\)\]]+`` (bare, no backtick in the exclusion
-  //      class) so a filename that legally contains a backtick
-  //      (``report`final.png``) is captured in full instead of being
-  //      truncated at the first backtick.
-  s=s.replace(/`MEDIA:([^`\s]+)`/g,'MEDIA:$1');
-  s=s.replace(/MEDIA:([^\s\)\]]+)/g,(_,raw_ref)=>{
-    media_stash.push(raw_ref);
-    return '\x00D'+(media_stash.length-1)+'\x00';
+  s=s.replace(/MEDIA:([^\s\)\]]+)/g,(token,raw_ref,offset)=>{
+    const parts=_mediaTokenParts(s,offset,raw_ref);
+    if(!parts) return token;
+    media_stash.push(parts[0]);
+    return '\x00D'+(media_stash.length-1)+'\x00'+parts[1];
   });
   // ── End MEDIA stash ─────────────────────────────────────────────────────────
   // Pre-pass: decode HTML entities first so markdown processing works correctly.
@@ -20522,8 +20571,8 @@ function loadDiffInline(container){
   root.querySelectorAll('.diff-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    const snapQuery=_mediaSnapQuery(el);
-    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>DIFF_MAX_SIZE){
@@ -20561,11 +20610,16 @@ function _mediaSnapQuery(el){
   return (snap&&/^[0-9a-f]{64}$/.test(snap))?('&snap='+snap):'';
 }
 
-function _csvMediaUrl(path, opts={}){
+function _mediaPreviewUrl(path, opts={}){
   let url='api/media?path='+encodeURIComponent(path)+_mediaSessionQuery();
   if(opts.snap) url+='&snap='+encodeURIComponent(opts.snap);
+  if(opts.inline) url+='&inline=1';
   if(opts.download) url+='&download=1';
   return url;
+}
+
+function _csvMediaUrl(path, opts={}){
+  return _mediaPreviewUrl(path, opts);
 }
 
 function buildCsvTablePreview(path, text, downloadUrl=''){
@@ -20592,9 +20646,8 @@ function buildCsvTablePreview(path, text, downloadUrl=''){
   };
 }
 
-function _csvPreviewErrorHtml(path, errorKey){
+function _csvPreviewErrorHtml(path, errorKey, downloadUrl=_csvMediaUrl(path,{download:true})){
   const fname=path.split('/').pop()||path;
-  const downloadUrl=_csvMediaUrl(path,{download:true});
   return `<div class="diff-inline-error">${esc(fname)}<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
 }
 
@@ -20610,10 +20663,10 @@ function loadCsvInline(container){
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         const preview=buildCsvTablePreview(path, text, downloadUrl);
-        el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error');
+        el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error', downloadUrl);
       })
       .catch(()=>{
-        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error');
+        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error', downloadUrl);
       });
   });
 }
@@ -20624,8 +20677,9 @@ function loadExcalidrawInline(container){
   root.querySelectorAll('.excalidraw-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    const snapQuery=_mediaSnapQuery(el);
-    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const downloadUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
+    fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>EXCALIDRAW_MAX_SIZE){
@@ -20643,7 +20697,6 @@ function loadExcalidrawInline(container){
           return;
         }
         const fname=esc(path.split('/').pop());
-        const downloadUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
         el.outerHTML=`<div class="excalidraw-embed-wrap" title="${t('excalidraw_simplified')}">
   <div class="msg-artifact-header">
     <span class="msg-media-label">${t('excalidraw_label')}</span>
@@ -20753,16 +20806,15 @@ function loadPdfInline(container){
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const snapQuery=_mediaSnapQuery(el);
-    const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const mediaUrl=_mediaPreviewUrl(path,{snap:snap||undefined});
+    // Freeze action URLs alongside the fetch: callbacks may run in another session.
+    const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     const loadPdf=(pdfjsLib)=>{
       fetch(mediaUrl)
         .then(r=>{if(!r.ok) throw new Error(r.status); return r.arrayBuffer();})
         .then(buf=>{
           if(buf.byteLength>PDF_MAX_SIZE){
-            const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
             return;
           }
@@ -20770,7 +20822,6 @@ function loadPdfInline(container){
         })
         .then(pdf=>{
           if(!pdf) return;
-          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           const total=pdf.numPages;
           const pagesLabel=total>1?` · ${total} pages`:'';
           const wrap=document.createElement('div');
@@ -20809,7 +20860,6 @@ function loadPdfInline(container){
           renderPage(1);
         })
         .catch(()=>{
-          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
         });
     };
@@ -20829,7 +20879,6 @@ function loadPdfInline(container){
       window.addEventListener('pdfjs-ready',()=>{ _pdfjsReady=true; loadPdf(window._pdfjsLib); },{once:true});
       setTimeout(()=>{
         if(!_pdfjsReady){
-          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           if(el.parentNode){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
           }
@@ -20849,24 +20898,21 @@ function loadHtmlInline(container){
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const snapQuery=_mediaSnapQuery(el);
-    const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const mediaUrl=_mediaPreviewUrl(path,{snap:snap||undefined});
+    const openUrl=_mediaPreviewUrl(path,{inline:true,snap:snap||undefined});
+    const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl, {cache:'no-store'})
       .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
-          const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
           el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
           return;
         }
-        const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
       .catch(()=>{
-        const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
         el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_error')}</span></div>`;
       });
   });
