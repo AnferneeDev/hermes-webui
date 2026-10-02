@@ -89,7 +89,7 @@ def test_hermes_home_default_precedes_agent_discovery():
     %USERPROFILE%\\.hermes install.
     """
     source = _start_ps1_source()
-    home_default = source.index("if (-not $env:HERMES_HOME)")
+    home_default = source.index("if ($hermesHomeIsDefault)")
     discovery = source.index("$AgentDir = $env:HERMES_WEBUI_AGENT_DIR")
     assert home_default < discovery, (
         "HERMES_HOME default must be resolved before agent discovery so the "
@@ -141,11 +141,15 @@ def test_discovery_candidate_order_matches_server():
     assert len(appends) >= 4, f"expected >=4 server candidate appends, got {appends!r}"
     assert "Join-Path $env:HERMES_HOME 'hermes-agent'" in appends[0]
     assert "Join-Path $repoParent 'hermes-agent'" in appends[1]
-    # After sibling/parent: platform-default home, then HOME\hermes-agent
+    # After sibling/parent: the home the SERVER would default to, then the
+    # platform home itself, then HOME\hermes-agent.
     platform_idx = next(
         i
         for i, a in enumerate(appends)
-        if "Join-Path $platformDefaultAgentHome 'hermes-agent'" in a
+        if "Join-Path $serverPlatformDefaultHome 'hermes-agent'" in a
+    )
+    new_home_idx = next(
+        i for i, a in enumerate(appends) if "Join-Path $newHermesHome 'hermes-agent'" in a
     )
     home_idx = next(
         i
@@ -158,11 +162,14 @@ def test_discovery_candidate_order_matches_server():
     sibling_idx = next(
         i for i, a in enumerate(appends) if "Join-Path $repoParent 'hermes-agent'" in a
     )
-    assert sibling_idx < platform_idx < home_idx, (
-        f"order must be sibling → platform-default → HOME/hermes-agent "
-        f"(sibling@{sibling_idx}, platform@{platform_idx}, home@{home_idx})"
+    assert sibling_idx < platform_idx < new_home_idx < home_idx, (
+        f"order must be sibling → server-default home → platform home → "
+        f"HOME/hermes-agent (sibling@{sibling_idx}, platform@{platform_idx}, "
+        f"new_home@{new_home_idx}, home@{home_idx})"
     )
-    # Must not unconditionally prepend USERPROFILE\.hermes among fallbacks
+    # Must not append the launcher's own launcher-only legacy root directly.
+    # It is reachable as the server-default home when #2905 selects it, and as
+    # a launcher-only rescue below.
     unconditional_legacy = [
         a
         for a in appends
@@ -170,7 +177,6 @@ def test_discovery_candidate_order_matches_server():
     ]
     assert not unconditional_legacy, (
         "USERPROFILE/.hermes/hermes-agent must not be appended unconditionally; "
-        "it belongs only inside the #2905 platform-default rule. "
         f"Found: {unconditional_legacy!r}"
     )
     # Program Files must not be mixed into the server-equivalent list
@@ -198,10 +204,11 @@ def test_discovery_uses_two_pass_run_agent_then_hermes_cli():
 def test_platform_default_home_uses_localappdata_when_established():
     """Case 1: custom HERMES_HOME empty + Agents in both legacy and LOCALAPPDATA.
 
-    After sibling/parent, the platform-default candidate must prefer
-    LOCALAPPDATA\\hermes (when established) per api.paths._platform_default_hermes_home,
-    not an unconditional USERPROFILE\\.hermes first among fallbacks. Legacy is
-    only chosen when it still holds WebUI state and the new location does not.
+    After sibling/parent, the candidate must be the home the SERVER would
+    default to per api.paths._platform_default_hermes_home, not an
+    unconditional USERPROFILE\\.hermes first among fallbacks. Legacy is only
+    chosen when it still holds WebUI state and the new location does not — and
+    LOCALAPPDATA stays in the list unconditionally behind it.
     """
     source = _start_ps1_source()
     assert "$newHermesHome = Join-Path $env:LOCALAPPDATA 'hermes'" in source
@@ -212,9 +219,11 @@ def test_platform_default_home_uses_localappdata_when_established():
     ) in source
     assert "$serverPlatformDefaultHome = $legacyHermesHome" in source
     block = _discovery_block(source)
-    assert "Join-Path $platformDefaultAgentHome 'hermes-agent'" in block
-    # Legacy USERPROFILE\.hermes must NOT be a server-equivalent candidate;
-    # it stays as a launcher-only rescue after both server passes.
+    assert "Join-Path $serverPlatformDefaultHome 'hermes-agent'" in block
+    assert "Join-Path $newHermesHome 'hermes-agent'" in block
+    # Legacy USERPROFILE\.hermes must NOT be a server-equivalent candidate in
+    # its own right; it is reachable via $serverPlatformDefaultHome when #2905
+    # selects it, and as a launcher-only rescue after both server passes.
     server_appends = [
         m.group(0)
         for m in re.finditer(r"\$serverCandidates\s*\+=\s*[^\n]+", block)
@@ -224,10 +233,6 @@ def test_platform_default_home_uses_localappdata_when_established():
     ), f"legacy .hermes must not be in $serverCandidates: {server_appends!r}"
     assert "Join-Path $env:USERPROFILE '.hermes\\hermes-agent'" in block
     assert "$launcherOnlyCandidates" in block
-    # Only the exported HERMES_HOME default is gated on an explicit STATE_DIR;
-    # the server-side platform default that feeds candidate 5 is not.
-    assert "if (-not $env:HERMES_WEBUI_STATE_DIR) {" in source
-    assert "$platformDefaultHermesHome = $serverPlatformDefaultHome" in source
 
 
 def test_home_hermes_agent_precedes_program_files_roots():
@@ -286,26 +291,42 @@ def test_program_files_only_after_both_server_passes():
 
 
 def test_explicit_webui_state_dir_skips_legacy_home_migration():
-    """CORE: explicit STATE_DIR must preserve LOCALAPPDATA HERMES_HOME default.
+    """CORE: the #2905 legacy preference must move only the STATE_DIR default.
 
-    With custom HERMES_WEBUI_STATE_DIR, a valid LOCALAPPDATA Agent/profile home,
-    and leftover %USERPROFILE%/.hermes/webui, the #2905 heuristic must NOT
-    switch HERMES_HOME to the legacy home (master keeps LOCALAPPDATA).
+    api/config.py reads providers and models from HERMES_HOME, so a user whose
+    config.yaml is in %LOCALAPPDATA%\\hermes must keep reading it from there
+    even while their WebUI sessions are still at the legacy
+    %USERPROFILE%\\.hermes. Only webui/ state location is affected by the
+    migration, and only while this script chose HERMES_HOME itself.
     """
     source = _start_ps1_source()
     assert "$platformDefaultHermesHome = $newHermesHome" in source
     assert (
-        "$platformDefaultHermesHome = $serverPlatformDefaultHome\n}"
-        in source
-    ), (
-        "the exported HERMES_HOME default must take the legacy fallback only "
-        "when HERMES_WEBUI_STATE_DIR is not already set"
+        "$hermesHomeIsDefault = -not $env:HERMES_HOME\n"
+        "if ($hermesHomeIsDefault) {\n"
+        "    $env:HERMES_HOME = $platformDefaultHermesHome\n"
+        "}"
+    ) in source, (
+        "HERMES_HOME must take the platform default unconditionally; only the "
+        "STATE_DIR default may follow the #2905 legacy preference"
     )
-    # Ungated form from the prior revision must be gone
-    assert "$platformDefaultHermesHome = $serverPlatformDefaultHome\n\nif" not in source
-    # Comment documents the explicit-state exception
-    assert "HERMES_WEBUI_STATE_DIR means WebUI state already lives elsewhere" in source
-    assert "must NOT yank HERMES_HOME" in source
+    # The legacy preference must not be able to reach HERMES_HOME any more.
+    assert "$platformDefaultHermesHome = $serverPlatformDefaultHome" not in source
+    # The redirect is applied to the STATE_DIR default, gated on this script
+    # having picked HERMES_HOME so an explicit value keeps master's behaviour.
+    assert (
+        "if ($hermesHomeIsDefault -and $serverPlatformDefaultHome -ne "
+        "$platformDefaultHermesHome) {"
+    ) in source, (
+        "the #2905 legacy fallback must gate on $hermesHomeIsDefault so an "
+        "explicit HERMES_HOME still gets webui/ beneath it"
+    )
+    assert (
+        "$env:HERMES_WEBUI_STATE_DIR = Join-Path $serverPlatformDefaultHome 'webui'"
+    ) in source
+    # Comment documents why the two answers are separated.
+    assert "reads providers and models from it" in source
+    assert "STATE_DIR default below" in source
 
 
 def test_legacy_hermes_is_launcher_only_before_program_files():
@@ -377,41 +398,50 @@ def test_launcher_only_roots_are_ranked_by_path_not_by_kind():
     )
 
 
-def test_agent_discovery_uses_the_fixed_platform_default_not_the_state_gate():
-    """Candidate 5 must NOT follow the #2905 legacy WebUI-state preference.
+def test_agent_discovery_uses_the_servers_default_home_plus_the_platform_home():
+    """Candidate 5 is the SERVER's default home, and LOCALAPPDATA must survive.
 
-    This assertion previously required the opposite, on the reasoning that the
-    launcher should mirror api/config.py's `_DEFAULT_HERMES_HOME`. That
-    reasoning does not survive contact with a real upgrade layout:
-    `_platform_default_hermes_home()` is keyed on where the WEBUI STATE lives,
-    so reading its answer for Agent discovery means that with state still at
-    the legacy %USERPROFILE%\\.hermes and the only Agent at
-    %LOCALAPPDATA%\\hermes, the LOCALAPPDATA path never enters the candidate
-    list at all and startup dies with "hermes-agent not found". Master
-    searched both roots unconditionally and found the install.
+    api/config.py candidate 5 is `_DEFAULT_HERMES_HOME / "hermes-agent"`, and
+    `_DEFAULT_HERMES_HOME` is `_platform_default_hermes_home()` — which still
+    prefers the legacy %USERPROFILE%\\.hermes while the WebUI state has not
+    migrated off it. Reading only the exported HERMES_HOME here got that wrong
+    in both directions:
 
-    So the two questions stay separate: HERMES_HOME follows the state-dir
-    aware rule (that is what #2905 is about), while Agent discovery searches
-    the platform default for an Agent install. The legacy location stays
-    reachable as a launcher-only candidate, so nothing is lost.
+    - reaching %USERPROFILE%\\hermes-agent first exports a flat checkout the
+      server never searches, in the very layout where the legacy install is the
+      one the server would pick;
+    - dropping %LOCALAPPDATA%\\hermes\\hermes-agent when the #2905 preference
+      applies makes a LOCALAPPDATA-only Agent unreachable and startup dies with
+      "hermes-agent not found".
+
+    So candidate 5 is the server's own default, candidate 6 is the platform
+    home unconditionally, and candidate 7 is HOME\\hermes-agent.
     """
     source = _start_ps1_source()
+    block = _discovery_block(source)
 
-    # The exported HERMES_HOME keeps the state-dir-aware behaviour.
     assert "$serverPlatformDefaultHome = $newHermesHome" in source
-    assert "if (-not $env:HERMES_WEBUI_STATE_DIR) {" in source
-    assert "$platformDefaultHermesHome = $serverPlatformDefaultHome" in source
-
-    # Agent discovery reads the fixed platform default.
-    assert "$platformDefaultAgentHome = $newHermesHome" in source, (
-        "the platform-default Agent candidate must not be gated on where "
-        "WebUI state lives, or a LOCALAPPDATA-only Agent becomes unreachable"
-    )
-    assert "$platformDefaultAgentHome = $serverPlatformDefaultHome" not in source
     assert (
-        "$serverCandidates += (Join-Path $platformDefaultAgentHome 'hermes-agent')"
-        in source
+        "if ($hermesHomeIsDefault) {\n"
+        "    $env:HERMES_HOME = $platformDefaultHermesHome\n"
+        "}"
+    ) in source, (
+        "HERMES_HOME must not be moved to the legacy home by the #2905 "
+        "preference; that would hide the working config.yaml"
     )
+
+    assert (
+        "Join-Path $serverPlatformDefaultHome 'hermes-agent'" in block
+    ), "candidate 5 must be the home the server itself would default to"
+    assert (
+        "Join-Path $newHermesHome 'hermes-agent'" in block
+    ), (
+        "%LOCALAPPDATA\\hermes\\hermes-agent must stay a candidate even when "
+        "the #2905 legacy preference selects a different home for candidate 5, "
+        "or a LOCALAPPDATA-only Agent becomes unreachable"
+    )
+    # The launcher-only legacy root must not reappear as the server's answer.
+    assert "$platformDefaultAgentHome" not in source
     assert (
         "$serverCandidates += (Join-Path $platformDefaultHermesHome 'hermes-agent')"
         not in source

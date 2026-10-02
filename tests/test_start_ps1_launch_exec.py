@@ -26,6 +26,10 @@ start.ps1 for real on windows-latest.
 All state is confined to tmp_path: USERPROFILE, LOCALAPPDATA and HERMES_HOME
 point inside the fixture, and HERMES_WEBUI_PYTHON is a stub that exits
 immediately, so no server is started and no real install is touched.
+start.ps1 itself is copied into the fixture too, because its repo root and the
+../hermes-agent sibling it searches are derived from its own location — running
+the checked-out script would point that candidate at the real Agent checkout
+next to the clone.
 """
 
 from __future__ import annotations
@@ -55,6 +59,7 @@ pytestmark = [
 # are the observable result of discovery and Python selection.
 AGENT_DIR_PREFIX = "[start.ps1] Agent dir:  "
 PYTHON_PREFIX = "[start.ps1] Python:     "
+STATE_DIR_PREFIX = "[start.ps1] State dir:  "
 
 
 def _write_stub_python(fixture: Path) -> Path:
@@ -65,18 +70,41 @@ def _write_stub_python(fixture: Path) -> Path:
     return stub
 
 
+def _write_env_probe_python(fixture: Path) -> Path:
+    """A stub that reports the environment start.ps1 exported to its child.
+
+    The exported HERMES_HOME is not one of the lines start.ps1 prints, and it
+    is the value that decides where api/config.py reads providers and models
+    from, so it needs to be observable from the test.
+    """
+    probe = fixture / "probe-python.sh"
+    probe.write_text(
+        '#!/bin/sh\n'
+        'echo "probe HERMES_HOME=$HERMES_HOME"\n'
+        'echo "probe HERMES_WEBUI_STATE_DIR=$HERMES_WEBUI_STATE_DIR"\n'
+        'exit 0\n',
+        encoding="utf-8",
+    )
+    probe.chmod(0o755)
+    return probe
+
+
 def _make_agent(root: Path, *, source: bool = False, venv: bool = False,
                 bootstrap: bool = False) -> Path:
     """Build a hermes-agent-shaped directory.
 
     `source=True` means a bare source checkout: run_agent.py and no hermes_cli,
-    which is what makes it eligible for the source-first pass. `venv` adds the
-    Windows venv path start.ps1 looks for; `bootstrap` adds the file
-    managed_agent_startup.activate_managed_agent() imports to supply deps.
+    which is what makes it eligible for the source-first pass. The default is
+    the pip-style shape instead — hermes_cli and no run_agent.py — because that
+    is what an installed Agent looks like, and keeping the two shapes disjoint
+    is what lets the source-first pass be exercised at all.
+    `venv` adds the Windows venv path start.ps1 looks for; `bootstrap` adds the
+    file managed_agent_startup.activate_managed_agent() imports to supply deps.
     """
     root.mkdir(parents=True, exist_ok=True)
-    (root / "run_agent.py").write_text("", encoding="utf-8")
-    if not source:
+    if source:
+        (root / "run_agent.py").write_text("", encoding="utf-8")
+    else:
         (root / "hermes_cli").mkdir(parents=True, exist_ok=True)
         (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     if venv:
@@ -88,8 +116,29 @@ def _make_agent(root: Path, *, source: bool = False, venv: bool = False,
     return root
 
 
+def _stage_repo(fixture: Path) -> Path:
+    """Copy start.ps1 into an isolated repo root inside the fixture.
+
+    start.ps1 derives $RepoRoot from its own path, and one of the layouts it
+    searches is that root's sibling, ../hermes-agent. Running the checked-out
+    script therefore points that candidate at the real checkout next to the
+    clone — which, for anyone using the documented side-by-side layout
+    (hermes-webui/ next to hermes-agent/), is their actual Agent working tree.
+    Copying the script keeps the repo root, the sibling candidate and every
+    Agent inside tmp_path, so a fixture can create and remove an Agent of its
+    own without ever reaching the developer's tree.
+    """
+    repo = fixture / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(START_PS1, repo / "start.ps1")
+    # start.ps1 refuses to launch when server.py is absent from its own root.
+    (repo / "server.py").write_text("", encoding="utf-8")
+    return repo
+
+
 def _run_start_ps1(fixture: Path, extra_env: dict[str, str] | None = None) -> tuple[int, str]:
     """Execute start.ps1 against a disposable fixture tree."""
+    start_ps1 = _stage_repo(fixture) / "start.ps1"
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(fixture / "user"),
@@ -99,7 +148,7 @@ def _run_start_ps1(fixture: Path, extra_env: dict[str, str] | None = None) -> tu
     }
     env.update(extra_env or {})
     completed = subprocess.run(
-        [shutil.which("pwsh"), "-NoProfile", "-File", str(START_PS1)],
+        [shutil.which("pwsh"), "-NoProfile", "-File", str(start_ps1)],
         capture_output=True,
         text=True,
         env=env,
@@ -119,6 +168,13 @@ def _python(output: str) -> str:
     for line in output.splitlines():
         if line.startswith(PYTHON_PREFIX):
             return line[len(PYTHON_PREFIX):].strip()
+    return ""
+
+
+def _state_dir(output: str) -> str:
+    for line in output.splitlines():
+        if line.startswith(STATE_DIR_PREFIX):
+            return line[len(STATE_DIR_PREFIX):].strip()
     return ""
 
 
@@ -203,12 +259,11 @@ def test_bare_source_checkout_falls_back_to_a_candidate_venv(tmp_path):
     installed = _make_agent(
         fixture / "local" / "hermes" / "hermes-agent", venv=True
     )
-    sibling = _make_agent(REPO_ROOT.parent / "hermes-agent", source=True)
+    # The sibling of the staged repo root, i.e. inside the fixture. Never
+    # REPO_ROOT.parent: that is the real checkout for a side-by-side developer.
+    sibling = _make_agent(fixture / "hermes-agent", source=True)
 
-    try:
-        code, output = _run_start_ps1(fixture)
-    finally:
-        shutil.rmtree(sibling, ignore_errors=True)
+    code, output = _run_start_ps1(fixture)
 
     expected = installed / "venv" / "Scripts" / "python.exe"
     assert _python(output) == str(expected), (
@@ -232,18 +287,75 @@ def test_source_checkout_with_bootstrap_keeps_its_own_interpreter(tmp_path):
     fixture = tmp_path / "fx"
     (fixture / "user" / ".hermes" / "webui").mkdir(parents=True)
     _make_agent(fixture / "local" / "hermes" / "hermes-agent", venv=True)
-    sibling = _make_agent(
-        REPO_ROOT.parent / "hermes-agent", source=True, bootstrap=True
-    )
+    sibling = _make_agent(fixture / "hermes-agent", source=True, bootstrap=True)
 
-    try:
-        code, output = _run_start_ps1(fixture)
-    finally:
-        shutil.rmtree(sibling, ignore_errors=True)
+    code, output = _run_start_ps1(fixture)
 
     assert _agent_dir(output) == str(sibling), output
     assert _python(output) == str(_write_stub_python(fixture)), (
         "hermes_bootstrap.py activates the checkout's dependencies, so the venv "
         "fallback must stay out of the way; got:\n" + output
+    )
+    assert code == 0, output
+
+
+def test_explicit_state_dir_keeps_the_legacy_agent_ahead_of_home(tmp_path):
+    """Candidate 5 must be the SERVER's default home, not HOME\\hermes-agent.
+
+    With the WebUI state still at the legacy %USERPROFILE%\\.hermes, the server
+    defaults its own home there too, so %USERPROFILE%\\.hermes\\hermes-agent is
+    the install it would use. %USERPROFILE%\\hermes-agent is a flat checkout the
+    server never searches, so when both exist the launcher has to reach the
+    legacy one first or it exports a different Agent than the server defaults
+    to.
+    """
+    fixture = tmp_path / "fx"
+    (fixture / "user" / ".hermes" / "webui").mkdir(parents=True)
+    legacy = _make_agent(fixture / "user" / ".hermes" / "hermes-agent")
+    _make_agent(fixture / "user" / "hermes-agent")
+
+    code, output = _run_start_ps1(
+        fixture, extra_env={"HERMES_WEBUI_STATE_DIR": str(fixture / "state")}
+    )
+
+    assert _agent_dir(output) == str(legacy), (
+        "the server's own default home must be searched before the flat "
+        "HOME\\hermes-agent checkout; got:\n" + output
+    )
+    assert code == 0, output
+
+
+def test_legacy_webui_state_redirects_only_the_state_dir(tmp_path):
+    """A legacy state dir must not drag the working config home along with it.
+
+    api/config.py reads providers and models from HERMES_HOME, so a user whose
+    config.yaml sits in %LOCALAPPDATA%\\hermes has to keep reading it there.
+    Only the webui/ state location is affected by the #2905 migration.
+    """
+    fixture = tmp_path / "fx"
+    legacy_state = fixture / "user" / ".hermes" / "webui"
+    legacy_state.mkdir(parents=True)
+    new_home = fixture / "local" / "hermes"
+    new_home.mkdir(parents=True)
+    (new_home / "config.yaml").write_text("provider: local\n", encoding="utf-8")
+    agent = _make_agent(new_home / "hermes-agent")
+    probe = _write_env_probe_python(fixture)
+
+    code, output = _run_start_ps1(
+        fixture, extra_env={"HERMES_WEBUI_PYTHON": str(probe)}
+    )
+
+    assert _agent_dir(output) == str(agent), (
+        "the new home's Agent must still be found in a legacy-state layout; "
+        "got:\n" + output
+    )
+    assert _state_dir(output) == str(legacy_state), (
+        "the sessions still live in the legacy webui directory, so the state "
+        "default has to follow them there; got:\n" + output
+    )
+    assert f"probe HERMES_HOME={new_home}" in output, (
+        "HERMES_HOME is where api/config.py reads providers and models from, so "
+        "it must stay on the platform default that holds config.yaml; got:\n"
+        + output
     )
     assert code == 0, output

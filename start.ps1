@@ -130,31 +130,16 @@ if ($legacyHermesHome -ne $newHermesHome -and
     $serverPlatformDefaultHome = $legacyHermesHome
 }
 
-# The exported HERMES_HOME is a different question. An explicit
-# HERMES_WEBUI_STATE_DIR means WebUI state already lives elsewhere, so a
-# leftover %USERPROFILE%\.hermes\webui must NOT yank HERMES_HOME to the legacy
-# path: api/profiles.py would then read provider settings from the wrong home.
-# Master keeps %LOCALAPPDATA%\hermes in that shape.
+# The exported HERMES_HOME stays on master's unconditional platform default.
+# api/config.py reads providers and models from it, so yanking it to the legacy
+# home because only the WebUI STATE has not migrated yet hides a working
+# config.yaml sitting in %LOCALAPPDATA%\hermes. The #2905 legacy preference
+# belongs to the STATE_DIR default below, which is the only place it changes
+# what the user actually sees.
 $platformDefaultHermesHome = $newHermesHome
-if (-not $env:HERMES_WEBUI_STATE_DIR) {
-    $platformDefaultHermesHome = $serverPlatformDefaultHome
-}
 
-# Candidate 5 is the PLATFORM default for an Agent install, and that is NOT
-# the same question as where the exported HERMES_HOME points. api/config.py
-# candidate 5 is _DEFAULT_HERMES_HOME\hermes-agent, but the #2905 legacy
-# fallback inside _platform_default_hermes_home() is keyed on where the WEBUI
-# STATE lives — so gating Agent discovery on it drops a real install: with
-# WebUI state still at the legacy %USERPROFILE%\.hermes and the only Agent at
-# %LOCALAPPDATA%\hermes, the LOCALAPPDATA path never enters the candidate list
-# and startup dies with "hermes-agent not found". Master searched both roots
-# unconditionally and found it, so keep that coverage: search the new
-# location, and let the legacy location stay reachable as a launcher-only
-# candidate. Because this script exports the discovered dir as
-# HERMES_WEBUI_AGENT_DIR, the server then uses the same one it reports.
-$platformDefaultAgentHome = $newHermesHome
-
-if (-not $env:HERMES_HOME) {
+$hermesHomeIsDefault = -not $env:HERMES_HOME
+if ($hermesHomeIsDefault) {
     $env:HERMES_HOME = $platformDefaultHermesHome
 }
 
@@ -192,9 +177,20 @@ if (-not $AgentDir) {
         (Test-Path (Join-Path $repoParent 'hermes_cli') -PathType Container)) {
         $serverCandidates += $repoParent
     }
-    # 5. Platform-default home\hermes-agent (api.paths._platform_default_hermes_home)
-    $serverCandidates += (Join-Path $platformDefaultAgentHome 'hermes-agent')
-    # 6. HOME\hermes-agent (Path.home() → %USERPROFILE% on Windows)
+    # 5. _DEFAULT_HERMES_HOME\hermes-agent, i.e. what the SERVER would default
+    #    to — which is NOT the same as where this script points HERMES_HOME.
+    #    _platform_default_hermes_home() still prefers %USERPROFILE%\.hermes
+    #    while the WebUI state has not migrated off it, so this slot resolves to
+    #    the legacy home in that layout and to %LOCALAPPDATA%\hermes otherwise.
+    #    Reach HOME\hermes-agent first and this exports a stale flat checkout the
+    #    server itself would never pick.
+    $serverCandidates += (Join-Path $serverPlatformDefaultHome 'hermes-agent')
+    # 6. LOCALAPPDATA\hermes-agent unconditionally. A legacy-state layout can
+    #    have the new home's Agent as the only install on the machine, and
+    #    dropping this when the #2905 preference applies leaves startup dying
+    #    with "hermes-agent not found".
+    $serverCandidates += (Join-Path $newHermesHome 'hermes-agent')
+    # 7. HOME\hermes-agent (Path.home() → %USERPROFILE% on Windows)
     $serverCandidates += (Join-Path $env:USERPROFILE 'hermes-agent')
     # De-dup server-equivalent list (HERMES_HOME may coincide with platform default).
     $serverCandidates = $serverCandidates | Select-Object -Unique
@@ -324,6 +320,16 @@ $env:HERMES_WEBUI_PORT = "$PortFinal"
 # exported HERMES_WEBUI_AGENT_DIR matches api/config.py's search order.
 if (-not $env:HERMES_WEBUI_STATE_DIR) {
     $env:HERMES_WEBUI_STATE_DIR = Join-Path $env:HERMES_HOME 'webui'
+    # #2905 migration, applied to the STATE_DIR default and nowhere else: while
+    # the sessions still live under the legacy %USERPROFILE%\.hermes and the new
+    # home holds none, read them from there. HERMES_HOME above deliberately
+    # stayed on %LOCALAPPDATA%\hermes so the working config.yaml next to the
+    # Agent is still the one api/config.py reads. Gated on this script having
+    # chosen HERMES_HOME itself — an explicit value keeps master's behaviour of
+    # putting webui/ under it.
+    if ($hermesHomeIsDefault -and $serverPlatformDefaultHome -ne $platformDefaultHermesHome) {
+        $env:HERMES_WEBUI_STATE_DIR = Join-Path $serverPlatformDefaultHome 'webui'
+    }
 }
 
 # === Ensure dirs exist =================================================
