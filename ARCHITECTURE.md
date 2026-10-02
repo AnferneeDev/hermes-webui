@@ -651,7 +651,11 @@ clear memory and provenance, retire the in-flight owner, and delete the durable 
 Every build already running becomes superseded *even when no successor rebuild is ever
 allocated*; otherwise a delayed worker could repopulate the cleared catalog under a
 fresh-looking fingerprint. Disk snapshots read before taking the catalog lock (including
-the session-visit warmer) are published only if their captured epoch still matches.
+the session-visit warmer) are published only if their captured epoch still matches: a
+preloaded fresh candidate whose epoch moved is dropped rather than published under the
+current fingerprint. The *degraded* stale fallback is deliberately not fenced — it is
+returned to a caller that already stopped waiting and is never published to memory, so
+discarding it would only swap a stale-but-real answer for a static catalog.
 
 A build's **identity is captured when it starts and re-validated when it publishes**, in
 memory and at the durable commit: the source fingerprint (`_models_cache_source_fingerprint`

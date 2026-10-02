@@ -11004,8 +11004,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     _cfg_changed = _current_mtime != _cfg_mtime
 
     # Disk load BEFORE lock: ~0.1ms, lets concurrent requests skip entirely.
-    # Capture the epoch before that load and reject the bytes if invalidation
-    # advanced it before publication. Cold rebuilds still serialize on the lock.
+    # Capture the epoch before that load: the bytes must not be published to
+    # memory under a fresh fingerprint if invalidation advanced the epoch in
+    # between. Cold rebuilds still serialize on the lock.
     disk_groups = None
     stale_disk_groups = None
     disk_epoch = _models_rebuild_seq
@@ -11018,8 +11019,15 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
     with _available_models_cache_lock:
         if disk_epoch != _models_rebuild_seq:
+            # Invalidation advanced the epoch after the unlocked read, so these
+            # bytes may describe the catalog it just cleared: they must not be
+            # published to memory here, nor served as the fresh answer.
+            # ``stale_disk_groups`` is deliberately NOT fenced — it is the
+            # degraded fallback handed to a caller that already stopped waiting
+            # (and to the strict-metadata miss below), and it is never published
+            # to memory, so discarding it would only turn a stale-but-real answer
+            # into a static catalog without protecting anything.
             disk_groups = None
-            stale_disk_groups = None
         # If another thread is already building, wait for its result instead
         # of re-entering the cold path (avoids duplicate 10s zai load_pool calls).
         if should_wait:
