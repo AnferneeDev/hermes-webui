@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import struct
+import zlib
 import queue
 import threading
 import time
@@ -1844,3 +1847,145 @@ def test_interrupted_owner_without_context_successor_requires_context_tail(suffi
             assert recovered.context_messages == before
             assert not any(row.get("content") == "Old tail answer" for row in _next_send_history(recovered))
             assert all(row.get("_recovered_display_only") is True for row in _stream_output(recovered, streams[0]))
+
+
+@pytest.mark.parametrize("cache_hits", [False, True], ids=["cold", "cached"])
+@pytest.mark.parametrize("new_output", [False, True], ids=["empty-stop", "output-stop"])
+@pytest.mark.parametrize("identity", [None, "token", "message-id", "state-row", "message-uid"])
+@pytest.mark.parametrize("shape", ["native-image", "native-image-successor", "context-api", "shared-api", "display-attachments"])
+def test_rich_interrupted_owner_preserves_exact_real_next_send(
+    tmp_path, cache_hits, new_output, identity, shape,
+):
+    from api.streaming import _build_native_multimodal_message, _workspace_context_prefix
+    sid = f"rich-old-owner-{cache_hits}-{new_output}-{identity}-{shape}"
+    streams = _persist_multi_retry_turns(sid, ["interrupted", "cancelled"], [
+        [("token", {"text": "Old rich answer"})],
+        [("token", {"text": "New answer"})] if new_output else [],
+    ], defer_first=True)
+    first = models.get_session(sid)
+    display_owner = next(row for row in first.messages if row.get("role") == "user" and row.get("timestamp") == 10)
+    context_owner = first.context_messages[0]
+    if identity is not None:
+        if identity == "message-id":
+            display_owner["id"] = "old-rich-id"
+            context_owner["message_id"] = "old-rich-id"
+        else:
+            key, value = {"token": ("_active_turn_token", f"{streams[0]}:10"),
+                          "state-row": ("_state_db_row_id", 42), "message-uid": ("message_uid", "old-rich-uid")}[identity]
+            display_owner[key] = value
+            context_owner[key] = value
+    prefix = _workspace_context_prefix(str(tmp_path))
+    attachments = [{"path": str(tmp_path / "upload.png"), "name": "upload.png", "mime": "image/png"}]
+    if shape.startswith("native-image"):
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(b"\0\xfb\xef\xff")) + chunk(b"IEND", b""))
+        (tmp_path / "upload.png").write_bytes(png)
+        rich = _build_native_multimodal_message(prefix, "Prompt 0", attachments, str(tmp_path), cfg={"agent": {"image_input_mode": "native"}})
+        assert isinstance(rich, list) and len(rich) == 2
+        assert base64.b64decode(rich[1]["image_url"]["url"].split(",", 1)[1]) == png
+        context_owner["content"] = rich
+        context_owner[models._WEBUI_TRUSTED_AGENT_INPUT_FIELD] = prefix + "Prompt 0"
+        display_owner["attachments"] = attachments
+    elif shape in ("context-api", "shared-api"):
+        context_owner["api_content"] = prefix + "Prompt 0\n\n[Attached files: upload.txt]"
+        if shape == "shared-api":
+            display_owner["api_content"] = context_owner["api_content"]
+    else:
+        display_owner["attachments"] = attachments
+        context_owner["content"] = prefix + "Prompt 0\n\n[Attached files: upload.png]"
+    successor_content = "Prompt 1"
+    if shape == "native-image-successor" and new_output:
+        successor = next(row for row in first.context_messages if row.get("role") == "user" and row.get("timestamp") == 20)
+        successor_content = _build_native_multimodal_message(prefix, "Prompt 1", attachments, str(tmp_path), cfg={"agent": {"image_input_mode": "native"}})
+        successor["content"] = successor_content
+        successor[models._WEBUI_TRUSTED_AGENT_INPUT_FIELD] = prefix + "Prompt 1"
+        successor["api_content"] = prefix + "Prompt 1\n\n[Attached files: upload.png]"
+        display_successor = next(row for row in first.messages if row.get("role") == "user" and row.get("timestamp") == 20)
+        display_successor["attachments"] = attachments
+    original_owner = copy.deepcopy(context_owner)
+    original_display = copy.deepcopy(display_owner)
+    first.save()
+    writer = RunJournalWriter(sid, streams[0])
+    writer.append_sse_event("token", {"text": "Old rich answer"})
+    writer.append_sse_event("cancel", {"message": "Old journal visible after new Stop"})
+    for _ in range(3):
+        if not cache_hits:
+            models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        history = _next_send_history(recovered)
+        expected = [("user", original_owner["content"]), ("assistant", "Old rich answer")]
+        if new_output:
+            expected += [("user", successor_content), ("assistant", "New answer")]
+        assert [(row["role"], row["content"]) for row in history] == expected
+        if "api_content" in original_owner:
+            assert history[0]["api_content"] == original_owner["api_content"]
+        assert next(row for row in recovered.context_messages if row.get("role") == "user" and row.get("timestamp") == 10) == original_owner
+        assert next(row for row in recovered.messages if row.get("role") == "user" and row.get("timestamp") == 10) == original_display
+        assert _pending_stream_hook(recovered, streams[0]) is None
+
+
+@pytest.mark.parametrize("failure", ["conflicting-api", "conflicting-attachments", "conflicting-id", "contradictory-id-alias", "contradictory-db-alias", "invalid-id", "conflicting-uid", "duplicate-id-context", "duplicate-id-display", "duplicate-normalized-owner", "interior-workspace", "nonterminal-attachment", "invalid-timestamp", "nonfinite-timestamp", "invalid-source", "invalid-uid", "structured-api-conflict", "duplicate-uid", "duplicate-token"])
+def test_rich_interrupted_owner_proof_rejects_conflicts_and_ambiguity(failure):
+    sid = f"rich-old-owner-reject-{failure}"
+    streams = _persist_multi_retry_turns(sid, ["interrupted", "cancelled"], [
+        [("token", {"text": "Old rejected answer"})], [("token", {"text": "New answer"})],
+    ], defer_first=True)
+    first = models.get_session(sid)
+    display = next(row for row in first.messages if row.get("role") == "user" and row.get("timestamp") == 10)
+    context = first.context_messages[0]
+    if failure == "conflicting-api":
+        display["api_content"], context["api_content"] = "display API", "other API"
+    elif failure == "conflicting-attachments":
+        display["attachments"], context["attachments"] = [{"path": "one.png"}], [{"path": "other.png"}]
+    elif failure == "conflicting-id":
+        display["id"], context["id"] = "one", "other"
+    elif failure == "contradictory-id-alias":
+        context.update(id="one", message_id="other")
+    elif failure == "contradictory-db-alias":
+        context.update(_state_db_row_id=1, _row_id=2)
+    elif failure == "invalid-id":
+        context["id"] = True
+    elif failure == "conflicting-uid":
+        display["message_uid"], context["message_uid"] = "one", "other"
+    elif failure.startswith("duplicate-id"):
+        display["id"] = context["id"] = "reused"
+        if failure == "duplicate-id-context":
+            first.context_messages.insert(1, {"role": "user", "content": "Unrelated prompt", "timestamp": 15, "id": "reused"})
+        else:
+            first.messages.insert(0, {"role": "user", "content": "Unrelated prompt", "timestamp": 5, "id": "reused"})
+    elif failure == "duplicate-normalized-owner":
+        duplicate = copy.deepcopy(context)
+        duplicate["content"] = "[Workspace::v1: /tmp/example]\nPrompt 0\n\n[Attached files: duplicate.txt]"
+        first.context_messages.insert(1, duplicate)
+    elif failure == "invalid-timestamp":
+        context["timestamp"] = True
+    elif failure == "nonfinite-timestamp":
+        context["timestamp"] = float("inf")
+    elif failure == "invalid-source":
+        context["_source"] = ["webui"]
+    elif failure == "invalid-uid":
+        context["message_uid"] = ["bad"]
+    elif failure == "structured-api-conflict":
+        context["id"] = display["id"] = "same"
+        context["api_content"], display["api_content"] = {"text": "one"}, {"text": "two"}
+    elif failure in ("duplicate-uid", "duplicate-token"):
+        key = "message_uid" if failure == "duplicate-uid" else "_active_turn_token"
+        context[key] = display[key] = "reused"
+        first.context_messages.insert(1, {"role": "user", "content": "Unrelated prompt", "timestamp": 15, key: "reused"})
+    elif failure == "interior-workspace":
+        context["content"] = "Prompt 0\n[Workspace::v1: /tmp/example]"
+    else:
+        context["content"] = "Prompt 0\n\n[Attached files: upload.txt]\nUser body continues."
+    first.save()
+    before = copy.deepcopy(first.context_messages)
+    writer = RunJournalWriter(sid, streams[0])
+    writer.append_sse_event("token", {"text": "Old rejected answer"})
+    writer.append_sse_event("cancel", {"message": "Old terminal tail"})
+    for _ in range(3):
+        models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        assert recovered.context_messages == before
+        assert all(row.get("_recovered_display_only") is True for row in _stream_output(recovered, streams[0]))
+        assert not any(row.get("content") == "Old rejected answer" for row in _next_send_history(recovered))

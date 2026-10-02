@@ -3894,30 +3894,131 @@ def _cancel_journal_retry_owner_index(session, marker_idx: int, marker: dict) ->
 
 
 
+def _journal_user_identity_details(row):
+    """Keep stable user identities in separate namespaces; reject bad aliases."""
+    stable, stable_valid = _stable_message_identity_details(row)
+    state_row, state_valid = _state_db_row_identity_details(row)
+    identities = {'message': stable, 'state_row': state_row}
+    valid = stable_valid and state_valid
+    for key in ('_active_turn_token', 'message_uid'):
+        value = row.get(key)
+        if value is None or value == '':
+            identities[key] = None
+        elif isinstance(value, str) and value.strip():
+            identities[key] = value.strip()
+        else:
+            identities[key] = None
+            valid = False
+    return identities, valid
+
+
+def _journal_user_display_text(row):
+    """Compare display text without rewriting native image/provider payloads."""
+    from api.streaming import _strip_title_attachment_suffix, _strip_workspace_prefix
+
+    content = row.get('content')
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                return None
+            kind = part.get('type')
+            if kind in ('text', 'input_text', 'output_text'):
+                if not isinstance(part.get('text'), str):
+                    return None
+                parts.append(part['text'])
+            elif kind not in ('image_url', 'input_image', 'image'):
+                return None
+        text = '\n'.join(parts)
+    else:
+        return None
+    return _strip_workspace_prefix(
+        _strip_title_attachment_suffix(text), include_legacy=True,
+    )
+
+
+def _journal_user_metadata_key(row):
+    timestamp = row.get('timestamp')
+    # Preserve exact numeric timestamps: float coercion loses large-int identity,
+    # and booleans/nonfinite values must never establish ownership.
+    if timestamp is not None and (type(timestamp) not in (int, float)
+                                 or (isinstance(timestamp, float) and not math.isfinite(timestamp))):
+        return None
+    source = row.get('_source') or 'webui'
+    if not isinstance(source, str):
+        return None
+    return timestamp, source.strip().casefold()
+
+
+def _journal_user_fallback_key(row):
+    metadata = _journal_user_metadata_key(row)
+    text = _journal_user_display_text(row)
+    if metadata is None or metadata[0] is None or text is None:
+        return None
+    return (*metadata, text)
+
+
 def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int | None):
-    """Prove an interrupted owner and its successor without display ordinals."""
+    """Prove an interrupted owner and its successor across rich projections."""
     messages = session.messages or []
     context = getattr(session, 'context_messages', None)
     if owner_idx is None or not isinstance(context, list):
         return None
-    owner = messages[owner_idx]
+    display_users = [row for row in messages if isinstance(row, dict) and row.get('role') == 'user']
+    context_users = [row for row in context if isinstance(row, dict) and row.get('role') == 'user']
 
-    def same_user(row, expected):
-        return (
-            isinstance(row, dict) and row.get('role') == 'user'
-            and row.get('content') == expected.get('content')
-            and row.get('timestamp') is not None
-            and row.get('timestamp') == expected.get('timestamp')
-            and (row.get('_source') or 'webui') == (expected.get('_source') or 'webui')
-            and (row.get('attachments') or []) == (expected.get('attachments') or [])
-            and row.get('api_content') == expected.get('api_content')
-        )
+    def unique_context_user(expected):
+        identities, valid = _journal_user_identity_details(expected)
+        if not valid:
+            return None
+        for namespace, value in identities.items():
+            if value is not None and any(
+                sum(_journal_user_identity_details(row)[0][namespace] == value for row in users) > 1
+                for users in (display_users, context_users)
+            ):
+                return None
+        expected_metadata = _journal_user_metadata_key(expected)
+        if expected_metadata is None:
+            return None
+        expected_key = _journal_user_fallback_key(expected)
+        matches = []
+        for row in context_users:
+            row_ids, row_valid = _journal_user_identity_details(row)
+            if not row_valid or not _message_private_identity_compatible(row, expected):
+                continue
+            if any(value is not None and row_ids[key] is not None and value != row_ids[key]
+                   for key, value in identities.items()):
+                continue
+            # A token on only one projection cannot establish a cancelled owner.
+            if row_ids['_active_turn_token'] != identities['_active_turn_token']:
+                continue
+            if any(row.get(key) not in (None, '', []) and expected.get(key) not in (None, '', [])
+                   and row[key] != expected[key] for key in ('api_content', 'attachments')):
+                continue
+            row_metadata = _journal_user_metadata_key(row)
+            if row_metadata is None or row_metadata[1] != expected_metadata[1]:
+                continue
+            if row_metadata[0] is not None and expected_metadata[0] is not None and row_metadata[0] != expected_metadata[0]:
+                continue
+            row_key = _journal_user_fallback_key(row)
+            shared = [key for key, value in identities.items() if value is not None and value == row_ids[key]]
+            if shared:
+                if any(sum(_journal_user_identity_details(candidate)[0][key] == identities[key]
+                           for candidate in users) != 1
+                       for key in shared for users in (display_users, context_users)):
+                    continue
+            elif expected_key is None or row_key != expected_key or any(
+                sum(_journal_user_fallback_key(candidate) == expected_key for candidate in users) != 1
+                for users in (display_users, context_users)
+            ):
+                continue
+            matches.append(row)
+        return matches[0] if len(matches) == 1 else None
 
-    owners = [row for row in context if same_user(row, owner)]
-    if len(owners) != 1 or sum(same_user(row, owner) for row in messages) != 1:
-        return None
-    context_owner = owners[0]
-    if (context_owner.get('_active_turn_token') or '') != (owner.get('_active_turn_token') or ''):
+    context_owner = unique_context_user(messages[owner_idx])
+    if context_owner is None:
         return None
     owner_position = next(i for i, row in enumerate(context) if row is context_owner)
     successor = next((row for row in context[owner_position + 1:]
@@ -3928,11 +4029,7 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
         token = str(successor.get('_active_turn_token') or '').strip()
         matches = [row for row in display_successors
                    if token and str(row.get('_active_turn_token') or '').strip() == token]
-        if len(matches) != 1 or not same_user(successor, matches[0]):
-            return None
-        if sum(isinstance(row, dict) and row.get('role') == 'user'
-               and str(row.get('_active_turn_token') or '').strip() == token
-               for row in context) != 1:
+        if len(matches) != 1 or unique_context_user(matches[0]) is not successor:
             return None
     elif owner_position != len(context) - 1 or not any(
         str(row.get('_active_turn_token') or '').strip() for row in display_successors
