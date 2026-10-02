@@ -130,9 +130,18 @@ Interrupted-hook scans bypass only assistant rows carrying the explicit
 `_recovered_from_cancel_journal: true` provenance stamped by successful exact-stream
 cancellation recovery. Other recovered and ordinary assistant turns retain the
 existing stopping boundary; a stream ID alone does not authorize bypass.
-Interrupted output recovered behind a later user remains display-only
-(`_recovered_display_only: true`), including during empty-context seeding and
-Agent/API replay sanitization. It must not be appended as the newer turn's answer.
+Interrupted output recovered behind a later display user enters provider history
+only when its display owner uniquely matches a context user by exact content,
+timestamp and source (with compatible attachments/API content and turn token),
+and the next context user uniquely matches an authoritative later display turn
+token. A surviving owner without a context successor still requires a token-bearing
+later display turn. Recovery inserts exact-stream output before that next user,
+retaining existing native tool call/result blocks together; truncated display tool
+metadata never becomes a provider call. This placement and hook retirement commit
+in one save, with in-memory rollback on failure. Empty, compressed, duplicate or
+ambiguous/tokenless ownership stays display-only (`_recovered_display_only: true`),
+including during empty-context seeding and Agent/API replay sanitization. It must
+not be appended as the newer turn's answer.
 Latest-turn interrupted output retains its existing provider-context projection.
 Display deduplication stays within the selected interrupted user/marker window;
 that window is not provider-context ownership evidence. Reordering moves only

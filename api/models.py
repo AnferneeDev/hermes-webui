@@ -3893,6 +3893,79 @@ def _cancel_journal_retry_owner_index(session, marker_idx: int, marker: dict) ->
     return matches[0] if len(matches) == 1 else None
 
 
+
+def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int | None):
+    """Prove an interrupted owner and its successor without display ordinals."""
+    messages = session.messages or []
+    context = getattr(session, 'context_messages', None)
+    if owner_idx is None or not isinstance(context, list):
+        return None
+    owner = messages[owner_idx]
+
+    def same_user(row, expected):
+        return (
+            isinstance(row, dict) and row.get('role') == 'user'
+            and row.get('content') == expected.get('content')
+            and row.get('timestamp') is not None
+            and row.get('timestamp') == expected.get('timestamp')
+            and (row.get('_source') or 'webui') == (expected.get('_source') or 'webui')
+            and (row.get('attachments') or []) == (expected.get('attachments') or [])
+            and row.get('api_content') == expected.get('api_content')
+        )
+
+    owners = [row for row in context if same_user(row, owner)]
+    if len(owners) != 1 or sum(same_user(row, owner) for row in messages) != 1:
+        return None
+    context_owner = owners[0]
+    if (context_owner.get('_active_turn_token') or '') != (owner.get('_active_turn_token') or ''):
+        return None
+    owner_position = next(i for i, row in enumerate(context) if row is context_owner)
+    successor = next((row for row in context[owner_position + 1:]
+                      if isinstance(row, dict) and row.get('role') == 'user'), None)
+    display_successors = [row for row in messages[marker_idx + 1:]
+                          if isinstance(row, dict) and row.get('role') == 'user']
+    if successor is not None:
+        token = str(successor.get('_active_turn_token') or '').strip()
+        matches = [row for row in display_successors
+                   if token and str(row.get('_active_turn_token') or '').strip() == token]
+        if len(matches) != 1 or not same_user(successor, matches[0]):
+            return None
+        if sum(isinstance(row, dict) and row.get('role') == 'user'
+               and str(row.get('_active_turn_token') or '').strip() == token
+               for row in context) != 1:
+            return None
+    elif not any(str(row.get('_active_turn_token') or '').strip() for row in display_successors):
+        # A tokenless display successor cannot prove which context turn survived.
+        return None
+    return context_owner
+
+
+def _rehome_interrupted_journal_context(session, context_owner, stream_id: str) -> None:
+    """Insert exact-stream output before the proven successor, preserving pairs."""
+    context = session.context_messages
+    owner_positions = [i for i, row in enumerate(context) if row is context_owner]
+    if len(owner_positions) != 1:
+        return
+    recovered = []
+    for row in session.messages:
+        if (not isinstance(row, dict) or row.get('_recovered_from_run_journal') is not True
+                or str(row.get('_recovered_stream_id') or '') != stream_id):
+            continue
+        candidate = dict(row)
+        candidate.pop('_recovered_display_only', None)
+        projected = _recovered_model_context_projection(candidate)
+        if projected is not None:
+            recovered.append(projected)
+        row.pop('_recovered_display_only', None)
+    if not recovered:
+        return
+    # Keep any existing native assistant/tool block together; never synthesize
+    # provider calls from the journal's truncated display-only tool metadata.
+    insert_at = next((i for i in range(owner_positions[0] + 1, len(context))
+                      if isinstance(context[i], dict) and context[i].get('role') == 'user'), len(context))
+    session.context_messages = context[:insert_at] + recovered + context[insert_at:]
+
+
 def _rehome_cancel_journal_rows(session, marker_idx: int, stream_id: str) -> None:
     """Move only this cancelled stream's recovered rows before its marker."""
     messages = getattr(session, 'messages', None)
@@ -4325,8 +4398,7 @@ def _retry_journal_recovery_in_place(
                             exc_info=True,
                         )
                     return False
-                # A display marker proves where to restore its rows, not where
-                # to insert them into provider context behind a successor user.
+                # Display successors alone do not establish context placement.
                 has_successor = any(
                     isinstance(row, dict) and row.get('role') == 'user'
                     for row in messages[idx + 1:]
@@ -4336,6 +4408,11 @@ def _retry_journal_recovery_in_place(
                     if isinstance(messages[index], dict)
                     and messages[index].get('role') == 'user'
                 ), None)
+                context_owner = (
+                    _interrupted_journal_context_owner(session, idx, owner_index)
+                    if has_successor else None
+                )
+                interrupted_snapshot = snapshot_cancel_projection() if context_owner is not None else None
                 recovered_output, terminal_error_recovered = (
                     _recover_journaled_output_and_terminal_error(
                         session,
@@ -4383,6 +4460,8 @@ def _retry_journal_recovery_in_place(
                     # interrupted wording or replacing it with a specific terminal
                     # error from that same stream.
                     _rehome_cancel_journal_rows(session, idx, str(stream_id))
+                    if context_owner is not None:
+                        _rehome_interrupted_journal_context(session, context_owner, str(stream_id))
                     if terminal_error_recovered:
                         before_removal = session.messages
                         session.messages = [
@@ -4394,6 +4473,10 @@ def _retry_journal_recovery_in_place(
                     try:
                         session.save(touch_updated_at=False)
                     except Exception:
+                        if interrupted_snapshot is not None:
+                            logger.debug("save() failed while applying proven interrupted context recovery", exc_info=True)
+                            restore_cancel_projection(interrupted_snapshot)
+                            return False
                         logger.debug(
                             "save() failed while applying lazy journal recovery for session %s",
                             getattr(session, 'session_id', '?'),

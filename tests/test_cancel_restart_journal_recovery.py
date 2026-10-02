@@ -1313,7 +1313,7 @@ def test_recovered_equal_segments_and_tool_owners_survive_cold_load():
 
 
 
-def _persist_multi_retry_turns(sid, kinds, outputs):
+def _persist_multi_retry_turns(sid, kinds, outputs, *, defer_first=False):
     """Persist actual Stop hooks and production interrupted markers/journals."""
     session = Session(session_id=sid, title="multiple retry turns", messages=[], context_messages=[])
     session.save()
@@ -1355,6 +1355,8 @@ def _persist_multi_retry_turns(sid, kinds, outputs):
         session.save()
     # Journals arrive after all markers, exactly the lazy-recovery condition.
     for number, events in enumerate(outputs):
+        if defer_first and number == 0:
+            continue
         writer = RunJournalWriter(sid, streams[number])
         for event, payload in events:
             writer.append_sse_event(event, payload)
@@ -1487,7 +1489,7 @@ def test_mixed_multiple_retry_turns_keep_boundaries_and_independent_budgets(
                 recovered, prefer_context=True, state_messages=[],
             )
         )
-        assert any(row.get("content") == "Oldest output" for row in history) is (older_kind == "cancelled")
+        assert any(row.get("content") == "Oldest output" for row in history)
 
 
 @pytest.mark.parametrize("expiry", ["attempts", "age"])
@@ -1608,9 +1610,9 @@ def test_two_interrupted_hooks_keep_newest_assistant_cutoff(cache_hits, later_ca
 
 
 @pytest.mark.parametrize("cache_hits", [False, True], ids=["cold", "cached"])
-@pytest.mark.parametrize("context_shape", ["full", "empty", "compressed"])
+@pytest.mark.parametrize("context_shape", ["empty", "compressed"])
 @pytest.mark.parametrize("equal_prose", [False, True])
-def test_older_interrupted_recovery_is_display_only_behind_cancelled_successor(
+def test_unproven_older_interrupted_recovery_stays_display_only(
     cache_hits, context_shape, equal_prose,
 ):
     sid = f"round5-display-only-{cache_hits}-{context_shape}-{equal_prose}"
@@ -1694,3 +1696,122 @@ def test_unproven_cancel_recovery_rows_keep_interrupted_scan_boundary(tag_value)
         assert not _stream_output(recovered, streams[0])
         assert recovered.context_messages == original_context
         assert _pending_stream_hook(recovered, streams[0])["_journal_retry_attempts"] == 0
+
+
+def _next_send_history(session):
+    from api.streaming import (
+        _new_turn_context_from_messages, _dedupe_replayed_context_messages,
+        _dedupe_replayed_active_context, _sanitize_messages_for_agent,
+    )
+    prompt = "Continue the next task"
+    reconciled = models.reconciled_state_db_messages_for_session(
+        session, prefer_context=True, state_messages=[],
+    )
+    history = _new_turn_context_from_messages(reconciled, prompt)
+    history = _dedupe_replayed_context_messages(history, history, prompt)
+    history = _dedupe_replayed_active_context(history, history, prompt)
+    return _sanitize_messages_for_agent(history)
+
+
+@pytest.mark.parametrize("cache_hits", [False, True], ids=["cold", "cached"])
+@pytest.mark.parametrize("new_output", [False, True], ids=["empty-stop", "output-stop"])
+@pytest.mark.parametrize("equal_prose", [False, True])
+@pytest.mark.parametrize("native_pair", [False, True])
+def test_proven_older_interrupted_answer_survives_real_stop_next_send(
+    cache_hits, new_output, equal_prose, native_pair,
+):
+    sid = f"proven-old-context-{cache_hits}-{new_output}-{equal_prose}-{native_pair}"
+    old_text = "Repeated answer" if equal_prose else "Old answer"
+    new_text = "Repeated answer" if equal_prose else "New answer"
+    kinds = ["interrupted", "cancelled"]
+    streams = _persist_multi_retry_turns(sid, kinds, [
+        [("token", {"text": old_text}),
+         ("tool", {"name": "read_file", "tid": "old-owned-tool", "args": {"path": "old.txt"}})],
+        [("token", {"text": new_text})] if new_output else [],
+    ], defer_first=True)
+    first = models.get_session(sid)
+    assert not _stream_output(first, streams[0])
+    pair = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "native-call", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"prior.txt"}'}}]},
+        {"role": "tool", "content": "Native tool result", "tool_call_id": "native-call"},
+    ] if native_pair else []
+    first.context_messages[1:1] = copy.deepcopy(pair)
+    first.save()
+    writer = RunJournalWriter(sid, streams[0])
+    writer.append_sse_event("token", {"text": old_text})
+    writer.append_sse_event("tool", {"name": "read_file", "tid": "old-owned-tool", "args": {"path": "old.txt"}})
+    writer.append_sse_event("cancel", {"message": "Old terminal journal arrives late"})
+    expected = [("user", "Prompt 0")] + [(row["role"], row["content"]) for row in pair] + [("assistant", old_text)]
+    if new_output:
+        expected += [("user", "Prompt 1"), ("assistant", new_text)]
+    for _ in range(3):
+        if not cache_hits:
+            models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        history = _next_send_history(recovered)
+        assert [(row["role"], row.get("content", "")) for row in history] == expected
+        if native_pair:
+            assert history[1]["tool_calls"] == pair[0]["tool_calls"]
+            assert history[2]["tool_call_id"] == "native-call"
+        assert _pending_stream_hook(recovered, streams[0]) is None
+        assert not any(row.get("_recovered_display_only") for row in _stream_output(recovered, streams[0]))
+        _assert_retry_turn_ownership(recovered, kinds, streams)
+
+
+@pytest.mark.parametrize("failure", ["duplicate-owner", "source", "timestamp", "owner-token", "tokenless-successor", "foreign-successor-token", "duplicate-successor-token"])
+def test_ambiguous_interrupted_context_proof_stays_display_only(failure):
+    sid = f"ambiguous-old-context-{failure}"
+    streams = _persist_multi_retry_turns(sid, ["interrupted", "cancelled"], [
+        [("token", {"text": "Old ambiguous answer"})],
+        [("token", {"text": "New answer"})],
+    ])
+    first = models.get_session(sid)
+    assert not _stream_output(first, streams[0])
+    owner = first.context_messages[0]
+    successor = next(row for row in first.context_messages if row.get("role") == "user" and row.get("content") == "Prompt 1")
+    if failure == "duplicate-owner":
+        first.context_messages.insert(1, copy.deepcopy(owner))
+    elif failure == "source":
+        owner["_source"] = "telegram"
+    elif failure == "timestamp":
+        owner["timestamp"] += 0.25
+    elif failure == "owner-token":
+        owner["_active_turn_token"] = "foreign-owner"
+    elif failure == "tokenless-successor":
+        successor.pop("_active_turn_token", None)
+    elif failure == "foreign-successor-token":
+        successor["_active_turn_token"] = "foreign-successor"
+    else:
+        first.context_messages.append(copy.deepcopy(successor))
+    first.save()
+    before = copy.deepcopy(first.context_messages)
+    for _ in range(3):
+        models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        assert recovered.context_messages == before
+        assert any(row.get("_recovered_display_only") is True for row in _stream_output(recovered, streams[0]))
+        assert not any(row.get("content") == "Old ambiguous answer" for row in _next_send_history(recovered))
+        from api.streaming import _sanitize_messages_for_agent
+        assert not any(row.get("content") == "Old ambiguous answer" for row in _sanitize_messages_for_agent(recovered.messages))
+
+
+def test_proven_interrupted_context_save_failure_retains_hook(monkeypatch):
+    sid = "proven-old-context-save-failure"
+    streams = _persist_multi_retry_turns(sid, ["interrupted", "cancelled"], [
+        [("token", {"text": "Old answer"})], [("token", {"text": "New answer"})],
+    ])
+    session = models.get_session(sid)
+    assert _pending_stream_hook(session, streams[0]) is not None
+    before = copy.deepcopy((session.messages, session.context_messages, session.tool_calls, session.updated_at))
+    original_save = Session.save
+    monkeypatch.setattr(Session, "save", Mock(side_effect=OSError("fixture save failure")))
+    assert models._retry_journal_recovery_in_place(session) is False
+    assert session.save.called, session.messages
+    assert (session.messages, session.context_messages, session.tool_calls, session.updated_at) == before
+    monkeypatch.setattr(Session, "save", original_save)
+    assert models._retry_journal_recovery_in_place(session) is True, session.messages
+    models.SESSIONS.clear()
+    recovered = models.get_session(sid)
+    assert [(row["role"], row["content"]) for row in _next_send_history(recovered)] == [
+        ("user", "Prompt 0"), ("assistant", "Old answer"), ("user", "Prompt 1"), ("assistant", "New answer"),
+    ]
