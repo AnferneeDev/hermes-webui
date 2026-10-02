@@ -92,6 +92,10 @@ function extractFn(name, src) {
   throw new Error('function did not close: ' + name);
 }
 function evalFn(name) { globalThis[name] = (0, eval)('(' + extractFn(name, SESSIONS_SRC) + ')'); }
+// #7652 review round 5: _panelQueryIntentFromLocation now validates the name
+// against the real panel set, so the helper it calls has to be evaluated too —
+// otherwise every parse falls into the catch and reports "no intent".
+function evalIntentFns() { evalFn('_knownPanelNames'); evalFn('_panelQueryIntentFromLocation'); }
 """
 
 # Runs the REAL boot panel branch with the last chat still in localStorage and
@@ -122,17 +126,41 @@ global.window = {
     window.location.href = 'https://x.test/' + url;
   } },
 };
-evalFn('_panelQueryIntentFromLocation');
+evalIntentFns();
 evalFn('_consumePanelQueryParamFromLocation');
 
 (async () => {
   const urlSession = null;
   const prefillIntent = null;
-  await eval('(async () => { ' + branch + ' })()');
+  // #7652 review round 5: the branch only *decides* now. It hands the honored
+  // panel to the restore path, which applies it after the saved session and its
+  // in-flight recovery have run. An early `return` (the round-4 shape) never
+  // reaches this read, so the intent reads back as null and the ordering
+  // assertion below fails on behavior rather than on a ReferenceError.
+  const NL = String.fromCharCode(10);
+  const declaredIntent = await eval(
+    '(async () => { ' + branch + NL
+    + 'return (typeof pendingPanelIntent === "undefined") ? undefined : pendingPanelIntent; })()'
+  );
+  if (declaredIntent) {
+    const saved = localStorage.getItem('hermes-webui-session');
+    if (saved) {
+      calls.push('loadSession:' + saved);
+      S.session = { session_id: saved };
+      S._bootReady = true;
+      syncTopbar(); syncWorkspacePanelState();
+      await renderSessionList();
+      startGatewaySSE();
+      calls.push('checkInflight:' + saved);
+    }
+    await switchPanel(declaredIntent);
+  }
   console.log(JSON.stringify({
     calls,
     switchPanelCalls,
+    declaredIntent: declaredIntent === undefined ? null : declaredIntent,
     bootReady: S._bootReady,
+    restoredSession: S.session ? S.session.session_id : null,
     remainingSearch: window.location.search,
     savedSessionUntouched: localStorage.getItem('hermes-webui-session'),
   }));
@@ -163,7 +191,7 @@ global.window = {
     window.location.search = url.startsWith('?') ? url : url.slice(url.indexOf('?'));
   } },
 };
-evalFn('_panelQueryIntentFromLocation');
+evalIntentFns();
 evalFn('_consumePanelQueryParamFromLocation');
 
 (async () => {
@@ -180,7 +208,7 @@ def test_panel_intent_parses_valid_panel_name():
         _EXTRACT_FN_JS
         + """
 global.window = { location: { search: '?panel=tasks' } };
-evalFn('_panelQueryIntentFromLocation');
+evalIntentFns();
 console.log(JSON.stringify(_panelQueryIntentFromLocation()));
 """
     )
@@ -191,7 +219,7 @@ def test_panel_intent_rejects_malformed_and_absent_values():
     out = _run_node(
         _EXTRACT_FN_JS
         + """
-evalFn('_panelQueryIntentFromLocation');
+evalIntentFns();
 function read(search) {
   global.window = { location: { search } };
   return _panelQueryIntentFromLocation();
@@ -235,25 +263,37 @@ console.log(JSON.stringify({ applied }));
     )
 
 
-def test_boot_honours_panel_intent_before_the_saved_chat_restore():
-    """The ordering IS the fix. The real boot branch runs with the last chat
-    still in localStorage: the panel branch must consume the intent, switch to
-    Tasks, and finish boot before anything can restore that chat."""
+def test_boot_honours_panel_intent_for_a_sessionless_cron_notification():
+    """The intent must be honored, but as an overlay — not a replacement. The
+    real boot branch runs with the last chat still in localStorage: it consumes
+    the intent and hands it to the restore path, which restores that chat and
+    its in-flight recovery first, then shows Tasks on top.
+
+    Round 4 switched the panel inside the branch and returned, so the chat the
+    user had open — and any live stream still running in it — stayed detached.
+    """
     branch = _boot_branch()
     out = _run_node(
         _EXTRACT_FN_JS + _HONOUR_STUB_JS.replace("__BRANCH__", json.dumps(branch))
     )
+    assert out["declaredIntent"] == "tasks", (
+        "the panel intent must be handed to the restore path so the click lands "
+        "on the panel the run belongs to"
+    )
     assert out["switchPanelCalls"] == ["tasks"], (
         "the panel intent must land the user on the Tasks panel"
     )
-    assert out["calls"] == [
-        "syncTopbar",
-        "syncWorkspacePanelState",
-        "switchPanel:tasks",
-        "renderSessionList",
-        "prefill",
-        "startGatewaySSE",
-    ], "boot must be marked ready and finish through the panel branch"
+    # The ordering is the fix: restore first, in-flight recovery next, panel last.
+    assert out["restoredSession"] == "last-open-chat", (
+        "the chat the user had open must still be restored under the panel"
+    )
+    calls = out["calls"]
+    assert calls.index("loadSession:last-open-chat") < calls.index(
+        "checkInflight:last-open-chat"
+    ) < calls.index("switchPanel:tasks"), (
+        "the saved-session restore and its in-flight recovery must both run "
+        "before Tasks is shown, or the user's chat is left detached"
+    )
     assert out["bootReady"] is True
     # The intent is consumed so a refresh does not re-run the panel launch, and
     # the saved chat is left alone for the next plain boot.

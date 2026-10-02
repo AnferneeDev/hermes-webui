@@ -185,32 +185,60 @@ self.addEventListener('notificationclick', (event) => {
   const sameOrigin = (clientUrl) => {
     try { return new URL(clientUrl).origin === self.location.origin; } catch (_e) { return false; }
   };
+  // A sessionless cron completion targets `/?panel=tasks` (see
+  // `_notificationOptions` in static/messages.js). Honoring that intent means
+  // an already-open tab on `/` must actually LOAD it — boot's saved-chat restore
+  // otherwise wins and the click opens the wrong panel. Only that case pays for
+  // a query-string match plus a navigate.
+  //
+  // Every other notification keeps master's behaviour: match on pathname alone
+  // and focus(). A session deep link inherits the current page's query string,
+  // so requiring a query match would drop an already-open chat onto the
+  // navigate branch — a full reload that discards composer text still inside
+  // the 400ms draft-save window. Matching on pathname is what prevents a
+  // duplicate window there.
+  const targetCarriesPanelIntent = (() => {
+    try {
+      const panel = new URL(targetUrl).searchParams.get('panel');
+      return !!panel && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(panel);
+    } catch (_e) { return false; }
+  })();
+  const samePathAndSearch = (clientUrl) => {
+    try {
+      const c = new URL(clientUrl);
+      return c.pathname === targetPath && c.search === new URL(targetUrl).search;
+    } catch (_e) { return false; }
+  };
   event.waitUntil(
     self.clients.matchAll({type: 'window', includeUncontrolled: true}).then((clientList) => {
-      // Match on pathname + search, not just pathname. A sessionless cron
-      // notification targets `/?panel=tasks`: an open tab sitting on `/` shares
-      // the pathname but not the query string, so pathname-only matching used
-      // to find it and focus() it, and the panel intent in the URL was never
-      // loaded — the click landed on whatever chat boot restored (#7652
-      // review round 4). The exact match below stays a focus() fast path; a
-      // same-pathname client is navigated so the intent is honored.
-      const samePathAndSearch = (clientUrl) => {
-        try {
-          const c = new URL(clientUrl);
-          return c.pathname === targetPath && c.search === new URL(targetUrl).search;
-        } catch (_e) { return false; }
-      };
-      const targetClient = clientList.find((client) => samePathAndSearch(client.url) && 'focus' in client);
+      // Focus fast path. A panel intent is only honored when the URL carries
+      // one: then the query string is part of the identity of the target, so
+      // pathname + search must both match. Every other notification matches on
+      // pathname alone, exactly as before, so an already-open chat is focus()ed
+      // rather than reloaded.
+      const targetClient = clientList.find((client) => (
+        targetCarriesPanelIntent ? samePathAndSearch(client.url) : samePath(client.url)
+      ) && 'focus' in client);
       if (targetClient) return targetClient.focus();
 
       const openNotificationWindow = () => (
         self.clients.openWindow ? self.clients.openWindow(targetUrl) : undefined
       );
-      // Same pathname but a stale query string (e.g. the tab sits on `/` while
-      // the intent is `/?panel=tasks`) must be navigated, not just focused.
-      const samePathnameClient = clientList.find((client) => samePath(client.url) && 'navigate' in client);
-      const focusableClient = samePathnameClient
-        || clientList.find((client) => sameOrigin(client.url) && 'focus' in client && 'navigate' in client);
+      // Only a panel intent may reload a same-pathname tab. The intent lives in
+      // the query string, so focusing alone would drop it and the user would
+      // land on the restored chat; navigating makes boot see it. A session
+      // notification must NOT come through here — reloading an open chat
+      // discards composer text still inside the 400ms draft-save window — so it
+      // falls through to the original any-same-origin-tab branch below.
+      if (targetCarriesPanelIntent) {
+        const samePathnameClient = clientList.find((client) => samePath(client.url) && 'navigate' in client);
+        if (samePathnameClient) {
+          return samePathnameClient.navigate(targetUrl)
+            .then((client) => (client && 'focus' in client ? client.focus() : samePathnameClient.focus()))
+            .catch(() => samePathnameClient.focus());
+        }
+      }
+      const focusableClient = clientList.find((client) => sameOrigin(client.url) && 'focus' in client && 'navigate' in client);
       if (focusableClient && 'navigate' in focusableClient) {
         return focusableClient.navigate(targetUrl)
           .then((client) => (client && 'focus' in client ? client.focus() : focusableClient.focus()))

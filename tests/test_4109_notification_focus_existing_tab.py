@@ -21,40 +21,55 @@ def _notification_click_handler() -> str:
     return SW_SRC[start:]
 
 
-def test_notification_click_keeps_exact_path_and_query_focus_fast_path():
-    """#7652 round 4: the focus() fast path must match pathname AND search.
+def test_notification_click_keeps_exact_path_focus_fast_path():
+    """The focus() fast path must keep matching on pathname, exactly as before.
 
-    A sessionless cron notification targets `/?panel=tasks`. Matching on
-    pathname alone found an open tab sitting on `/`, focused it, and the panel
-    intent in the URL was never loaded — so the click landed on whatever chat
-    boot restored. The exact match (both) stays a focus() fast path; a
-    same-pathname client is navigated below."""
+    A session deep link inherits the current page's query string, so requiring a
+    query match would fail to find an already-open `/session/<sid>` tab and
+    spawn a duplicate window. The search component only becomes part of the
+    target's identity when the URL carries a panel intent (#7652 round 5)."""
     handler = _notification_click_handler()
 
     target_idx = handler.index("const targetClient = clientList.find")
     exact_focus_idx = handler.index("if (targetClient) return targetClient.focus();")
-    reusable_idx = handler.index("const focusableClient =")
+    reusable_idx = handler.index("const focusableClient = clientList.find")
 
+    assert "samePath(client.url)" in handler
+    assert "new URL(clientUrl).pathname === targetPath" in handler
+    assert target_idx < exact_focus_idx < reusable_idx
+
+    # #7652 round 5: the pathname+search match is conditional on the target
+    # actually carrying a panel intent, so a plain session notification is
+    # never routed by its query string.
     assert "const samePathAndSearch = (clientUrl) =>" in handler
     assert "c.pathname === targetPath && c.search === new URL(targetUrl).search" in handler
-    assert "samePathAndSearch(client.url)" in handler
-    assert target_idx < exact_focus_idx < reusable_idx
+    assert "targetCarriesPanelIntent ? samePathAndSearch(client.url) : samePath(client.url)" in handler
+    assert "const targetCarriesPanelIntent = (() =>" in handler
+    assert "searchParams.get('panel')" in handler
 
 
 def test_notification_click_navigates_reusable_client_before_opening_window():
     handler = _notification_click_handler()
 
-    same_pathname_idx = handler.index("const samePathnameClient = clientList.find")
-    reusable_idx = handler.index("const focusableClient = samePathnameClient")
+    reusable_idx = handler.index("const focusableClient = clientList.find")
     navigate_idx = handler.index("focusableClient.navigate(targetUrl)")
     open_fallback_idx = handler.index("return openNotificationWindow();")
 
-    # A same-pathname client is navigated first so a stale query string (the
-    # tab sits on `/` while the intent is `/?panel=tasks`) can't win.
-    assert "samePath(client.url) && 'navigate' in client" in handler
     assert "sameOrigin(client.url) && 'focus' in client && 'navigate' in client" in handler
-    assert same_pathname_idx < reusable_idx < navigate_idx < open_fallback_idx
+    assert reusable_idx < navigate_idx < open_fallback_idx
     assert "if (self.clients.openWindow) return self.clients.openWindow(targetUrl)" not in handler
+
+    # #7652 round 5: a same-pathname client is navigated ONLY for a panel
+    # intent. For a session notification that reload would discard composer
+    # text still inside the 400ms draft-save window, so the gate has to come
+    # before the navigate, not merely prefer it.
+    same_pathname_idx = handler.index("const samePathnameClient = clientList.find")
+    assert "samePath(client.url) && 'navigate' in client" in handler
+    assert "if (targetCarriesPanelIntent) {" in handler
+    gate_idx = handler.index("if (targetCarriesPanelIntent) {")
+    assert gate_idx < same_pathname_idx < reusable_idx, (
+        "the panel-intent gate must precede the same-pathname navigate"
+    )
 
 
 def test_notification_click_focuses_after_navigation_or_navigation_failure():
