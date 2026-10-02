@@ -13238,9 +13238,12 @@ async function _cronSendHiddenCompletionNotification(name,statusText,sessionId){
   // #7652 review: pass an explicit sessionless marker when the completion has
   // no session_id. Without it _notificationOptions falls back to the user's
   // CURRENT session, so clicking the notification opens the wrong chat (and
-  // reuses that session's notification tag).
+  // reuses that session's notification tag). The `panel` intent is the click
+  // target: a sessionless completion belongs to no chat, so the click must
+  // land on the Tasks panel the run lives in — not the root, which would
+  // restore the last chat the user had open (#7652 review round 4).
   try{
-    const delivered=await sendBrowserNotification(name,statusText,{sid:sessionId||null,sessionless:!sessionId});
+    const delivered=await sendBrowserNotification(name,statusText,{sid:sessionId||null,sessionless:!sessionId,panel:!sessionId?'tasks':''});
     // Fail closed on anything that is not an explicit success: the primitive
     // returns undefined when it short-circuits before delivery.
     return delivered===true;

@@ -187,17 +187,30 @@ self.addEventListener('notificationclick', (event) => {
   };
   event.waitUntil(
     self.clients.matchAll({type: 'window', includeUncontrolled: true}).then((clientList) => {
-      // Match on pathname, not the full href: _sessionUrlForSid copies the
-      // current page's query string + hash into the deep link, so an open tab
-      // already on /session/<sid> would fail an exact-href match and spawn a
-      // duplicate window.
-      const targetClient = clientList.find((client) => samePath(client.url) && 'focus' in client);
+      // Match on pathname + search, not just pathname. A sessionless cron
+      // notification targets `/?panel=tasks`: an open tab sitting on `/` shares
+      // the pathname but not the query string, so pathname-only matching used
+      // to find it and focus() it, and the panel intent in the URL was never
+      // loaded — the click landed on whatever chat boot restored (#7652
+      // review round 4). The exact match below stays a focus() fast path; a
+      // same-pathname client is navigated so the intent is honored.
+      const samePathAndSearch = (clientUrl) => {
+        try {
+          const c = new URL(clientUrl);
+          return c.pathname === targetPath && c.search === new URL(targetUrl).search;
+        } catch (_e) { return false; }
+      };
+      const targetClient = clientList.find((client) => samePathAndSearch(client.url) && 'focus' in client);
       if (targetClient) return targetClient.focus();
 
       const openNotificationWindow = () => (
         self.clients.openWindow ? self.clients.openWindow(targetUrl) : undefined
       );
-      const focusableClient = clientList.find((client) => sameOrigin(client.url) && 'focus' in client && 'navigate' in client);
+      // Same pathname but a stale query string (e.g. the tab sits on `/` while
+      // the intent is `/?panel=tasks`) must be navigated, not just focused.
+      const samePathnameClient = clientList.find((client) => samePath(client.url) && 'navigate' in client);
+      const focusableClient = samePathnameClient
+        || clientList.find((client) => sameOrigin(client.url) && 'focus' in client && 'navigate' in client);
       if (focusableClient && 'navigate' in focusableClient) {
         return focusableClient.navigate(targetUrl)
           .then((client) => (client && 'focus' in client ? client.focus() : focusableClient.focus()))

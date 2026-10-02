@@ -21,27 +21,39 @@ def _notification_click_handler() -> str:
     return SW_SRC[start:]
 
 
-def test_notification_click_keeps_exact_path_focus_fast_path():
+def test_notification_click_keeps_exact_path_and_query_focus_fast_path():
+    """#7652 round 4: the focus() fast path must match pathname AND search.
+
+    A sessionless cron notification targets `/?panel=tasks`. Matching on
+    pathname alone found an open tab sitting on `/`, focused it, and the panel
+    intent in the URL was never loaded — so the click landed on whatever chat
+    boot restored. The exact match (both) stays a focus() fast path; a
+    same-pathname client is navigated below."""
     handler = _notification_click_handler()
 
     target_idx = handler.index("const targetClient = clientList.find")
     exact_focus_idx = handler.index("if (targetClient) return targetClient.focus();")
-    reusable_idx = handler.index("const focusableClient = clientList.find")
+    reusable_idx = handler.index("const focusableClient =")
 
-    assert "samePath(client.url)" in handler
-    assert "new URL(clientUrl).pathname === targetPath" in handler
+    assert "const samePathAndSearch = (clientUrl) =>" in handler
+    assert "c.pathname === targetPath && c.search === new URL(targetUrl).search" in handler
+    assert "samePathAndSearch(client.url)" in handler
     assert target_idx < exact_focus_idx < reusable_idx
 
 
 def test_notification_click_navigates_reusable_client_before_opening_window():
     handler = _notification_click_handler()
 
-    reusable_idx = handler.index("const focusableClient = clientList.find")
+    same_pathname_idx = handler.index("const samePathnameClient = clientList.find")
+    reusable_idx = handler.index("const focusableClient = samePathnameClient")
     navigate_idx = handler.index("focusableClient.navigate(targetUrl)")
     open_fallback_idx = handler.index("return openNotificationWindow();")
 
+    # A same-pathname client is navigated first so a stale query string (the
+    # tab sits on `/` while the intent is `/?panel=tasks`) can't win.
+    assert "samePath(client.url) && 'navigate' in client" in handler
     assert "sameOrigin(client.url) && 'focus' in client && 'navigate' in client" in handler
-    assert reusable_idx < navigate_idx < open_fallback_idx
+    assert same_pathname_idx < reusable_idx < navigate_idx < open_fallback_idx
     assert "if (self.clients.openWindow) return self.clients.openWindow(targetUrl)" not in handler
 
 
@@ -68,8 +80,14 @@ def test_notification_click_open_window_remains_no_reusable_client_fallback():
 def test_test_notification_without_sid_still_targets_current_page_for_reuse():
     # #7652 review: a caller with no options at all (the Settings test button)
     # still falls back to the current session's URL; only an explicit
-    # {sessionless:true} marker routes to the app root.
-    assert "const url=sessionless?`${location.origin}${_appRootPath()}`:(sid?`${location.origin}${_sessionUrlForSid(sid)}`:location.href);" in MESSAGES_SRC
+    # {sessionless:true} marker routes away from it.
+    assert "const sessionless=!!(options&&options.sessionless);" in MESSAGES_SRC
+    assert "sessionless?null:((options&&options.sid)||(S&&S.session&&S.session.session_id))" in MESSAGES_SRC
+    # #7652 round 4: a sessionless target carries a panel intent so the click
+    # opens the Tasks panel instead of the last chat boot would restore.
+    assert "const url=sessionless?rootWithPanelIntent:(sid?`${location.origin}${_sessionUrlForSid(sid)}`:location.href);" in MESSAGES_SRC
+    assert "const rootWithPanelIntent=panel" in MESSAGES_SRC
+    assert "panel=${encodeURIComponent(panel)}" in MESSAGES_SRC
     assert "sendBrowserNotification('Hermes test','Notifications are ready.',{force:true});" in (
         ROOT / "static" / "index.html"
     ).read_text(encoding="utf-8")

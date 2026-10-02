@@ -385,6 +385,25 @@ async function driveTick(completions) {
   await _runCronPollTick();
 }
 
+// #7652 round 4: report the notification the tick actually sent, with the
+// URL the real _notificationOptions builds for its options — so the intent
+// carried end-to-end (poll -> options -> click target) is observable.
+function sentNotificationFor(completions, opts) {
+  state.notificationsEnabled = true;
+  state.permission = 'granted';
+  state.deliveryFails = false;
+  state.notifications = [];
+  return (async () => {
+    await driveTick(completions);
+    const sent = state.notifications.slice();
+    return sent.map((entry) => ({
+      title: entry.title,
+      tag: _notificationOptions('x', entry.options).tag,
+      url: _notificationOptions('x', entry.options).data.url,
+    }));
+  })();
+}
+
 (async () => {
   const out = {};
 
@@ -471,11 +490,16 @@ async function driveTick(completions) {
   const sessionlessOpts = _notificationOptions('body', { sid: null, sessionless: true });
   const withSidOpts = _notificationOptions('body', { sid: 'cron-session-1' });
   const currentSessionOpts = _notificationOptions('body', {});
+  // #7652 review round 4: a sessionless notification carries a Tasks launch
+  // intent so the click opens the panel the run belongs to. The bare-root
+  // entry above is the control for callers that pass no intent.
+  const panelOpts = _notificationOptions('body', { sid: null, sessionless: true, panel: 'tasks' });
   out.c_notification_options = {
     sessionless: {
       tag: sessionlessOpts.tag,
       url: sessionlessOpts.data.url,
     },
+    withPanel: { tag: panelOpts.tag, url: panelOpts.data.url },
     withSid: { tag: withSidOpts.tag, url: withSidOpts.data.url },
     currentSession: { tag: currentSessionOpts.tag, url: currentSessionOpts.data.url },
   };
@@ -538,6 +562,20 @@ async function driveTick(completions) {
     queued: _cronPendingToasts.length,
     toastsAfterVisible: state.toasts.length,
   };
+
+  // === Scenario F: a sessionless notification carries the Tasks intent =====
+  // #7652 round 4: the URL alone was not enough — boot restores the last
+  // chat on a plain root load, so the click landed in the wrong place. The
+  // notification must carry an explicit panel intent end-to-end.
+  _cronPendingToasts.length = 0;
+  state.notifications = [];
+  state.toasts = [];
+  setHidden(true);
+  out.f_sent_notifications = await sentNotificationFor([
+    { job_id: 'job-panelless', name: 'No panel', status: 'success',
+      completed_at: 600, session_id: null, message_count: 0,
+      toast_notifications: true },
+  ]);
 
   process.stdout.write(JSON.stringify(out));
 })().catch((error) => {
@@ -723,4 +761,25 @@ def test_successful_hidden_notification_does_not_also_queue_a_toast():
     )
     assert ok["toastsAfterVisible"] == 0, (
         "no fallback toast may fire when the notification was delivered"
+    )
+
+
+def test_sessionless_completion_notification_carries_tasks_panel_intent():
+    """#7652 round 4: a sessionless notification must carry an explicit Tasks
+    panel intent. Routing to the bare app root was not enough — boot restores
+    the last chat from localStorage for a plain root load, so the click landed
+    in the chat instead of the panel the run belongs to. The intent is asserted
+    on the options the poll actually sends, resolved through the real
+    _notificationOptions to the click target."""
+    out = _run_cron_harness()
+
+    sent = out["f_sent_notifications"]
+    assert len(sent) == 1, f"expected exactly one notification, got {sent}"
+    assert sent[0]["tag"] == "hermes-webui-sessionless", (
+        "a sessionless notification needs its own tag so it neither replaces "
+        "nor is replaced by a session-scoped notification"
+    )
+    assert "panel=tasks" in sent[0]["url"], (
+        f"a sessionless completion must carry a Tasks panel intent so the "
+        f"click opens the Tasks panel, got {sent[0]['url']}"
     )

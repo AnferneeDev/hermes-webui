@@ -3861,6 +3861,27 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
       syncTopbar();syncWorkspacePanelState();await renderSessionList();await _finalizeComposerPrefillOnBoot(prefillIntent);if(typeof startGatewaySSE==='function')startGatewaySSE();return;
     }catch(e){console.warn('[pwa] new-chat launch action failed', e);}
   }
+  // #7652 review round 4: a sessionless completion notification carries an
+  // explicit panel intent (e.g. ?panel=tasks). It must be honored BEFORE the
+  // saved-chat restore below, otherwise boot restores the last chat the user
+  // had open and the click never reaches the Tasks panel the run lives in.
+  // Constrained to the same intent family as profile/launch-action: only a
+  // valid panel name, and never when a URL session names the target already.
+  const panelIntent=(typeof _panelQueryIntentFromLocation==='function')?_panelQueryIntentFromLocation():null;
+  if(panelIntent&&panelIntent.hasParam&&panelIntent.valid&&!urlSession
+     &&typeof switchPanel==='function'&&panelIntent.name!=='chat'){
+    try{
+      _consumePanelQueryParamFromLocation();
+      S._bootReady=true;
+      syncTopbar();
+      syncWorkspacePanelState();
+      await switchPanel(panelIntent.name);
+      await renderSessionList();
+      await _finalizeComposerPrefillOnBoot(prefillIntent);
+      if(typeof startGatewaySSE==='function')startGatewaySSE();
+      return;
+    }catch(e){console.warn('[boot] panel intent launch failed', e);}
+  }
   const _profileQueryBlocksSavedLocal=_profileQueryBlocksSavedLocalRestore(profileIntent, urlSession);
   if(_profileQueryBlocksSavedLocal&&_profileSwitchCompleted&&_profileSwitchChangedProfile){
     try{
