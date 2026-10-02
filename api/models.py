@@ -3968,6 +3968,13 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
         return None
     display_users = [row for row in messages if isinstance(row, dict) and row.get('role') == 'user']
     context_users = [row for row in context if isinstance(row, dict) and row.get('role') == 'user']
+    display_rows = [row for row in messages if isinstance(row, dict)]
+    context_rows = [row for row in context if isinstance(row, dict)]
+
+    def identity_projections(namespace):
+        # Turn tokens identify user turns; stable message/DB/UID identities are
+        # message-wide, so an assistant/tool alias also defeats uniqueness.
+        return (display_users, context_users) if namespace == '_active_turn_token' else (display_rows, context_rows)
 
     def unique_context_user(expected):
         identities, valid = _journal_user_identity_details(expected)
@@ -3976,7 +3983,7 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
         for namespace, value in identities.items():
             if value is not None and any(
                 sum(_journal_user_identity_details(row)[0][namespace] == value for row in users) > 1
-                for users in (display_users, context_users)
+                for users in identity_projections(namespace)
             ):
                 return None
         expected_metadata = _journal_user_metadata_key(expected)
@@ -4007,7 +4014,7 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
             if shared:
                 if any(sum(_journal_user_identity_details(candidate)[0][key] == identities[key]
                            for candidate in users) != 1
-                       for key in shared for users in (display_users, context_users)):
+                       for key in shared for users in identity_projections(key)):
                     continue
             elif expected_key is None or row_key != expected_key or any(
                 sum(_journal_user_fallback_key(candidate) == expected_key for candidate in users) != 1

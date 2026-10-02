@@ -1926,7 +1926,12 @@ def test_rich_interrupted_owner_preserves_exact_real_next_send(
         assert _pending_stream_hook(recovered, streams[0]) is None
 
 
-@pytest.mark.parametrize("failure", ["conflicting-api", "conflicting-attachments", "conflicting-id", "contradictory-id-alias", "contradictory-db-alias", "invalid-id", "conflicting-uid", "duplicate-id-context", "duplicate-id-display", "duplicate-normalized-owner", "interior-workspace", "nonterminal-attachment", "invalid-timestamp", "nonfinite-timestamp", "invalid-source", "invalid-uid", "structured-api-conflict", "duplicate-uid", "duplicate-token"])
+@pytest.mark.parametrize("failure", ["conflicting-api", "conflicting-attachments", "conflicting-id", "contradictory-id-alias", "contradictory-db-alias", "invalid-id", "conflicting-uid", "duplicate-id-context", "duplicate-id-display", "duplicate-normalized-owner", "interior-workspace", "nonterminal-attachment", "invalid-timestamp", "nonfinite-timestamp", "invalid-source", "invalid-uid", "structured-api-conflict", "duplicate-uid", "duplicate-token"] + [
+    f"reused-{namespace}-{role}-{projection}"
+    for namespace in ("message", "state", "uid")
+    for role in ("assistant", "tool")
+    for projection in ("display", "context")
+])
 def test_rich_interrupted_owner_proof_rejects_conflicts_and_ambiguity(failure):
     sid = f"rich-old-owner-reject-{failure}"
     streams = _persist_multi_retry_turns(sid, ["interrupted", "cancelled"], [
@@ -1959,6 +1964,15 @@ def test_rich_interrupted_owner_proof_rejects_conflicts_and_ambiguity(failure):
         duplicate = copy.deepcopy(context)
         duplicate["content"] = "[Workspace::v1: /tmp/example]\nPrompt 0\n\n[Attached files: duplicate.txt]"
         first.context_messages.insert(1, duplicate)
+    elif failure.startswith("reused-"):
+        _, namespace, role, projection = failure.split("-")
+        key, value = {"message": ("id", "reused"), "state": ("_state_db_row_id", 42), "uid": ("message_uid", "reused")}[namespace]
+        context[key] = display[key] = value
+        duplicate = {"role": role, "content": "Unrelated output", "timestamp": 15, key: value}
+        if projection == "display":
+            first.messages.insert(1, duplicate)
+        else:
+            first.context_messages.insert(1, duplicate)
     elif failure == "invalid-timestamp":
         context["timestamp"] = True
     elif failure == "nonfinite-timestamp":
