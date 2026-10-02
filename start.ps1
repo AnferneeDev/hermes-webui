@@ -101,9 +101,13 @@ if (-not $Python) {
 # the server. Leave an already-set HERMES_HOME alone.
 
 function Test-HermesWebuiState {
-    param([string]$Home)
+    # $BaseHome, not $Home: PowerShell variable names are case-insensitive, so
+    # a $Home parameter collides with the read-only automatic $HOME and the
+    # assignment fails under $ErrorActionPreference = 'Stop' — which killed the
+    # script on the first call, before any Agent discovery.
+    param([string]$BaseHome)
     foreach ($rel in @('webui\sessions', 'webui\settings.json', 'webui')) {
-        if (Test-Path (Join-Path $Home $rel)) { return $true }
+        if (Test-Path (Join-Path $BaseHome $rel)) { return $true }
     }
     return $false
 }
@@ -136,11 +140,19 @@ if (-not $env:HERMES_WEBUI_STATE_DIR) {
     $platformDefaultHermesHome = $serverPlatformDefaultHome
 }
 
-# Candidate 5 reads the server's answer, not the exported one. Reading
-# $platformDefaultHermesHome here instead would skip the legacy Agent whenever
-# the state dir is overridden, and %USERPROFILE%\hermes-agent (candidate 6)
-# would then win over the populated legacy install the server itself picks.
-$platformDefaultAgentHome = $serverPlatformDefaultHome
+# Candidate 5 is the PLATFORM default for an Agent install, and that is NOT
+# the same question as where the exported HERMES_HOME points. api/config.py
+# candidate 5 is _DEFAULT_HERMES_HOME\hermes-agent, but the #2905 legacy
+# fallback inside _platform_default_hermes_home() is keyed on where the WEBUI
+# STATE lives — so gating Agent discovery on it drops a real install: with
+# WebUI state still at the legacy %USERPROFILE%\.hermes and the only Agent at
+# %LOCALAPPDATA%\hermes, the LOCALAPPDATA path never enters the candidate list
+# and startup dies with "hermes-agent not found". Master searched both roots
+# unconditionally and found it, so keep that coverage: search the new
+# location, and let the legacy location stay reachable as a launcher-only
+# candidate. Because this script exports the discovered dir as
+# HERMES_WEBUI_AGENT_DIR, the server then uses the same one it reports.
+$platformDefaultAgentHome = $newHermesHome
 
 if (-not $env:HERMES_HOME) {
     $env:HERMES_HOME = $platformDefaultHermesHome
@@ -252,7 +264,34 @@ if (-not $AgentDir) {
 [Environment]::SetEnvironmentVariable('HERMES_WEBUI_AGENT_DIR', $AgentDir)
 
 # === Prefer the agent's venv Python if available =======================
+# A venv next to the selected Agent is the interpreter that already has its
+# dependencies. Two ways an Agent can supply those instead, and either one
+# means the venv override is unnecessary: its own venv, or the managed
+# bootstrap that activate_managed_agent() imports (hermes_bootstrap.py).
 $agentVenvPython = Join-Path $AgentDir 'venv\Scripts\python.exe'
+if (-not (Test-Path $agentVenvPython) -and
+    -not (Test-Path (Join-Path $AgentDir 'hermes_bootstrap.py'))) {
+    # Neither. This is a bare source checkout, and it can be selected ahead of
+    # an install that does have the dependencies: the source-first pass (which
+    # mirrors api/config.py) reaches a sibling checkout before the platform
+    # default, while master's single hermes_cli-only pass skipped source roots
+    # entirely and so kept using the LOCALAPPDATA venv. Without this the first
+    # Agent import after activate_managed_agent() no-ops and dies with
+    # ModuleNotFoundError. Fall back to the first candidate that does have a
+    # venv, in candidate order, so the dependency import still resolves.
+    # Only applies to discovery — an explicit HERMES_WEBUI_AGENT_DIR is the
+    # caller's choice and is left alone.
+    if ($candidates) {
+        foreach ($c in $candidates) {
+            $fallback = Join-Path $c 'venv\Scripts\python.exe'
+            if (Test-Path $fallback) {
+                Write-Warning "Agent dir '$AgentDir' has no venv and no hermes_bootstrap.py; falling back to the venv at '$fallback' for the Agent dependencies."
+                $agentVenvPython = $fallback
+                break
+            }
+        }
+    }
+}
 if (Test-Path $agentVenvPython) {
     $Python = $agentVenvPython
 }

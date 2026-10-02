@@ -377,36 +377,37 @@ def test_launcher_only_roots_are_ranked_by_path_not_by_kind():
     )
 
 
-def test_platform_default_agent_home_ignores_webui_state_dir_override():
-    """CORE: the Agent candidate must follow api/paths.py, not the STATE_DIR gate.
+def test_agent_discovery_uses_the_fixed_platform_default_not_the_state_gate():
+    """Candidate 5 must NOT follow the #2905 legacy WebUI-state preference.
 
-    api/paths._platform_default_hermes_home() prefers the legacy
-    %USERPROFILE%\\.hermes whenever it holds WebUI state and
-    %LOCALAPPDATA%\\hermes does not. HERMES_WEBUI_STATE_DIR only redirects the
-    state dir (api/config.py:96) and does not gate that preference, so the
-    launcher must resolve the platform-default *Agent* home with the server's
-    rule unconditionally -- otherwise %USERPROFILE%\\hermes-agent (candidate 6)
-    wins over the populated legacy install the server itself would pick.
+    This assertion previously required the opposite, on the reasoning that the
+    launcher should mirror api/config.py's `_DEFAULT_HERMES_HOME`. That
+    reasoning does not survive contact with a real upgrade layout:
+    `_platform_default_hermes_home()` is keyed on where the WEBUI STATE lives,
+    so reading its answer for Agent discovery means that with state still at
+    the legacy %USERPROFILE%\\.hermes and the only Agent at
+    %LOCALAPPDATA%\\hermes, the LOCALAPPDATA path never enters the candidate
+    list at all and startup dies with "hermes-agent not found". Master
+    searched both roots unconditionally and found the install.
+
+    So the two questions stay separate: HERMES_HOME follows the state-dir
+    aware rule (that is what #2905 is about), while Agent discovery searches
+    the platform default for an Agent install. The legacy location stays
+    reachable as a launcher-only candidate, so nothing is lost.
     """
     source = _start_ps1_source()
-    # The server's answer is computed once, with no STATE_DIR gate on it.
+
+    # The exported HERMES_HOME keeps the state-dir-aware behaviour.
     assert "$serverPlatformDefaultHome = $newHermesHome" in source
-    server_block = source[
-        source.index("$serverPlatformDefaultHome = $newHermesHome") :
-        source.index("$platformDefaultHermesHome = $newHermesHome")
-    ]
-    # Strip comments: the prose above this block names the var it must not read.
-    server_code = "\n".join(
-        ln for ln in server_block.split("\n") if not ln.lstrip().startswith("#")
-    )
-    assert "HERMES_WEBUI_STATE_DIR" not in server_code, (
-        "the server-side platform default must not consult HERMES_WEBUI_STATE_DIR"
-    )
-    # Only the exported HERMES_HOME is gated on it.
     assert "if (-not $env:HERMES_WEBUI_STATE_DIR) {" in source
     assert "$platformDefaultHermesHome = $serverPlatformDefaultHome" in source
-    # Candidate 5 reads the server's answer, not the exported one.
-    assert "$platformDefaultAgentHome = $serverPlatformDefaultHome" in source
+
+    # Agent discovery reads the fixed platform default.
+    assert "$platformDefaultAgentHome = $newHermesHome" in source, (
+        "the platform-default Agent candidate must not be gated on where "
+        "WebUI state lives, or a LOCALAPPDATA-only Agent becomes unreachable"
+    )
+    assert "$platformDefaultAgentHome = $serverPlatformDefaultHome" not in source
     assert (
         "$serverCandidates += (Join-Path $platformDefaultAgentHome 'hermes-agent')"
         in source
@@ -415,3 +416,58 @@ def test_platform_default_agent_home_ignores_webui_state_dir_override():
         "$serverCandidates += (Join-Path $platformDefaultHermesHome 'hermes-agent')"
         not in source
     )
+
+    # The legacy install must still be findable, as a launcher-only candidate.
+    assert (
+        "$launcherOnlyCandidates += (Join-Path $env:USERPROFILE '.hermes\\hermes-agent')"
+        in source
+    ), (
+        "the legacy Agent root has to stay in the launcher-only candidates, "
+        "otherwise moving candidate 5 to the new home loses legacy-only installs"
+    )
+
+
+def test_state_helper_parameter_is_not_named_home():
+    """`$Home` as a parameter name collides with the read-only automatic `$HOME`.
+
+    PowerShell variable names are case-insensitive, so `param([string]$Home)`
+    makes every assignment a write to the read-only automatic variable. Under
+    this script's `$ErrorActionPreference = 'Stop'` the first call aborts the
+    script, so no layout gets as far as Agent discovery.
+    """
+    source = _start_ps1_source()
+    helper = source[source.index("function Test-HermesWebuiState") :]
+    helper = helper[: helper.index("\n}")]
+    assert "param([string]$Home)" not in helper, (
+        "Test-HermesWebuiState must not bind $Home; PowerShell treats that as "
+        "the read-only automatic $HOME and the script dies on the first call"
+    )
+    assert "param([string]$BaseHome)" in helper
+
+
+def test_missing_venv_falls_back_to_a_candidate_venv():
+    """A source checkout with no venv and no bootstrap cannot supply its deps.
+
+    The source-first pass reaches a sibling checkout before the platform
+    default, and activate_managed_agent() no-ops for an Agent without
+    hermes_bootstrap.py, so the dependency import has to come from elsewhere.
+    """
+    source = _start_ps1_source()
+    python_block = source[source.index("# === Prefer the agent's venv Python") :]
+    python_block = python_block[: python_block.index("# === Resolve bind")]
+    code = "\n".join(
+        ln for ln in python_block.split("\n") if not ln.lstrip().startswith("#")
+    )
+    assert "hermes_bootstrap.py" in code, (
+        "a checkout with no venv but a hermes_bootstrap.py activates its own "
+        "dependencies, so the venv fallback must not fire for it"
+    )
+    assert "$candidates" in code, (
+        "the fallback has to walk the discovered candidates; that list is the "
+        "only place a working venv can be found"
+    )
+    assert "falling back to the venv" in python_block, (
+        "silently swapping interpreters is worse than a bare source checkout; "
+        "the fallback must say which Agent it is covering"
+    )
+
