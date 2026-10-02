@@ -109,6 +109,12 @@ def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts, clock=None):
     return observed
 
 
+# The real durable-cache writer, captured before the autouse fixture replaces it
+# with a no-op. The concurrency tests below opt back in to the real one, because
+# the durable file is part of what they assert (#7481 review).
+_REAL_SAVE_MODELS_CACHE_TO_DISK = cfg._save_models_cache_to_disk
+
+
 @pytest.fixture(autouse=True)
 def isolate_models_catalog_state(monkeypatch, tmp_path):
     """Hermetic catalog state, mirroring the #3928 budget-fallback fixture."""
@@ -134,6 +140,10 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
     monkeypatch.setattr(cfg, "_models_rebuild_seq", 0, raising=False)
     monkeypatch.setattr(cfg, "_models_published_seq", 0, raising=False)
+    # The durable-commit generation is process-wide state like the two above, so
+    # it has to be reset per test: a sequence committed by an earlier test would
+    # otherwise fence this test's own (lower-numbered) commits out of the file.
+    monkeypatch.setattr(cfg, "_models_disk_committed_seq", 0, raising=False)
     monkeypatch.setattr(cfg, "cfg", {}, raising=False)
     # Any provider left in the catalog would otherwise shell out to the Hermes
     # CLI for a live id list; the rebuild must stay network-free apart from the
@@ -151,7 +161,20 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
 
     monkeypatch.setattr(socket, "getaddrinfo", _unresolvable)
 
-    return {"tmp_path": tmp_path, "auth_store_path": auth_store_path}
+    yield {"tmp_path": tmp_path, "auth_store_path": auth_store_path}
+
+    # Own every daemon worker this test started before the fixture tears its
+    # monkeypatches down (#7481 review): a worker still parked inside a mocked
+    # builder would otherwise wake up in the NEXT test and run against state that
+    # is no longer patched, which reads as a random failure somewhere else. The
+    # concurrency tests below release and join their own workers, so this is a
+    # backstop that also proves the ownership claim.
+    for thread in threading.enumerate():
+        if thread.name == "models-catalog-rebuild" and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+            assert not thread.is_alive(), (
+                "a models-catalog-rebuild worker outlived its test"
+            )
 
 
 def _configure(monkeypatch, *, active_base_url, provider_base_url=None, custom_providers=None):
@@ -492,6 +515,31 @@ def test_probe_schedule_stays_bounded_in_band_after_the_window_is_spent(monkeypa
         assert 0 < timeout < 5.0, timeout  # attempted, but never the full cap
 
 
+def _install_schedule_recorder(monkeypatch, seen):
+    """Wrap ``_CustomProbeSchedule`` so a test can see what the rebuild hands it.
+
+    Records what the PRODUCTION caller supplies — notably the absolute
+    ``deadline`` — rather than what the schedule would compute on its own, which
+    is what the "one window, not two" invariant is about.
+    """
+    real_schedule = cfg._CustomProbeSchedule
+
+    class _RecordingSchedule(real_schedule):
+        def __init__(self, endpoint_count, *, out_of_band=None, deadline=None):
+            seen["predicate"] = out_of_band
+            seen["deadline"] = deadline
+            seen["endpoint_count"] = endpoint_count
+            seen["constructed"] = seen.get("constructed", 0) + 1
+            super().__init__(
+                endpoint_count,
+                out_of_band=out_of_band,
+                deadline=deadline,
+            )
+
+    monkeypatch.setattr(cfg, "_CustomProbeSchedule", _RecordingSchedule)
+    return _RecordingSchedule
+
+
 def test_probe_schedule_is_wired_to_the_foreground_giving_up(
     monkeypatch, isolate_models_catalog_state
 ):
@@ -507,15 +555,9 @@ def test_probe_schedule_is_wired_to_the_foreground_giving_up(
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
 
     seen: dict = {}
-    real_schedule = cfg._CustomProbeSchedule
     real_invoke = cfg._invoke_models_rebuild
 
-    class _RecordingSchedule(real_schedule):
-        def __init__(self, endpoint_count, *, out_of_band=None):
-            seen["predicate"] = out_of_band
-            super().__init__(endpoint_count, out_of_band=out_of_band)
-
-    monkeypatch.setattr(cfg, "_CustomProbeSchedule", _RecordingSchedule)
+    _install_schedule_recorder(monkeypatch, seen)
 
     def _slow_builder(builder):
         # Hold the worker past the budget so the foreground gives up before the
@@ -743,3 +785,430 @@ def test_older_publish_does_not_cost_a_newer_rebuild_its_result(
     )
     assert cfg._available_models_cache["active_provider"] == "newer"
     assert cfg._models_published_seq == cfg._models_rebuild_seq
+
+
+# ── Review round 5 (2026-10-01): the remaining production races ──────────────
+#
+# The review found three states the allocated-generation guard did not cover:
+#   1. invalidation without a successor never revoked the running worker, which
+#      then republished the cleared catalog stamped with a NEW fingerprint;
+#   2. a publisher could clear a newer rebuild's single-flight ownership (and
+#      overwrite its durable result) from its post-lock exit path;
+#   3. the probe schedule and the foreground wait still used two independent
+#      windows, so pre-custom discovery work was granted to the chain twice.
+# All of the tests below are event/barrier driven — no polling and no fixed
+# sleeps — and they release and join the daemon workers they start.
+
+
+def _written_active_provider(cache_path):
+    """``active_provider`` in the durable catalog, or None when it is absent."""
+    if not cache_path.exists():
+        return None
+    return json.loads(cache_path.read_text(encoding="utf-8"))["active_provider"]
+
+
+def _glob_cache_files(cache_path):
+    """Every durable-catalog artefact (the file plus any leftover temp file)."""
+    return sorted(p.name for p in cache_path.parent.glob(cache_path.name + "*"))
+
+
+def test_probe_schedule_spends_the_callers_window_not_a_fresh_one(
+    monkeypatch, isolate_models_catalog_state
+):
+    """The probe chain and the foreground wait must share ONE absolute deadline.
+
+    Maintainer review, 2026-10-01. ``_CustomProbeSchedule`` used to mint its own
+    window when it was constructed — deep inside the worker, after provider
+    detection and the live id lookups — while the foreground started a fresh full
+    ``Event.wait`` after starting that worker. Any discovery work before the
+    custom-probe phase was therefore granted to the chain a second time, so the
+    chain could still be probing after the caller had been served the over-budget
+    fallback: the reachable provider landed out-of-band at best.
+
+    The deadline handed to the schedule must be the caller's (captured before the
+    worker started), so it reads ``budget`` past the call — not
+    ``budget + discovery delay`` — and it must coincide with the instant the
+    caller stopped waiting on.
+    """
+    _configure(
+        monkeypatch,
+        active_base_url="http://lan-dead.example:1234/v1",
+        custom_providers=[
+            {
+                "name": "My Gateway",
+                "base_url": "https://gw-live.example/v1",
+                "api_key": "sk-live",
+            }
+        ],
+    )
+    budget = 1.0
+    discovery_delay = 0.6
+    cap = 0.3
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", budget, raising=False)
+    monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", cap, raising=False)
+    observed = _install_urlopen(
+        monkeypatch, dead_hosts=["lan-dead.example"], live_hosts=["gw-live.example"]
+    )
+
+    seen: dict = {}
+    recorder = _install_schedule_recorder(monkeypatch, seen)
+
+    class _DelayedRecordingSchedule(recorder):
+        def __init__(self, endpoint_count, *, out_of_band=None, deadline=None):
+            # Stands in for the pre-custom discovery work: by the time the chain
+            # is built, part of the caller's window is already spent. The old
+            # construction-time deadline would start counting HERE.
+            time.sleep(discovery_delay)
+            super().__init__(
+                endpoint_count, out_of_band=out_of_band, deadline=deadline
+            )
+
+    monkeypatch.setattr(cfg, "_CustomProbeSchedule", _DelayedRecordingSchedule)
+
+    started_at = time.monotonic()
+    cfg.get_available_models()
+    stopped_waiting = time.monotonic()
+
+    assert seen.get("constructed"), "the custom-probe chain was never scheduled"
+    deadline = seen["deadline"]
+    assert deadline is not None, (
+        "the rebuild handed the schedule no deadline, so the chain minted its own "
+        "window"
+    )
+
+    # One window, not two: the discovery delay is NOT added to it.
+    assert deadline - started_at <= budget + 0.25, (
+        deadline - started_at,
+        budget,
+        discovery_delay,
+    )
+    # ... and it is the very instant the caller stopped waiting on.
+    assert stopped_waiting - deadline <= 0.25, (stopped_waiting - deadline)
+
+    # The probes drew from that same window: every one of them was bounded
+    # (positive, never above the per-endpoint cap).
+    for url, timeout in observed["dead"] + observed["live"]:
+        assert timeout is not None and 0 < timeout <= cap, (url, timeout)
+
+
+def test_invalidated_worker_cannot_restore_the_catalog_without_a_successor(
+    monkeypatch, isolate_models_catalog_state
+):
+    """Invalidation alone must revoke a rebuild that is already in flight.
+
+    Maintainer review, 2026-10-01. ``invalidate_models_cache()`` cleared memory
+    and the in-progress flag but never advanced the allocated generation, so a
+    delayed worker stayed eligible and republished the catalog that had just been
+    cleared — memory, provenance and the durable file — stamped with a NEW source
+    fingerprint at publication, which is exactly how stale data acquires
+    fresh-looking provenance. No successor rebuild is started here: the fence has
+    to hold on its own.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
+
+    cache_path = cfg._get_models_cache_path()
+    older = _catalog("older")
+    started = threading.Event()
+    release = threading.Event()
+    workers: list = []
+    saves: list = []
+
+    def _builder(_builder):
+        workers.append(threading.current_thread())
+        started.set()
+        assert release.wait(5.0)
+        return copy.deepcopy(older)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _builder)
+    monkeypatch.setattr(
+        cfg,
+        "_save_models_cache_to_disk",
+        lambda result, **kwargs: (
+            saves.append(result),
+            _REAL_SAVE_MODELS_CACHE_TO_DISK(result, **kwargs),
+        ),
+    )
+
+    # Rebuild N: the foreground gives up at the budget and leaves its worker
+    # blocked inside the builder — the in-flight state invalidation must fence.
+    cfg.get_available_models()
+    assert started.wait(2.0), "the rebuild worker never started"
+    assert cfg._cache_build_in_progress is True
+
+    # The config edit. Nothing else is started — no successor rebuild at all.
+    cfg.invalidate_models_cache()
+    assert cfg._cache_build_in_progress is False
+
+    release.set()
+    workers[0].join(timeout=5.0)
+    assert not workers[0].is_alive()
+
+    assert cfg._available_models_cache is None, (
+        "the invalidated worker restored the cleared catalog"
+    )
+    assert cfg._models_cache_provenance is None
+    assert cfg._available_models_cache_source_fingerprint is None
+    assert saves == [], "the invalidated worker wrote a durable catalog"
+    assert _written_active_provider(cache_path) is None
+    assert _glob_cache_files(cache_path) == [], (
+        "a superseded publisher left a temp file behind"
+    )
+    assert cfg._cache_build_in_progress is False
+
+
+def test_invalidated_worker_cannot_overwrite_a_newer_published_catalog(
+    monkeypatch, isolate_models_catalog_state
+):
+    """The other completion order: the invalidated worker is released LAST.
+
+    Companion to ``test_invalidated_worker_cannot_publish_over_a_newer_in_flight_rebuild``
+    (maintainer review, 2026-10-01, "cover both completion orders"). Here the
+    newer rebuild has already published to memory AND committed its durable
+    catalog before the older worker is released, so the older worker has to be
+    rejected on generation alone — the durable file is checked too, because the
+    shared per-pid temp name used to let the older writer revert it.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
+
+    cache_path = cfg._get_models_cache_path()
+    older = _catalog("older")
+    newer = _catalog("newer")
+    older_started = threading.Event()
+    release_older = threading.Event()
+    workers: list = []
+    calls = {"n": 0}
+
+    def _builder(_builder):
+        workers.append(threading.current_thread())
+        calls["n"] += 1
+        if calls["n"] == 1:
+            older_started.set()
+            assert release_older.wait(5.0)
+            return copy.deepcopy(older)
+        return copy.deepcopy(newer)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _builder)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", _REAL_SAVE_MODELS_CACHE_TO_DISK)
+
+    # Rebuild N goes out of budget with its worker blocked (out-of-band).
+    cfg.get_available_models()
+    assert older_started.wait(2.0), "the first rebuild worker never started"
+
+    # Invalidate, then let the newer rebuild run to completion — it publishes and
+    # commits its catalog while N is still parked.
+    cfg.invalidate_models_cache()
+    result = cfg.get_available_models()
+    assert result["active_provider"] == "newer"
+    assert cfg._available_models_cache == newer
+    assert _written_active_provider(cache_path) == "newer"
+
+    release_older.set()
+    workers[0].join(timeout=5.0)
+    assert not workers[0].is_alive()
+
+    assert cfg._available_models_cache == newer, (
+        "the older worker reverted the newer in-memory catalog"
+    )
+    assert _written_active_provider(cache_path) == "newer", (
+        "the older worker reverted the newer durable catalog"
+    )
+    assert _glob_cache_files(cache_path) == [cache_path.name], (
+        "a superseded publisher left a temp file behind"
+    )
+    assert cfg._cache_build_in_progress is False
+    assert cfg._models_published_seq == cfg._models_rebuild_seq
+
+
+def test_superseded_publish_does_not_release_the_newer_rebuilds_ownership(
+    monkeypatch, isolate_models_catalog_state
+):
+    """A publisher must not clear the single-flight slot a newer build now owns.
+
+    Maintainer review, 2026-10-01: ``_publish_models_result`` checked the
+    generation under the cache lock, saved the file with that lock released, and
+    then cleared ``_cache_build_in_progress`` unconditionally. So A could pass its
+    check, B could be allocated while A was in its disk window, and A's exit path
+    would then release B's ownership — admitting a third rebuild C beside B and
+    letting A's stale payload land in the durable file. This test holds A inside
+    its own disk commit (a barrier) while the newer rebuild B is admitted, then
+    releases it and asserts:
+
+      * A's payload never reaches the durable catalog;
+      * B keeps the single-flight slot, so C is NOT admitted (C gets B's catalog);
+      * B, when it finally publishes, is recorded in the file.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
+
+    cache_path = cfg._get_models_cache_path()
+    older = _catalog("older")
+    newer = _catalog("newer")
+    a_started = threading.Event()
+    release_a = threading.Event()
+    a_in_save = threading.Event()
+    b_started = threading.Event()
+    release_b = threading.Event()
+    b_in_save = threading.Event()
+    release_b_save = threading.Event()
+    workers: list = []
+    calls = {"n": 0}
+
+    def _builder(_builder):
+        workers.append(threading.current_thread())
+        calls["n"] += 1
+        if calls["n"] == 1:
+            a_started.set()
+            assert release_a.wait(5.0)
+            return copy.deepcopy(older)
+        b_started.set()
+        assert release_b.wait(5.0)
+        return copy.deepcopy(newer)
+
+    def _gated_save(result, **kwargs):
+        if result.get("active_provider") == "older":
+            a_in_save.set()
+            # Stay inside the publisher's disk window until the newer rebuild has
+            # been allocated and has reached its own commit.
+            assert b_started.wait(5.0)
+            assert b_in_save.wait(5.0)
+        else:
+            b_in_save.set()
+            # Hold B in its disk window too, so the flag it owns is still set
+            # while A's exit path runs — that is the state A must not release.
+            assert release_b_save.wait(5.0)
+        return _REAL_SAVE_MODELS_CACHE_TO_DISK(result, **kwargs)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _builder)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", _gated_save)
+
+    # Rebuild A: out of budget, worker blocked inside the builder.
+    cfg.get_available_models()
+    assert a_started.wait(2.0), "the first rebuild worker never started"
+
+    # Release A: it is out-of-band now, publishes to memory and enters its disk
+    # commit — where the gate holds it.
+    release_a.set()
+    assert a_in_save.wait(5.0), "the older rebuild never reached its disk commit"
+
+    # A config edit invalidates, and the newer rebuild B is admitted while A is
+    # still inside that commit. Releasing B's builder lets B publish to memory and
+    # enter its own commit, which is where B now owns the single-flight slot.
+    cfg.invalidate_models_cache()
+    cfg.get_available_models()
+    assert b_started.wait(2.0), "the newer rebuild never started"
+    release_b.set()
+    assert b_in_save.wait(5.0), "the newer rebuild never reached its disk commit"
+    assert cfg._available_models_cache == newer
+    assert cfg._cache_build_in_progress is True, "B does not own the build slot"
+
+    # Now let the older publisher out of its disk window. It is superseded.
+    release_a.set()
+    workers[0].join(timeout=5.0)
+    assert not workers[0].is_alive()
+
+    assert cfg._available_models_cache == newer, (
+        "the superseded publisher reverted the newer in-memory catalog"
+    )
+    assert _written_active_provider(cache_path) != "older", (
+        "the superseded publisher wrote its stale payload to the durable catalog"
+    )
+    assert cfg._cache_build_in_progress is True, (
+        "the superseded publisher released the newer rebuild's single-flight slot"
+    )
+
+    # C must not be admitted while B owns the slot: it waits for B and is served
+    # B's catalog instead of starting a third rebuild.
+    seq_before_c = cfg._models_rebuild_seq
+    c_result: dict = {}
+
+    def _caller_c():
+        c_result["catalog"] = cfg.get_available_models()
+
+    caller_c = threading.Thread(target=_caller_c, name="issue7481-caller-c")
+    caller_c.start()
+    assert not caller_c.join(timeout=0.3), "the third caller did not wait for B"
+    assert calls["n"] == 2, "a third rebuild was admitted while the newer one lived"
+    assert cfg._models_rebuild_seq == seq_before_c
+
+    release_b_save.set()
+    workers[1].join(timeout=5.0)
+    caller_c.join(timeout=5.0)
+    assert not caller_c.is_alive()
+    assert calls["n"] == 2
+
+    assert c_result["catalog"]["active_provider"] == "newer"
+    assert cfg._available_models_cache == newer
+    assert _written_active_provider(cache_path) == "newer"
+    assert _glob_cache_files(cache_path) == [cache_path.name]
+    assert cfg._cache_build_in_progress is False
+
+
+def test_source_edit_during_a_rebuild_discards_the_stale_result(
+    monkeypatch, isolate_models_catalog_state
+):
+    """A catalog built from sources that changed must not be published as fresh.
+
+    Maintainer review, 2026-10-01 ("capture and validate the build's
+    source/profile identity at publication"). A build that outlives a config edit
+    used to publish its stale catalog with the CURRENT source fingerprint — the
+    data was never built from those sources, but it carried their provenance, in
+    memory and on disk. The captured identity is re-validated at publication and
+    at the durable commit instead; here nothing is invalidated, so the fence has
+    to come from the identity check alone.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
+
+    cache_path = cfg._get_models_cache_path()
+    fingerprint = {"value": "fp-before-edit"}
+    monkeypatch.setattr(
+        cfg, "_models_cache_source_fingerprint", lambda: fingerprint["value"]
+    )
+
+    older = _catalog("older")
+    started = threading.Event()
+    release = threading.Event()
+    workers: list = []
+    saves: list = []
+
+    def _builder(_builder):
+        workers.append(threading.current_thread())
+        started.set()
+        assert release.wait(5.0)
+        return copy.deepcopy(older)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _builder)
+    monkeypatch.setattr(
+        cfg,
+        "_save_models_cache_to_disk",
+        lambda result, **kwargs: (
+            saves.append(result),
+            _REAL_SAVE_MODELS_CACHE_TO_DISK(result, **kwargs),
+        ),
+    )
+
+    cfg.get_available_models()
+    assert started.wait(2.0), "the rebuild worker never started"
+
+    # The user edits the config while the build is running. No invalidation call:
+    # the sources simply change under the build.
+    fingerprint["value"] = "fp-after-edit"
+
+    release.set()
+    workers[0].join(timeout=5.0)
+    assert not workers[0].is_alive()
+
+    assert cfg._available_models_cache is None, (
+        "a catalog built from the previous sources was published under the new "
+        "fingerprint"
+    )
+    assert cfg._available_models_cache_source_fingerprint is None
+    assert cfg._models_cache_provenance is None
+    assert saves == [], "a catalog built from the previous sources reached the disk"
+    assert _written_active_provider(cache_path) is None
+    assert _glob_cache_files(cache_path) == []
+    # The build owned the slot and nothing superseded it, so it must release it:
+    # otherwise the next caller waits out the whole budget for nothing.
+    assert cfg._cache_build_in_progress is False
