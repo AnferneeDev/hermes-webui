@@ -2153,12 +2153,31 @@ def test_proven_legacy_owner_is_not_promoted_without_model_visible_answer(kind):
     context.pop('_active_turn_token',None)
     first.save()
     writer=RunJournalWriter(sid,streams[0])
-    if kind=='reasoning':writer.append_sse_event('thinking',{'text':'Private saved reasoning'})
-    elif kind=='tool':writer.append_sse_event('tool',{'name':'read_file','tid':'old-card','args':{'path':'fake.txt'}})
-    else:writer.append_sse_event('apperror',{'message':'Old terminal error'})
-    writer.append_sse_event('cancel',{'message':'Old terminal'})
+    if kind=='reasoning':
+        writer.append_sse_event('reasoning',{'text':'Private saved reasoning'})
+    elif kind=='tool':
+        writer.append_sse_event('tool',{'name':'read_file','tid':'old-card','args':{'path':'fake.txt'}})
+    else:
+        writer.append_sse_event('apperror',{
+            'session_id':sid,'terminal_session_persisted':False,
+            'session':{'session_id':sid,'messages':[
+                copy.deepcopy(display),
+                {'role':'assistant','content':'Old terminal error','_error':True},
+            ]},
+        })
+    if kind!='error':
+        writer.append_sse_event('cancel',{'message':'Old terminal'})
     models.SESSIONS.clear()
     recovered=models.get_session(sid)
+    assert _pending_stream_hook(recovered,streams[0]) is None
+    output=_stream_output(recovered,streams[0])
+    if kind=='reasoning':
+        assert any(row.get('role')=='assistant' and row.get('reasoning')=='Private saved reasoning' for row in output)
+    elif kind=='tool':
+        assert any(tool.get('tid')=='old-card' for tool in recovered.tool_calls)
+        _assert_retry_turn_ownership(recovered,['interrupted','cancelled'],streams)
+    else:
+        assert any(row.get('_error') is True and row.get('content')=='Old terminal error' for row in output)
     for rows in (recovered.messages,recovered.context_messages):
         owner=next(row for row in rows if row.get('role')=='user' and row.get('content')=='Prompt 0')
         assert owner.get('_recovered') is True
