@@ -209,8 +209,9 @@ class TestAutolinkInlinePass:
 # matched run. When a URL was followed by a full-width mark and then MORE prose
 # before the closing mark — e.g. 「（https://example.com/x/，節錄原文）」 — the
 # whole 「，節錄原文」 was swallowed into href, because the match never stopped
-# at the interior mark. Fix: the match now STOPS at CJK full-width punctuation
-# (and the CJK bracket/quote families), so the prose stays outside the anchor.
+# at the interior mark. Fix: the match now STOPS at the high-confidence CJK
+# sentence marks and closing brackets needed by the report, so the prose stays
+# outside the anchor without truncating other valid Unicode IRI characters.
 # Reported shape: （https://opencode.ai/docs/go/，節錄原文） and
 # （https://opencode.ai/auth；文件也寫用量在那裡看） both clicked through to a
 # broken URL.
@@ -255,3 +256,31 @@ class TestAutolinkCjkProseContinuation:
         assert 'href="https://example.com/auth；' not in out
         assert "</a>，節錄原文）" in out
         assert "</a>；文件也寫用量在那裡看）" in out
+
+    @pytest.mark.parametrize("iri_char", ["—", "’"])
+    def test_outer_pass_preserves_unicode_iri_path_characters(self, driver_path, iri_char):
+        url = f"https://example.com/owner{iri_char}s-guide"
+        out = _render(driver_path, f"See {url}")
+        assert f'href="{url}"' in out, (
+            f"Unicode IRI character {iri_char!r} must remain inside a bare URL. Got: {out!r}"
+        )
+        assert f">{url}</a>" in out
+
+    @pytest.mark.parametrize("iri_char", ["—", "’"])
+    def test_inline_pass_preserves_unicode_iri_path_characters(self, driver_path, iri_char):
+        url = f"https://example.com/owner{iri_char}s-guide"
+        out = _render(driver_path, f"- See {url}")
+        assert f'href="{url}"' in out, (
+            f"Inline pass must preserve {iri_char!r} in a bare Unicode IRI. Got: {out!r}"
+        )
+        assert f">{url}</a>" in out
+
+    @pytest.mark.parametrize("iri_char", ["—", "’"])
+    def test_explicit_markdown_link_preserves_unicode_iri_path_characters(
+        self, driver_path, iri_char
+    ):
+        url = f"https://example.com/owner{iri_char}s-guide"
+        out = _render(driver_path, f"[guide]({url})")
+        assert f'href="{url}"' in out
+        assert ">guide</a>" in out
+        assert out.count("<a ") == 1

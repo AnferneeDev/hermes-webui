@@ -8167,7 +8167,7 @@ function renderMd(raw){
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
     t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
-    t=t.replace(/(https?:\/\/[^\s<>"')\]\uFF09\u3001\u3002\u3008-\u3011\u3014-\u301F\uFF01-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65\u2013\u2014\u2026\u2018\u2019\u201C\u201D]+)/g,(url)=>{const trail=url.match(/[.,;:!?)\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
+    t=t.replace(/(https?:\/\/[^\s<>"')\]\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002\u3011\u300D\u300B\u3015]+)/g,(url)=>{const trail=url.match(/[.,;:!?)\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
@@ -8515,15 +8515,15 @@ function renderMd(raw){
   // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
-  s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09\u3001\u3002\u3008-\u3011\u3014-\u301F\uFF01-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65\u2013\u2014\u2026\u2018\u2019\u201C\u201D]+)/g,(url)=>{
+  s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002\u3011\u300D\u300B\u3015]+)/g,(url)=>{
     // Strip trailing punctuation that was likely not part of the URL.
-    // CJK full-width punctuation (）。，；：！？、 and the bracket/quote
-    // families) is included because LLMs frequently use full-width
-    // delimiters in Chinese/Japanese text. The match also STOPS at those
-    // marks: a URL glued to CJK prose — （https://ex.com/，節錄原文） —
-    // ends at the first mark and the prose stays visible outside the
-    // anchor. This generalizes the #6792 strip, which could only drop a
-    // single mark sitting at the very end of the match.
+    // High-confidence CJK sentence marks and closing brackets
+    // (）。，；：！？、】」》〕) stop the match so a URL glued to prose —
+    // （https://ex.com/，節錄原文） — ends before that prose. Keep other
+    // Unicode IRI characters (for example em dash and smart apostrophe)
+    // matchable rather than treating broad punctuation ranges as delimiters.
+    // This generalizes the #6792 strip, which could only drop a single mark
+    // sitting at the very end of the match.
     const trail=url.match(/[.,;:!?)]$/)||url.match(/[\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';
     const clean=trail?url.slice(0,-1):url;
     return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
