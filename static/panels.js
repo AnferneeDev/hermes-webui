@@ -13170,16 +13170,30 @@ async function _runCronPollTick(){
           const statusText = c.status==='error' ? t('status_failed') : t('status_completed');
           if(document.hidden){
             // A hidden completion only counts as delivered when the
-            // notification actually reached the user's channel.
-            // sendBrowserNotification silently no-ops otherwise, so a
-            // hidden completion must not be consumed with no surface
-            // at all (#7652 review).
-            const notified=_cronSendHiddenCompletionNotification(c.name,statusText,c.session_id);
-            // Notification channel closed (disabled or denied): queue the
-            // completion so the user still gets it as a toast when the tab
-            // comes back. Otherwise _cronPollSince advances past it and the
-            // completion is consumed with no surface at all.
-            if(!notified) _cronPendingToasts.push({name:c.name,statusText});
+            // notification actually reached the user's channel. The helper
+            // awaits the real display result, so a display failure is NOT
+            // mistaken for delivery and the completion is queued instead
+            // (#7652 review: SILENT gap).
+            const notified=await _cronSendHiddenCompletionNotification(c.name,statusText,c.session_id);
+            // The await yields: the profile may have switched (the queue
+            // state belongs to the old profile) or the tab may have become
+            // visible (the user is already looking at a live surface). Skip
+            // a stale tick's fallback entirely.
+            if(pollGeneration!==_cronPollGeneration) return;
+            if(!notified){
+              if(typeof document!=='undefined'&&document.hidden){
+                // Notification channel closed or the display failed: queue
+                // the completion so the user still gets it as a toast when
+                // the tab comes back. Otherwise _cronPollSince advances past
+                // it and the completion is consumed with no surface at all.
+                _cronPendingToasts.push({name:c.name,statusText});
+              }else{
+                // The tab became visible while the delivery was pending:
+                // surface it immediately rather than waiting for another
+                // visibility change.
+                showToast(t('cron_completion_status', c.name, statusText), 4000);
+              }
+            }
           } else {
             showToast(t('cron_completion_status', c.name, statusText), 4000);
           }
@@ -13209,18 +13223,30 @@ function _cronCanNotify(){
     && Notification.permission==='granted');
 }
 
-// Notify for a completion that arrived while the tab was hidden. Returns true
-// when the notification actually reached the user's notification channel, so
-// the caller can decide whether to queue a fallback toast.
-function _cronSendHiddenCompletionNotification(name,statusText,sessionId){
+// Notify for a completion that arrived while the tab was hidden. Resolves true
+// only when sendBrowserNotification reports that the notification actually
+// reached the user's notification channel, so the caller can decide whether to
+// queue a fallback toast. This must be AWAITED: `_cronCanNotify()` is only a
+// permission pre-check, and the real primitive still resolves false when the
+// service-worker path finds no active registration while the direct
+// Notification constructor throws — the normal case on some mobile browsers
+// and installed-PWA contexts that only allow SW notifications. Returning true
+// without awaiting made such a completion vanish (#7652 review).
+async function _cronSendHiddenCompletionNotification(name,statusText,sessionId){
   if(!_cronCanNotify()) return false;
   if(typeof sendBrowserNotification!=='function') return false;
   // #7652 review: pass an explicit sessionless marker when the completion has
   // no session_id. Without it _notificationOptions falls back to the user's
   // CURRENT session, so clicking the notification opens the wrong chat (and
   // reuses that session's notification tag).
-  sendBrowserNotification(name,statusText,{sid:sessionId||null,sessionless:!sessionId});
-  return true;
+  try{
+    const delivered=await sendBrowserNotification(name,statusText,{sid:sessionId||null,sessionless:!sessionId});
+    // Fail closed on anything that is not an explicit success: the primitive
+    // returns undefined when it short-circuits before delivery.
+    return delivered===true;
+  }catch(_err){
+    return false;
+  }
 }
 
 // Flush completions that arrived while hidden but reached no surface, as

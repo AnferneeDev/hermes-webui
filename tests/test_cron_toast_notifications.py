@@ -275,6 +275,7 @@ const state = {
   notifications: [],
   apiCalls: [],
   pendingSince: null,
+  deliveryFails: false,
 };
 
 global.S = null;
@@ -315,10 +316,16 @@ const _cronNewJobIds = new Set();
 const _cronPendingToasts = [];
 let _cronPollInFlight = false;
 global.sendBrowserNotification = (title, body, options) => {
-  // Mirror the real primitive's silence: with the channel closed it is a
-  // no-op, which is exactly the case the poll must not mistake for delivery.
-  if (!state.notificationsEnabled || state.permission !== 'granted') return;
+  // Mirror the real primitive's result contract: with the channel closed it
+  // resolves false, and even with the channel open a display failure (the
+  // service-worker path finding no active registration while the direct
+  // Notification constructor throws — normal on some mobile/PWA contexts)
+  // resolves false without anything being shown. The poll must not mistake
+  // either case for a delivered notification (#7652 review — SILENT gap).
+  if (!state.notificationsEnabled || state.permission !== 'granted') return Promise.resolve(false);
+  if (state.deliveryFails) return Promise.resolve(false);
   state.notifications.push({ title, body, options });
+  return Promise.resolve(true);
 };
 global.api = async (path) => {
   state.apiCalls.push(path);
@@ -483,6 +490,55 @@ async function driveTick(completions) {
   }]);
   out.c_poll_marker = state.notifications.map((entry) => entry.options);
 
+  // === Scenario D: notification channel OPEN but the display FAILS =========
+  // #7652 review — the SILENT gap: _cronCanNotify() is only a permission
+  // pre-check. sendBrowserNotification can still resolve false (service-worker
+  // path finds no active registration AND the direct Notification constructor
+  // throws — normal on mobile / installed-PWA contexts that only allow SW
+  // notifications). A helper that returns true without awaiting the real
+  // result makes that completion vanish: the poll advances _cronPollSince and
+  // nothing is queued.
+  state.notificationsEnabled = true;
+  state.permission = 'granted';
+  state.deliveryFails = true;
+  _cronPendingToasts.length = 0;
+  state.notifications = [];
+  setHidden(true);
+  await driveTick([{
+    job_id: 'job-silent-fail', name: 'Silent failure', status: 'success',
+    completed_at: 500, session_id: 'cron-session-silent', message_count: 1,
+    toast_notifications: true,
+  }]);
+  out.d_silent_display_failure = {
+    notifications: state.notifications.slice(),
+    queued: _cronPendingToasts.length,
+    since: _cronPollSince,
+  };
+  // The completion must surface as a toast once the tab is visible again.
+  setHidden(false);
+  out.d_after_visible = {
+    toasts: state.toasts.map((entry) => entry.text),
+    queued: _cronPendingToasts.length,
+  };
+
+  // === Scenario E: successful notification still must NOT double-surface ===
+  state.deliveryFails = false;
+  _cronPendingToasts.length = 0;
+  state.notifications = [];
+  state.toasts = [];
+  setHidden(true);
+  await driveTick([{
+    job_id: 'job-ok-notify', name: 'Okay notice', status: 'success',
+    completed_at: 600, session_id: 'cron-session-ok', message_count: 1,
+    toast_notifications: true,
+  }]);
+  setHidden(false);
+  out.e_successful_notify = {
+    notifications: state.notifications.length,
+    queued: _cronPendingToasts.length,
+    toastsAfterVisible: state.toasts.length,
+  };
+
   process.stdout.write(JSON.stringify(out));
 })().catch((error) => {
   console.error(error && error.stack || error);
@@ -623,3 +679,48 @@ def test_cron_toast_i18n_keys_exist():
     assert "cron_toast_notifications_hint" in I18N_JS
     assert "cron_toast_notifications_enabled" in I18N_JS
     assert "cron_toast_notifications_disabled" in I18N_JS
+
+
+def test_hidden_completion_whose_notification_fails_to_display_is_not_lost():
+    """#7652 review (SILENT gap): a notification that fails to DISPLAY must not
+    count as delivered. Permission granted is only a pre-check — the real
+    primitive resolves false when the service-worker path finds no active
+    registration and the direct constructor throws, which is normal on mobile
+    and installed-PWA contexts. The completion must be queued and toasted on
+    return instead of being consumed with no surface."""
+    out = _run_cron_harness()
+
+    hidden = out["d_silent_display_failure"]
+    assert hidden["notifications"] == [], (
+        "a failed display must not be recorded as a delivered notification"
+    )
+    assert hidden["queued"] == 1, (
+        "a notification that failed to display must queue the completion, "
+        "not consume it silently"
+    )
+    assert hidden["since"] == 500, "the poll still advances past the completion"
+
+    after = out["d_after_visible"]
+    assert after["queued"] == 0, "the queue must drain on visibilitychange"
+    assert len(after["toasts"]) == 1, (
+        "the retained completion must flush as exactly one toast"
+    )
+    assert "Silent failure" in after["toasts"][0], (
+        "the flushed toast must carry the completion name"
+    )
+
+
+def test_successful_hidden_notification_does_not_also_queue_a_toast():
+    """The await must not turn a real delivery into a fallback toast: when the
+    notification resolves true, nothing is queued and becoming visible adds no
+    extra toast (no double surface)."""
+    out = _run_cron_harness()
+
+    ok = out["e_successful_notify"]
+    assert ok["notifications"] == 1, "the completion must notify exactly once"
+    assert ok["queued"] == 0, (
+        "a notification that actually displayed must not also queue a toast"
+    )
+    assert ok["toastsAfterVisible"] == 0, (
+        "no fallback toast may fire when the notification was delivered"
+    )
