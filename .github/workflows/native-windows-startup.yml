@@ -315,6 +315,75 @@ jobs:
           }
           Write-Host "OK probe4: legacy-only Agent found with explicit STATE_DIR"
 
+          # Probe 5: legacy pip Agent + a STALE Program Files SOURCE checkout.
+          # Program Files is launcher-only and sorts after the legacy root, so
+          # ranking these roots by kind (a run_agent.py pass, then a hermes_cli
+          # pass) let the stale source checkout win. Its hermes_bootstrap.py can
+          # SystemExit before the server binds, so this is a brick, not a
+          # preference. Master picks the legacy pip Agent.
+          $local5 = Join-Path $root 'local5'
+          $user5 = Join-Path $root 'user5'
+          $pf5 = Join-Path $root 'pf5'
+          $legacyAgent5 = Join-Path (Join-Path $user5 '.hermes') 'hermes-agent'
+          $pfAgent5 = Join-Path (Join-Path $pf5 'hermes') 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path (Join-Path $legacyAgent5 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path $local5 | Out-Null
+          # A source checkout: run_agent.py, no hermes_cli.
+          New-Item -ItemType Directory -Force -Path $pfAgent5 | Out-Null
+          Set-Content -Path (Join-Path $pfAgent5 'run_agent.py') -Value '# stale source checkout'
+          $out5 = Invoke-StartPs1Probe -Label 'legacy-pip-vs-stale-pf-source' -EnvMap @{
+            LOCALAPPDATA = $local5
+            USERPROFILE = $user5
+            ProgramW6432 = $pf5
+            ProgramFiles = $pf5
+            'ProgramFiles(x86)' = $pf5
+          }
+          if ($out5 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$legacyAgent5")) {
+            throw "legacy-pip-vs-stale-pf-source: stale Program Files source outranked the legacy pip Agent"
+          }
+          Write-Host "OK probe5: legacy pip Agent beats the stale Program Files source"
+
+          # Probe 6: explicit STATE_DIR + populated legacy webui state, with pip
+          # Agents at BOTH %USERPROFILE%\.hermes\hermes-agent and
+          # %USERPROFILE%\hermes-agent. api/paths._platform_default_hermes_home()
+          # does not gate the #2905 legacy preference on HERMES_WEBUI_STATE_DIR,
+          # so the launcher's platform-default Agent candidate must be the
+          # legacy home here while the exported HERMES_HOME stays LOCALAPPDATA.
+          $local6 = Join-Path $root 'local6'
+          $user6 = Join-Path $root 'user6'
+          $pf6 = Join-Path $root 'pf6'
+          $customState6 = Join-Path $root 'custom-state6'
+          $legacyAgent6 = Join-Path (Join-Path $user6 '.hermes') 'hermes-agent'
+          $homeAgent6 = Join-Path $user6 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path (Join-Path $legacyAgent6 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $homeAgent6 'hermes_cli') | Out-Null
+          # Populated legacy WebUI state, and nothing at the new home.
+          New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $user6 '.hermes') 'webui') | Out-Null
+          New-Item -ItemType Directory -Force -Path $local6 | Out-Null
+          New-Item -ItemType Directory -Force -Path $pf6 | Out-Null
+          New-Item -ItemType Directory -Force -Path $customState6 | Out-Null
+          $out6 = Invoke-StartPs1Probe -Label 'explicit-state-legacy-webui-state' -EnvMap @{
+            LOCALAPPDATA = $local6
+            USERPROFILE = $user6
+            ProgramW6432 = $pf6
+            ProgramFiles = $pf6
+            'ProgramFiles(x86)' = $pf6
+            HERMES_WEBUI_STATE_DIR = $customState6
+          }
+          if ($out6 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$legacyAgent6")) {
+            throw "explicit-state-legacy-webui-state: expected the legacy Agent $legacyAgent6, got a different candidate"
+          }
+          # The exported HERMES_HOME must still stay at the new home, so
+          # api/profiles.py does not read provider settings from the legacy one.
+          $localHome6 = Join-Path $local6 'hermes'
+          if ($out6 -notmatch [regex]::Escape("PROBE_HERMES_HOME=$localHome6")) {
+            throw "explicit-state-legacy-webui-state: exported HERMES_HOME moved to the legacy home"
+          }
+          if ($out6 -notmatch [regex]::Escape("PROBE_STATE_DIR=$customState6")) {
+            throw "explicit-state-legacy-webui-state: custom STATE_DIR was not preserved"
+          }
+          Write-Host "OK probe6: legacy Agent candidate with explicit STATE_DIR and LOCALAPPDATA HERMES_HOME"
+
 
       - name: Restore server.py
         if: always()

@@ -91,41 +91,57 @@ if (-not $Python) {
 }
 
 # === Resolve platform-default Hermes home before agent discovery =======
-# api/config.py's _discover_agent_dir prefers $HERMES_HOME\hermes-agent
-# after the explicit HERMES_WEBUI_AGENT_DIR override, then later falls back
-# to `_DEFAULT_HERMES_HOME\hermes-agent` from
-# api.paths._platform_default_hermes_home(). Mirror that #2905 rule here:
-# %LOCALAPPDATA%\hermes once established; %USERPROFILE%\.hermes only when
-# the legacy home still holds WebUI state and the new location does not.
-# Resolving before the candidate list keeps the exported discovery result
-# aligned with the server. Leave an already-set HERMES_HOME alone.
-#
-# Explicit HERMES_WEBUI_STATE_DIR: WebUI state is already located elsewhere,
-# so a leftover %USERPROFILE%\.hermes\webui must NOT yank HERMES_HOME to the
-# legacy path. Master keeps %LOCALAPPDATA%\hermes in that shape; switching
-# would make api/profiles.py read provider settings from the wrong home.
-if ($env:LOCALAPPDATA) {
-    $platformDefaultHermesHome = Join-Path $env:LOCALAPPDATA 'hermes'
-    $legacyHermesHome = Join-Path $env:USERPROFILE '.hermes'
-    # Migration heuristic only when state dir is NOT explicitly overridden.
-    if (-not $env:HERMES_WEBUI_STATE_DIR -and $legacyHermesHome -ne $platformDefaultHermesHome) {
-        $newHasWebuiState = $false
-        $legacyHasWebuiState = $false
-        foreach ($rel in @('webui\sessions', 'webui\settings.json', 'webui')) {
-            if (-not $newHasWebuiState -and (Test-Path (Join-Path $platformDefaultHermesHome $rel))) {
-                $newHasWebuiState = $true
-            }
-            if (-not $legacyHasWebuiState -and (Test-Path (Join-Path $legacyHermesHome $rel))) {
-                $legacyHasWebuiState = $true
-            }
-        }
-        if (-not $newHasWebuiState -and $legacyHasWebuiState) {
-            $platformDefaultHermesHome = $legacyHermesHome
-        }
+# api/config.py's _discover_agent_dir prefers $HERMES_HOME\hermes-agent after
+# the explicit HERMES_WEBUI_AGENT_DIR override, then later falls back to
+# `_DEFAULT_HERMES_HOME\hermes-agent` from
+# api/paths._platform_default_hermes_home(). Mirror that #2905 rule here:
+# %LOCALAPPDATA%\hermes once established; %USERPROFILE%\.hermes only when the
+# legacy home still holds WebUI state and the new location does not. Resolving
+# before the candidate list keeps the exported discovery result aligned with
+# the server. Leave an already-set HERMES_HOME alone.
+
+function Test-HermesWebuiState {
+    param([string]$Home)
+    foreach ($rel in @('webui\sessions', 'webui\settings.json', 'webui')) {
+        if (Test-Path (Join-Path $Home $rel)) { return $true }
     }
-} else {
-    $platformDefaultHermesHome = Join-Path $env:USERPROFILE '.hermes'
+    return $false
 }
+
+if ($env:LOCALAPPDATA) {
+    $newHermesHome = Join-Path $env:LOCALAPPDATA 'hermes'
+    $legacyHermesHome = Join-Path $env:USERPROFILE '.hermes'
+} else {
+    $newHermesHome = Join-Path $env:USERPROFILE '.hermes'
+    $legacyHermesHome = $newHermesHome
+}
+
+# What the server itself would use. api/paths.py gates the #2905 legacy
+# fallback on where the WebUI STATE lives and nothing else, so this is
+# computed with no STATE_DIR gate.
+$serverPlatformDefaultHome = $newHermesHome
+if ($legacyHermesHome -ne $newHermesHome -and
+    -not (Test-HermesWebuiState $newHermesHome) -and
+    (Test-HermesWebuiState $legacyHermesHome)) {
+    $serverPlatformDefaultHome = $legacyHermesHome
+}
+
+# The exported HERMES_HOME is a different question. An explicit
+# HERMES_WEBUI_STATE_DIR means WebUI state already lives elsewhere, so a
+# leftover %USERPROFILE%\.hermes\webui must NOT yank HERMES_HOME to the legacy
+# path: api/profiles.py would then read provider settings from the wrong home.
+# Master keeps %LOCALAPPDATA%\hermes in that shape.
+$platformDefaultHermesHome = $newHermesHome
+if (-not $env:HERMES_WEBUI_STATE_DIR) {
+    $platformDefaultHermesHome = $serverPlatformDefaultHome
+}
+
+# Candidate 5 reads the server's answer, not the exported one. Reading
+# $platformDefaultHermesHome here instead would skip the legacy Agent whenever
+# the state dir is overridden, and %USERPROFILE%\hermes-agent (candidate 6)
+# would then win over the populated legacy install the server itself picks.
+$platformDefaultAgentHome = $serverPlatformDefaultHome
+
 if (-not $env:HERMES_HOME) {
     $env:HERMES_HOME = $platformDefaultHermesHome
 }
@@ -165,7 +181,7 @@ if (-not $AgentDir) {
         $serverCandidates += $repoParent
     }
     # 5. Platform-default home\hermes-agent (api.paths._platform_default_hermes_home)
-    $serverCandidates += (Join-Path $platformDefaultHermesHome 'hermes-agent')
+    $serverCandidates += (Join-Path $platformDefaultAgentHome 'hermes-agent')
     # 6. HOME\hermes-agent (Path.home() → %USERPROFILE% on Windows)
     $serverCandidates += (Join-Path $env:USERPROFILE 'hermes-agent')
     # De-dup server-equivalent list (HERMES_HOME may coincide with platform default).
@@ -194,14 +210,21 @@ if (-not $AgentDir) {
     # De-dup: WOW64 can make ProgramFiles == ProgramFiles(x86); legacy may equal
     # a prior server candidate when HERMES_HOME already points there.
     $launcherOnlyCandidates = $launcherOnlyCandidates | Select-Object -Unique
+    # One interleaved pass, in path order, accepting either kind. The
+    # server-equivalent passes above stay source-first-then-pip because that is
+    # api/config.py's order and the server genuinely searches that list twice.
+    # These roots are not in the server's list at all, so there is no server
+    # order to mirror and splitting them by kind lets a stale Program Files
+    # SOURCE checkout outrank a working legacy pip install that comes first in
+    # the list — and that checkout's hermes_bootstrap.py can SystemExit before
+    # the server binds.
     if (-not $AgentDir) {
         foreach ($c in $launcherOnlyCandidates) {
-            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf) { $AgentDir = $c; break }
-        }
-    }
-    if (-not $AgentDir) {
-        foreach ($c in $launcherOnlyCandidates) {
-            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
+            if ((Test-Path (Join-Path $c 'hermes_cli') -PathType Container) -or
+                (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf)) {
+                $AgentDir = $c
+                break
+            }
         }
     }
     # Combined list for the not-found error message.
