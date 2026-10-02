@@ -21,12 +21,14 @@ hardcoded 5s timeout outside any budget — now draws from the same schedule.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 import pytest
 
@@ -1217,9 +1219,71 @@ def test_source_edit_during_a_rebuild_discards_the_stale_result(
     assert cfg._cache_build_in_progress is False
 
 
+class _FakeRouteHandler:
+    """Transport-less ``BaseHTTPRequestHandler`` stand-in for ``routes.handle_post``.
+
+    Exposes ``wfile``/``headers``/``rfile`` so the real router can read the JSON
+    body and write its response. ``headers`` carries no ``Origin``/``Referer``, so
+    ``_check_csrf`` treats the caller as a non-browser API client (the same
+    contract curl/MCP use) instead of demanding a session CSRF token.
+    """
+
+    def __init__(self, body_bytes: bytes = b""):
+        self.status = None
+        self.sent_headers = []
+        self.body = bytearray()
+        self.wfile = self
+        self.rfile = io.BytesIO(body_bytes)
+        self.headers = {"Content-Length": str(len(body_bytes))}
+        self.request = None
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, name, value):
+        self.sent_headers.append((name, value))
+
+    def end_headers(self):
+        pass
+
+    def write(self, data):
+        self.body.extend(data)
+
+    def json_body(self):
+        return json.loads(bytes(self.body).decode("utf-8"))
+
+
+def _refresh_provider_via_route(provider_id: str) -> None:
+    """Drive ``POST /api/models/refresh`` through the real router.
+
+    The route is the production entry point (``api/routes.py``, reached from
+    ``static/panels.js``); it is a thin wrapper over
+    ``invalidate_provider_models_cache``, so asserting the fence at the route is
+    what proves the endpoint the browser actually calls is fenced (#7481 review).
+    """
+    from api.routes import handle_post
+
+    handler = _FakeRouteHandler(json.dumps({"provider": provider_id}).encode("utf-8"))
+    handle_post(handler, urlparse("http://example.com/api/models/refresh"))
+    # The branch answers with ``return j(handler, ...)`` — i.e. it returns the
+    # router's response writer value, not the ``True`` the dispatcher docstring
+    # describes — so the observable contract is the response itself.
+    assert handler.status == 200, (handler.status, bytes(handler.body))
+    assert handler.json_body() == {"ok": True, "provider": provider_id}
+
+
+@pytest.mark.parametrize("entry", ["function", "route"], ids=["direct_call", "http_route"])
 @pytest.mark.parametrize("start_successor", [False, True], ids=["a_only", "a_then_b"])
-def test_provider_refresh_revokes_in_flight_catalog(monkeypatch, isolate_models_catalog_state, start_successor):
-    """Provider-scoped invalidation fences A, with or without a successor B."""
+def test_provider_refresh_revokes_in_flight_catalog(
+    monkeypatch, isolate_models_catalog_state, start_successor, entry
+):
+    """Provider-scoped invalidation fences A, with or without a successor B.
+
+    ``entry`` selects the entry point: the invalidator function directly, or the
+    ``POST /api/models/refresh`` route that calls it (``api/routes.py``). Both must
+    revoke an in-flight rebuild, and neither may let it restore memory, provenance
+    or the durable JSON afterwards.
+    """
     _configure(monkeypatch, active_base_url=None)
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05)
     old, new = _catalog("older"), _catalog("newer")
@@ -1228,6 +1292,12 @@ def test_provider_refresh_revokes_in_flight_catalog(monkeypatch, isolate_models_
     a_started, release_a = threading.Event(), threading.Event()
     b_started, release_b = threading.Event(), threading.Event()
     workers, saves = [], []
+
+    def refresh_provider() -> None:
+        if entry == "route":
+            _refresh_provider_via_route("openai")
+        else:
+            cfg.invalidate_provider_models_cache("openai")
 
     def builder(_builder):
         workers.append(threading.current_thread())
@@ -1248,7 +1318,7 @@ def test_provider_refresh_revokes_in_flight_catalog(monkeypatch, isolate_models_
     try:
         cfg.get_available_models()
         assert a_started.wait(2)
-        cfg.invalidate_provider_models_cache("openai")
+        refresh_provider()
         if start_successor:
             cfg.get_available_models()
             assert b_started.wait(2)
