@@ -980,13 +980,18 @@ def _append_recovered_turn_to_context(session, recovered: dict) -> None:
     _append_recovered_context_projection(session, context_messages, projected)
 
 
-def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> dict | None:
+def _recovered_pending_timestamp(value=None) -> int | float:
+    """Retain the pending intent's exact finite time, with the legacy fallback."""
+    if type(value) in (int, float) and value > 0 and (type(value) is int or math.isfinite(value)):
+        return value
+    return int(time.time())
+
+
+def _append_recovered_pending_turn(session, *, timestamp: int | float | None = None) -> dict | None:
     pending_text = str(session.pending_user_message or '')
     if not pending_text:
         return None
-    recovered_ts = int(time.time())
-    if isinstance(timestamp, (int, float)) and timestamp > 0:
-        recovered_ts = int(timestamp)
+    recovered_ts = _recovered_pending_timestamp(timestamp)
     recovered: dict = {
         'role': 'user',
         'content': session.pending_user_message,
@@ -994,7 +999,7 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
         '_recovered': True,
     }
     pending_source = getattr(session, 'pending_user_source', None)
-    stamp_message_source(recovered, pending_source)
+    stamp_message_source(recovered, pending_source, active_turn_token=_pending_active_turn_token(session))
     if session.pending_attachments:
         recovered['attachments'] = list(session.pending_attachments)
     session.messages.append(recovered)
@@ -3960,6 +3965,26 @@ def _journal_user_fallback_key(row):
     return (*metadata, text)
 
 
+def _journal_user_timestamps_match(left, right) -> bool:
+    """Match exact times or a legacy integer against its finite fractional time."""
+    if type(left) not in (int, float) or type(right) not in (int, float):
+        return False
+    if any(type(value) is float and not math.isfinite(value) for value in (left, right)):
+        return False
+    if left == right:
+        return True
+    if type(left) is int:
+        return left == int(right)
+    if type(right) is int:
+        return int(left) == right
+    return False
+
+
+def _journal_user_fallback_keys_match(left, right) -> bool:
+    return (left is not None and right is not None and left[1:] == right[1:]
+            and _journal_user_timestamps_match(left[0], right[0]))
+
+
 def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int | None):
     """Prove an interrupted owner and its successor across rich projections."""
     messages = session.messages or []
@@ -3998,8 +4023,11 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
             if any(value is not None and row_ids[key] is not None and value != row_ids[key]
                    for key, value in identities.items()):
                 continue
-            # A token on only one projection cannot establish a cancelled owner.
-            if row_ids['_active_turn_token'] != identities['_active_turn_token']:
+            # Legacy eager repair can lack the display token in context. Only
+            # a unique fallback pair may bridge that missing token; a context-
+            # only token or any conflicting shared token still fails closed.
+            missing_context_token = bool(identities['_active_turn_token'] and row_ids['_active_turn_token'] is None)
+            if row_ids['_active_turn_token'] != identities['_active_turn_token'] and not missing_context_token:
                 continue
             if any(row.get(key) not in (None, '', []) and expected.get(key) not in (None, '', [])
                    and row[key] != expected[key] for key in ('api_content', 'attachments')):
@@ -4007,18 +4035,19 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
             row_metadata = _journal_user_metadata_key(row)
             if row_metadata is None or row_metadata[1] != expected_metadata[1]:
                 continue
-            if row_metadata[0] is not None and expected_metadata[0] is not None and row_metadata[0] != expected_metadata[0]:
+            if row_metadata[0] is not None and expected_metadata[0] is not None and not _journal_user_timestamps_match(row_metadata[0], expected_metadata[0]):
                 continue
             row_key = _journal_user_fallback_key(row)
             shared = [key for key, value in identities.items() if value is not None and value == row_ids[key]]
-            if shared:
+            if shared and not missing_context_token:
                 if any(sum(_journal_user_identity_details(candidate)[0][key] == identities[key]
                            for candidate in users) != 1
                        for key in shared for users in identity_projections(key)):
                     continue
-            elif expected_key is None or row_key != expected_key or any(
-                sum(_journal_user_fallback_key(candidate) == expected_key for candidate in users) != 1
-                for users in (display_users, context_users)
+            elif not _journal_user_fallback_keys_match(row_key, expected_key) or any(
+                sum(_journal_user_fallback_keys_match(_journal_user_fallback_key(candidate), endpoint)
+                    for candidate in users) != 1
+                for endpoint in (row_key, expected_key) for users in (display_users, context_users)
             ):
                 continue
             matches.append(row)
@@ -4047,7 +4076,7 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
     return context_owner
 
 
-def _rehome_interrupted_journal_context(session, context_owner, stream_id: str) -> None:
+def _rehome_interrupted_journal_context(session, context_owner, stream_id: str, *, display_owner=None) -> None:
     """Insert exact-stream output before the proven successor, preserving pairs."""
     context = session.context_messages
     owner_positions = [i for i, row in enumerate(context) if row is context_owner]
@@ -4066,6 +4095,12 @@ def _rehome_interrupted_journal_context(session, context_owner, stream_id: str) 
         row.pop('_recovered_display_only', None)
     if not recovered:
         return
+    if any(row.get('role') == 'assistant' for row in recovered):
+        # Answered recovered questions are no longer provisional. Match the
+        # cancellation promotion rule so a first question survives sanitizing.
+        context_owner.pop('_recovered', None)
+        if display_owner is not None:
+            display_owner.pop('_recovered', None)
     # Keep any existing native assistant/tool block together; never synthesize
     # provider calls from the journal's truncated display-only tool metadata.
     insert_at = next((i for i in range(owner_positions[0] + 1, len(context))
@@ -4568,7 +4603,7 @@ def _retry_journal_recovery_in_place(
                     # error from that same stream.
                     _rehome_cancel_journal_rows(session, idx, str(stream_id))
                     if context_owner is not None:
-                        _rehome_interrupted_journal_context(session, context_owner, str(stream_id))
+                        _rehome_interrupted_journal_context(session, context_owner, str(stream_id), display_owner=messages[owner_index])
                     if terminal_error_recovered:
                         before_removal = session.messages
                         session.messages = [
@@ -4691,9 +4726,7 @@ def _apply_core_sync_or_error_marker(
     # prompt submitted just before a server restart, so materialize it before
     # clearing runtime stream state.
     if len(session.messages) != 0:
-        _recovered_ts = int(time.time())
-        if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
-            _recovered_ts = int(session.pending_started_at)
+        _recovered_ts = _recovered_pending_timestamp(session.pending_started_at)
         _already_checkpointed = _message_matches_pending_checkpoint(
             session.messages[-1],
             session.pending_user_message,
@@ -4759,8 +4792,7 @@ def _apply_core_sync_or_error_marker(
                 '_recovered': True,
             }
             pending_source = getattr(session, 'pending_user_source', None)
-            if pending_source and pending_source != 'webui':
-                recovered['_source'] = pending_source
+            stamp_message_source(recovered, pending_source, active_turn_token=_pending_active_turn_token(session))
             if session.pending_attachments:
                 recovered['attachments'] = list(session.pending_attachments)
             _append_recovered_turn_to_context(session, recovered)
@@ -4804,9 +4836,7 @@ def _apply_core_sync_or_error_marker(
                 if core.get(field) is not None:
                     setattr(session, field, core[field])
             _pending_text = _normalize_journal_recovery_text(session.pending_user_message)
-            _recovered_ts = int(time.time())
-            if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
-                _recovered_ts = int(session.pending_started_at)
+            _recovered_ts = _recovered_pending_timestamp(session.pending_started_at)
             _already_checkpointed = _message_matches_pending_checkpoint(
                 session.messages[-1] if session.messages else None,
                 session.pending_user_message,
@@ -4874,9 +4904,7 @@ def _apply_core_sync_or_error_marker(
     if session.pending_user_message:
         # Use the original send time if available so the recovered turn
         # appears in the correct chronological position.
-        _recovered_ts = int(time.time())
-        if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
-            _recovered_ts = int(session.pending_started_at)
+        _recovered_ts = _recovered_pending_timestamp(session.pending_started_at)
         _append_recovered_pending_turn(session, timestamp=_recovered_ts)
     recovered_output, terminal_error_recovered = (
         _recover_journaled_output_and_terminal_error(

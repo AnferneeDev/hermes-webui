@@ -134,7 +134,14 @@ Interrupted output recovered behind a later display user enters provider history
 only when its display owner uniquely matches a context user through a shared
 stable identity (turn token, message ID, state.db row ID, or message UID, kept in
 separate namespaces), or through a unique exact timestamp, normalized source,
-and display-equivalent text. Text comparison removes only a leading workspace
+and display-equivalent text. Legacy integer-truncated times may match a finite
+fractional time only when one side is integer-typed; two distinct fractional
+times remain distinct. Both endpoints must be unique across both projections,
+so an integer matching two same-second candidates does not establish ownership.
+A missing context token may use only that unique fallback pair; context-only or
+conflicting tokens still fail closed. New stale repairs retain the exact pending
+time and stamp its active-turn token before projecting the recovered user row.
+Text comparison removes only a leading workspace
 tag and a terminal attachment suffix and extracts known native text parts; it
 never rewrites provider payloads or image bytes. Contradictory/malformed identities,
 reused shared identities, and conflicting API content or attachments carried by
@@ -144,7 +151,9 @@ match an authoritative later display turn token. A surviving owner without a con
 still requires a token-bearing later display turn; compression summaries or
 unowned context suffixes do not prove an insertion boundary. Recovery inserts exact-stream output before that next user,
 retaining existing native tool call/result blocks together; truncated display tool
-metadata never becomes a provider call. This placement and hook retirement commit
+metadata never becomes a provider call. Only inserted model-visible assistant
+output promotes the proven recovered question out of its provisional state;
+reasoning-only/tool-display/error recovery does not. This placement and hook retirement commit
 in one save, with in-memory rollback on failure. Empty, compressed, duplicate or
 ambiguous/tokenless ownership stays display-only (`_recovered_display_only: true`),
 including during empty-context seeding and Agent/API replay sanitization. It must

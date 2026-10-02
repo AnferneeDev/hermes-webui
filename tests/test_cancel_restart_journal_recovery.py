@@ -1777,6 +1777,10 @@ def test_ambiguous_interrupted_context_proof_stays_display_only(failure):
     elif failure == "source":
         owner["_source"] = "telegram"
     elif failure == "timestamp":
+        # Distinct fractional timestamps conflict; int10/float10.25 is now
+        # the explicitly supported legacy truncation shape, not this negative.
+        display_owner=next(row for row in first.messages if row.get("role")=="user" and row.get("content")=="Prompt 0")
+        display_owner["timestamp"]=float(display_owner["timestamp"])
         owner["timestamp"] += 0.25
     elif failure == "owner-token":
         owner["_active_turn_token"] = "foreign-owner"
@@ -1805,6 +1809,8 @@ def test_proven_interrupted_context_save_failure_retains_hook(monkeypatch):
     ])
     session = models.get_session(sid)
     assert _pending_stream_hook(session, streams[0]) is not None
+    for rows in (session.messages, session.context_messages):
+        next(row for row in rows if row.get("role")=="user" and row.get("content")=="Prompt 0")["_recovered"]=True
     before = copy.deepcopy((session.messages, session.context_messages, session.tool_calls, session.updated_at))
     original_save = Session.save
     monkeypatch.setattr(Session, "save", Mock(side_effect=OSError("fixture save failure")))
@@ -2003,3 +2009,159 @@ def test_rich_interrupted_owner_proof_rejects_conflicts_and_ambiguity(failure):
         assert recovered.context_messages == before
         assert all(row.get("_recovered_display_only") is True for row in _stream_output(recovered, streams[0]))
         assert not any(row.get("content") == "Old rejected answer" for row in _next_send_history(recovered))
+
+
+@pytest.mark.parametrize('mode,started,legacy', [('deferred',10,False), ('deferred',10.5,False), ('eager',10.5,False), ('deferred',10.5,True), ('eager',10.5,True)])
+@pytest.mark.parametrize('previous_exchange', [False,True])
+@pytest.mark.parametrize('cache_hits', [False,True], ids=['cold','cached'])
+@pytest.mark.parametrize('new_output', [False,True], ids=['empty-stop','output-stop'])
+def test_fractional_stale_repair_keeps_exact_real_next_send(mode,started,legacy,previous_exchange,cache_hits,new_output,monkeypatch,tmp_path):
+    from api import routes
+    started_id=str(started).replace('.', 'p')
+    sid=f'r8-{mode}-{started_id}-{legacy}-{previous_exchange}-{cache_hits}-{new_output}'
+    old_stream=f'{sid}-old'
+    prior=[{'role':'user','content':'Before Q','timestamp':1},
+           {'role':'assistant','content':'Before A','timestamp':2}]
+    if not previous_exchange: prior=[]
+    s=Session(session_id=sid,title='disposable',messages=copy.deepcopy(prior),context_messages=copy.deepcopy(prior))
+    if mode=='deferred':
+        # Provider context was saved after constructing the pending question;
+        # display still relies on the pending intent, matching the review shape.
+        s.context_messages.append({'role':'user','content':'Old Q','timestamp':started})
+    monkeypatch.setattr(routes,'get_webui_session_save_mode',lambda:mode)
+    routes._prepare_chat_start_session_for_stream(s,msg='Old Q',attachments=[],workspace=str(tmp_path),model='test',model_provider=None,stream_id=old_stream,started_at=started)
+    _simulate_restart()
+    repaired=models.get_session(sid)
+    assert repaired.active_stream_id is None
+    assert repaired.pending_user_message is None
+    assert _pending_stream_hook(repaired,old_stream) is not None
+    if legacy:
+        # Existing sidecars produced by the old int-truncating repair must
+        # recover as well as newly materialized exact-time rows.
+        display_owner=next(row for row in repaired.messages if row.get('content')=='Old Q')
+        context_owner=next(row for row in repaired.context_messages if row.get('content')=='Old Q')
+        if mode=='deferred':
+            display_owner['timestamp']=int(started)
+            display_owner.pop('_active_turn_token',None)
+        else:
+            context_owner['timestamp']=int(started)
+        context_owner.pop('_active_turn_token',None)
+        repaired.save()
+    new_stream=f'{sid}-new'
+    new_owner={'role':'user','content':'New Q','timestamp':20}
+    repaired.messages.append(copy.deepcopy(new_owner));repaired.context_messages.append(copy.deepcopy(new_owner))
+    repaired.pending_user_message='New Q';repaired.pending_started_at=20
+    repaired.pending_user_source='webui';repaired.active_stream_id=new_stream
+    models.SESSIONS[sid]=repaired
+    config.STREAMS[new_stream]=queue.Queue();config.CANCEL_FLAGS[new_stream]=threading.Event()
+    agent=Mock();agent.session_id=sid;config.AGENT_INSTANCES[new_stream]=agent
+    config.ACTIVE_RUNS[new_stream]={'session_id':sid,'phase':'running','started_at':time.time()}
+    repaired.save();assert cancel_stream(new_stream) is True
+    new_writer=RunJournalWriter(sid,new_stream)
+    if new_output:new_writer.append_sse_event('token',{'text':'New A'})
+    new_writer.append_sse_event('cancel',{'message':'New Stop'})
+    _simulate_restart();models.get_session(sid)
+    old_writer=RunJournalWriter(sid,old_stream)
+    old_writer.append_sse_event('token',{'text':'Old A'})
+    old_writer.append_sse_event('cancel',{'message':'Old journal now visible'})
+    observed=[]
+    _simulate_restart()
+    for _ in range(3):
+        if not cache_hits: _simulate_restart()
+        assert Session.load(sid) is not None
+        recovered=models.get_session(sid)
+        history=_next_send_history(recovered)
+        observed.append([(r['role'],r.get('content')) for r in history])
+        outputs=[r for r in recovered.messages if r.get('_recovered_stream_id')==old_stream and r.get('content')=='Old A']
+        assert len(outputs)==1
+    expected=[(r['role'],r['content']) for r in prior]+[('user','Old Q'),('assistant','Old A')]
+    if new_output:expected += [('user','New Q'),('assistant','New A')]
+    assert observed==[expected]*3
+    assert _pending_stream_hook(recovered,old_stream) is None
+    assert not outputs[0].get('_recovered_display_only')
+
+
+@pytest.mark.parametrize('branch', ['append-helper','nonempty','core','empty'])
+def test_stale_pending_producers_preserve_fractional_time_and_stamp_before_context(branch,tmp_path,monkeypatch):
+    sid=f'fractional-producer-{branch}'
+    stream=f'{sid}-stream'
+    prior=[{'role':'user','content':'Before Q','timestamp':1}, {'role':'assistant','content':'Before A','timestamp':2}]
+    session=Session(session_id=sid,title='fractional producer',messages=copy.deepcopy(prior) if branch=='nonempty' else [],context_messages=copy.deepcopy(prior) if branch=='nonempty' else [],pending_user_message='Old Q',pending_started_at=10.5,pending_user_source='webui',active_stream_id=stream)
+    original=models._append_recovered_turn_to_context
+    projected=[]
+    def observe(target,row):
+        if row.get('role')=='user' and row.get('content')=='Old Q':projected.append(copy.deepcopy(row))
+        return original(target,row)
+    monkeypatch.setattr(models,'_append_recovered_turn_to_context',observe)
+    if branch=='append-helper':
+        models._append_recovered_pending_turn(session,timestamp=10.5)
+    else:
+        core=tmp_path/'core.json'
+        if branch=='core':
+            import json
+            core.write_text(json.dumps({'messages':prior}))
+            writer=RunJournalWriter(sid,stream)
+            writer.append_sse_event('token',{'text':'Old partial'})
+        assert models._apply_core_sync_or_error_marker(session,core) is True
+    assert projected
+    for row in projected:
+        assert row['timestamp']==10.5 and type(row['timestamp']) is float
+        assert row['_active_turn_token']==f'{stream}:10.5'
+    for rows in (session.messages,session.context_messages):
+        owner=next(row for row in rows if row.get('role')=='user' and row.get('content')=='Old Q')
+        assert owner['timestamp']==10.5
+        assert owner['_active_turn_token']==f'{stream}:10.5'
+
+
+@pytest.mark.parametrize('projection',['display','context'])
+@pytest.mark.parametrize('anchor',['int','float'])
+def test_legacy_int_equivalence_rejects_every_same_second_candidate(projection,anchor):
+    sid=f'legacy-ambiguous-{projection}-{anchor}'
+    streams=_persist_multi_retry_turns(sid,['interrupted','cancelled'],[
+        [('token',{'text':'Old ambiguous answer'})],[('token',{'text':'New answer'})],
+    ],defer_first=True)
+    first=models.get_session(sid)
+    display=next(row for row in first.messages if row.get('role')=='user' and row.get('timestamp')==10)
+    context=first.context_messages[0]
+    display['timestamp'],context['timestamp']=(10,10.5) if anchor=='int' else (10.5,10)
+    # Only one endpoint may be fractional; either projection can carry an
+    # additional same-second row compatible with the integer endpoint.
+    target=first.messages if projection=='display' else first.context_messages
+    duplicate=copy.deepcopy(display if projection=='display' else context)
+    duplicate['timestamp']=10.9
+    target.insert(0,duplicate)
+    first.save();before=copy.deepcopy(first.context_messages)
+    writer=RunJournalWriter(sid,streams[0]);writer.append_sse_event('token',{'text':'Old ambiguous answer'});writer.append_sse_event('cancel',{'message':'Late terminal'})
+    for _ in range(3):
+        models.SESSIONS.clear();recovered=models.get_session(sid)
+        assert recovered.context_messages==before
+        assert all(row.get('_recovered_display_only') is True for row in _stream_output(recovered,streams[0]))
+        assert not any(row.get('content')=='Old ambiguous answer' for row in _next_send_history(recovered))
+
+
+@pytest.mark.parametrize('kind', ['reasoning','tool','error'])
+def test_proven_legacy_owner_is_not_promoted_without_model_visible_answer(kind):
+    sid=f'legacy-provisional-{kind}'
+    streams=_persist_multi_retry_turns(sid,['interrupted','cancelled'],[
+        [],[('token',{'text':'New answer'})],
+    ],defer_first=True)
+    first=models.get_session(sid)
+    display=next(row for row in first.messages if row.get('role')=='user' and row.get('content')=='Prompt 0')
+    context=first.context_messages[0]
+    display.update(timestamp=10.5,_recovered=True,_active_turn_token=f'{streams[0]}:10.5')
+    context.update(timestamp=10,_recovered=True)
+    context.pop('_active_turn_token',None)
+    first.save()
+    writer=RunJournalWriter(sid,streams[0])
+    if kind=='reasoning':writer.append_sse_event('thinking',{'text':'Private saved reasoning'})
+    elif kind=='tool':writer.append_sse_event('tool',{'name':'read_file','tid':'old-card','args':{'path':'fake.txt'}})
+    else:writer.append_sse_event('apperror',{'message':'Old terminal error'})
+    writer.append_sse_event('cancel',{'message':'Old terminal'})
+    models.SESSIONS.clear()
+    recovered=models.get_session(sid)
+    for rows in (recovered.messages,recovered.context_messages):
+        owner=next(row for row in rows if row.get('role')=='user' and row.get('content')=='Prompt 0')
+        assert owner.get('_recovered') is True
+    history=_next_send_history(recovered)
+    assert not any(row.get('content')=='Private saved reasoning' for row in history)
+    assert not any(row.get('content')=='Old terminal error' for row in history)
