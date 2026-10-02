@@ -210,8 +210,17 @@ def test_platform_default_home_uses_localappdata_when_established():
     assert "$platformDefaultHermesHome = $legacyHermesHome" in source
     block = _discovery_block(source)
     assert "Join-Path $platformDefaultHermesHome 'hermes-agent'" in block
-    # Unconditional legacy append must be gone from the discovery block
-    assert "Join-Path $env:USERPROFILE '.hermes\\hermes-agent'" not in block
+    # Legacy USERPROFILE\.hermes must NOT be a server-equivalent candidate;
+    # it stays as a launcher-only rescue after both server passes.
+    server_appends = [
+        m.group(0)
+        for m in re.finditer(r"\$serverCandidates\s*\+=\s*[^\n]+", block)
+    ]
+    assert not any(
+        "USERPROFILE" in a and ".hermes" in a for a in server_appends
+    ), f"legacy .hermes must not be in $serverCandidates: {server_appends!r}"
+    assert "Join-Path $env:USERPROFILE '.hermes\\hermes-agent'" in block
+    assert "$launcherOnlyCandidates" in block
     # Migration must be gated on STATE_DIR not being explicit
     assert (
         "if (-not $env:HERMES_WEBUI_STATE_DIR -and $legacyHermesHome -ne $platformDefaultHermesHome)"
@@ -243,31 +252,35 @@ def test_program_files_only_after_both_server_passes():
     """CORE: stale Program Files source must not beat LOCALAPPDATA pip Agent.
 
     Both run_agent.py and hermes_cli passes over $serverCandidates must complete
-    before any Program Files fallback pass. Otherwise an all-source first pass
-    over a combined list picks Program Files over a working LOCALAPPDATA pip root.
+    before any launcher-only (legacy .hermes + Program Files) fallback pass.
+    Otherwise an all-source first pass over a combined list picks Program Files
+    over a working LOCALAPPDATA pip root.
     """
     block = _discovery_block(_start_ps1_source())
     assert "$serverCandidates = @()" in block
-    assert "$pfCandidates = @()" in block
+    assert "$launcherOnlyCandidates = @()" in block
     server_run = block.index("foreach ($c in $serverCandidates)")
     server_pip = block.index(
         "Test-Path (Join-Path $c 'hermes_cli') -PathType Container"
     )
-    pf_marker = block.index("${env:ProgramW6432}")
-    pf_run = block.index("foreach ($c in $pfCandidates)")
-    assert server_run < server_pip < pf_marker < pf_run, (
-        "server source+pip passes must both precede Program Files fallbacks "
-        f"(server_run@{server_run}, server_pip@{server_pip}, "
-        f"pf_list@{pf_marker}, pf_run@{pf_run})"
+    legacy_marker = block.index(
+        "Join-Path $env:USERPROFILE '.hermes\\hermes-agent'"
     )
-    between = block[server_pip:pf_run]
+    pf_marker = block.index("${env:ProgramW6432}")
+    launcher_run = block.index("foreach ($c in $launcherOnlyCandidates)")
+    assert server_run < server_pip < legacy_marker < pf_marker < launcher_run, (
+        "server source+pip passes must both precede launcher-only legacy+PF "
+        f"(server_run@{server_run}, server_pip@{server_pip}, "
+        f"legacy@{legacy_marker}, pf_list@{pf_marker}, launcher_run@{launcher_run})"
+    )
+    between = block[server_pip:launcher_run]
     assert "if (-not $AgentDir)" in between, (
-        "Program Files source pass must be gated on AgentDir still empty "
+        "launcher-only source pass must be gated on AgentDir still empty "
         "after both server-equivalent passes"
     )
     before_pf = block[:pf_marker]
     assert "$serverCandidates += (Join-Path $root" not in before_pf
-    assert "$pfCandidates += (Join-Path $root" in block[pf_marker:]
+    assert "$launcherOnlyCandidates += (Join-Path $root" in block[pf_marker:]
 
 
 def test_explicit_webui_state_dir_skips_legacy_home_migration():
@@ -292,3 +305,33 @@ def test_explicit_webui_state_dir_skips_legacy_home_migration():
     # Comment documents the explicit-state exception
     assert "Explicit HERMES_WEBUI_STATE_DIR" in source
     assert "must NOT yank HERMES_HOME" in source
+
+
+def test_legacy_hermes_is_launcher_only_before_program_files():
+    """BRICK: legacy-only Agent must still be found after server-equivalent passes.
+
+    %USERPROFILE%\\.hermes\\hermes-agent is not a server candidate (HOME is
+    %USERPROFILE%\\hermes-agent), but master always searched it. Keep it as a
+    launcher-only rescue ahead of Program Files so a legacy-only install is not
+    a hard exit.
+    """
+    block = _discovery_block(_start_ps1_source())
+    server_appends = [
+        m.group(0)
+        for m in re.finditer(r"\$serverCandidates\s*\+=\s*[^\n]+", block)
+    ]
+    assert not any(
+        ".hermes" in a and "hermes-agent" in a for a in server_appends
+    ), f"legacy .hermes must not be appended to $serverCandidates: {server_appends!r}"
+    legacy_pos = block.index("Join-Path $env:USERPROFILE '.hermes\\hermes-agent'")
+    pf_pos = block.index("${env:ProgramW6432}")
+    assert "$launcherOnlyCandidates" in block
+    assert legacy_pos < pf_pos, (
+        "legacy .hermes/hermes-agent must precede Program Files among "
+        f"launcher-only roots (legacy@{legacy_pos}, pf@{pf_pos})"
+    )
+    server_pip = block.index(
+        "Test-Path (Join-Path $c 'hermes_cli') -PathType Container"
+    )
+    assert server_pip < legacy_pos
+

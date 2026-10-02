@@ -131,13 +131,15 @@ jobs:
           }
           exit 0
 
-  # Selection probes for the two CORE layouts from PR #7948 review:
+  # Selection probes for layouts from PR #7948 review:
   # 1) LOCALAPPDATA pip Agent must beat stale Program Files source
   # 2) explicit HERMES_WEBUI_STATE_DIR must keep LOCALAPPDATA HERMES_HOME
   #    despite leftover %USERPROFILE%\.hermes\webui
+  # 3) legacy-only Agent in %USERPROFILE%\.hermes\hermes-agent (no WebUI state)
+  # 4) same legacy-only layout with explicit HERMES_WEBUI_STATE_DIR
   # Stub server.py so start.ps1 runs real discovery/home logic then exits 0.
   start-ps1-selection:
-    name: start.ps1 selection probes (two-install + explicit state)
+    name: start.ps1 selection probes (two-install / explicit state / legacy-only)
     runs-on: windows-latest
     timeout-minutes: 8
 
@@ -150,7 +152,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Probe two-install + explicit-state layouts
+      - name: Probe two-install / explicit-state / legacy-only layouts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -181,7 +183,9 @@ jobs:
             foreach ($k in $EnvMap.Keys) {
               $v = [string]$EnvMap[$k]
               $v = $v.Replace("'", "''")
-              [void]$sb.AppendLine(('${0} = ''{1}''' -f "env:$k", $v))
+              # SetEnvironmentVariable avoids `$env:ProgramFiles(x86) = ...` parse errors
+              # (parens are not valid in bare $env:Name assignment form).
+              [void]$sb.AppendLine(('[Environment]::SetEnvironmentVariable(''{0}'', ''{1}'', ''Process'')' -f $k, $v))
             }
             $repo = $PWD.Path.Replace("'", "''")
             [void]$sb.AppendLine(('Set-Location -LiteralPath ''{0}''' -f $repo))
@@ -200,14 +204,14 @@ jobs:
             $null = $proc.WaitForExit(30000)
             if (-not $proc.HasExited) {
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-              throw "$Label: start.ps1 did not exit within 30s"
+              throw "${Label}: start.ps1 did not exit within 30s"
             }
             $out = if (Test-Path $stdout) { Get-Content $stdout -Raw } else { '' }
             $err = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { '' }
             Write-Host "===== $Label stdout ====="
             Write-Host $out
             if ($err) { Write-Host "===== $Label stderr ====="; Write-Host $err }
-            if ($proc.ExitCode -ne 0) { throw "$Label: start.ps1 exited $($proc.ExitCode)" }
+            if ($proc.ExitCode -ne 0) { throw "${Label}: start.ps1 exited $($proc.ExitCode)" }
             return $out
           }
 
@@ -264,6 +268,53 @@ jobs:
             throw "explicit-state: custom STATE_DIR was not preserved"
           }
           Write-Host "OK probe2: explicit STATE_DIR preserved LOCALAPPDATA HERMES_HOME"
+
+          # Probe 3: legacy-only Agent (no WebUI state) must still be found
+          $local3 = Join-Path $root 'local3'
+          $user3 = Join-Path $root 'user3'
+          $pf3 = Join-Path $root 'pf3'
+          $legacyAgent3 = Join-Path (Join-Path $user3 '.hermes') 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path (Join-Path $legacyAgent3 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path $local3 | Out-Null
+          New-Item -ItemType Directory -Force -Path $pf3 | Out-Null
+          $out3 = Invoke-StartPs1Probe -Label 'legacy-only' -EnvMap @{
+            LOCALAPPDATA = $local3
+            USERPROFILE = $user3
+            ProgramW6432 = $pf3
+            ProgramFiles = $pf3
+            'ProgramFiles(x86)' = $pf3
+          }
+          if ($out3 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$legacyAgent3")) {
+            throw "legacy-only: expected Agent dir $legacyAgent3"
+          }
+          Write-Host "OK probe3: legacy-only Agent found"
+
+          # Probe 4: legacy-only + explicit STATE_DIR (migration gated off)
+          $local4 = Join-Path $root 'local4'
+          $user4 = Join-Path $root 'user4'
+          $pf4 = Join-Path $root 'pf4'
+          $customState4 = Join-Path $root 'custom-state4'
+          $legacyAgent4 = Join-Path (Join-Path $user4 '.hermes') 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path (Join-Path $legacyAgent4 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path $local4 | Out-Null
+          New-Item -ItemType Directory -Force -Path $pf4 | Out-Null
+          New-Item -ItemType Directory -Force -Path $customState4 | Out-Null
+          $out4 = Invoke-StartPs1Probe -Label 'legacy-only-explicit-state' -EnvMap @{
+            LOCALAPPDATA = $local4
+            USERPROFILE = $user4
+            ProgramW6432 = $pf4
+            ProgramFiles = $pf4
+            'ProgramFiles(x86)' = $pf4
+            HERMES_WEBUI_STATE_DIR = $customState4
+          }
+          if ($out4 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$legacyAgent4")) {
+            throw "legacy-only-explicit-state: expected Agent dir $legacyAgent4"
+          }
+          if ($out4 -notmatch [regex]::Escape("PROBE_STATE_DIR=$customState4")) {
+            throw "legacy-only-explicit-state: custom STATE_DIR was not preserved"
+          }
+          Write-Host "OK probe4: legacy-only Agent found with explicit STATE_DIR"
+
 
       - name: Restore server.py
         if: always()

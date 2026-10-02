@@ -146,13 +146,14 @@ if (-not $AgentDir) {
     # HERMES_HOME\hermes-agent → repo sibling → parent (when it looks like an
     # agent root) → _DEFAULT_HERMES_HOME\hermes-agent → HOME\hermes-agent.
     # Complete BOTH source (run_agent.py) and pip-style (hermes_cli) passes over
-    # that list BEFORE trying launcher-only Program Files roots. Folding Program
-    # Files into the same candidate list lets a stale Program Files source outrank
-    # a working LOCALAPPDATA pip Agent on the all-source first pass — the server
-    # never searches Program Files at all. Build incrementally —
-    # ${env:ProgramFiles(x86)} is null on 32-bit Windows and in some constrained
-    # environments, and Join-Path throws on a null Path. Skip any system-wide
-    # root that isn't set so the launcher stays robust across Windows variants.
+    # that list BEFORE trying launcher-only roots (legacy .hermes + Program Files).
+    # Folding those into the same candidate list lets a stale Program Files source
+    # outrank a working LOCALAPPDATA pip Agent on the all-source first pass — the
+    # server never searches Program Files (or USERPROFILE\.hermes) at all. Build
+    # Program Files incrementally — ${env:ProgramFiles(x86)} is null on 32-bit
+    # Windows and in some constrained environments, and Join-Path throws on a
+    # null Path. Skip any system-wide root that isn't set so the launcher stays
+    # robust across Windows variants.
     $serverCandidates = @()
     $serverCandidates += (Join-Path $env:HERMES_HOME 'hermes-agent')
     $repoParent = Split-Path -Parent $RepoRoot
@@ -178,26 +179,33 @@ if (-not $AgentDir) {
             if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
         }
     }
-    # Launcher-only Program Files fallbacks — only after both server passes.
-    # (Server uses XDG /opt /usr/local on POSIX; these have no server equivalent.)
-    $pfCandidates = @()
+    # Launcher-only fallbacks — only after both server-equivalent passes.
+    # Master always searched %USERPROFILE%\.hermes\hermes-agent first; the server
+    # never does (its HOME candidate is %USERPROFILE%\hermes-agent). Keep that
+    # legacy path as a launcher-only rescue AFTER the server-equivalent passes so
+    # a legacy-only Agent is still found, then Program Files (POSIX XDG/opt
+    # equivalents have no Windows server twin). Legacy ahead of Program Files
+    # matches master's precedence among these launcher-only roots.
+    $launcherOnlyCandidates = @()
+    $launcherOnlyCandidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
     foreach ($root in @(${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
-        if ($root) { $pfCandidates += (Join-Path $root 'hermes\hermes-agent') }
+        if ($root) { $launcherOnlyCandidates += (Join-Path $root 'hermes\hermes-agent') }
     }
-    # De-dup: WOW64 can make ProgramFiles == ProgramFiles(x86).
-    $pfCandidates = $pfCandidates | Select-Object -Unique
+    # De-dup: WOW64 can make ProgramFiles == ProgramFiles(x86); legacy may equal
+    # a prior server candidate when HERMES_HOME already points there.
+    $launcherOnlyCandidates = $launcherOnlyCandidates | Select-Object -Unique
     if (-not $AgentDir) {
-        foreach ($c in $pfCandidates) {
+        foreach ($c in $launcherOnlyCandidates) {
             if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf) { $AgentDir = $c; break }
         }
     }
     if (-not $AgentDir) {
-        foreach ($c in $pfCandidates) {
+        foreach ($c in $launcherOnlyCandidates) {
             if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
         }
     }
     # Combined list for the not-found error message.
-    $candidates = @($serverCandidates) + @($pfCandidates)
+    $candidates = @($serverCandidates) + @($launcherOnlyCandidates)
 }
 if (-not $AgentDir) {
     $searched = $candidates -join ', '
