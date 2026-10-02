@@ -3934,8 +3934,11 @@ def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int 
                and str(row.get('_active_turn_token') or '').strip() == token
                for row in context) != 1:
             return None
-    elif not any(str(row.get('_active_turn_token') or '').strip() for row in display_successors):
-        # A tokenless display successor cannot prove which context turn survived.
+    elif owner_position != len(context) - 1 or not any(
+        str(row.get('_active_turn_token') or '').strip() for row in display_successors
+    ):
+        # Without a context successor, only a tail owner has a proven insertion
+        # boundary. Compression summaries or unowned suffixes stay untouched.
         return None
     return context_owner
 

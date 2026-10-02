@@ -1815,3 +1815,32 @@ def test_proven_interrupted_context_save_failure_retains_hook(monkeypatch):
     assert [(row["role"], row["content"]) for row in _next_send_history(recovered)] == [
         ("user", "Prompt 0"), ("assistant", "Old answer"), ("user", "Prompt 1"), ("assistant", "New answer"),
     ]
+
+
+@pytest.mark.parametrize("suffix", [None, "compression-system", "compression-assistant", "unowned-assistant"])
+def test_interrupted_owner_without_context_successor_requires_context_tail(suffix):
+    sid = f"old-context-tail-{suffix}"
+    streams = _persist_multi_retry_turns(sid, ["interrupted", "cancelled"], [
+        [("token", {"text": "Old tail answer"})], [("token", {"text": "New answer"})],
+    ])
+    first = models.get_session(sid)
+    assert not _stream_output(first, streams[0])
+    first.context_messages = [copy.deepcopy(first.context_messages[0])]
+    if suffix is not None:
+        first.context_messages.append({
+            "role": "system" if suffix == "compression-system" else "assistant",
+            "content": "Context compression: newer work only." if suffix.startswith("compression") else "Unowned later answer",
+        })
+    first.save()
+    before = copy.deepcopy(first.context_messages)
+    for _ in range(3):
+        models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+        if suffix is None:
+            assert [(row["role"], row["content"]) for row in _next_send_history(recovered)] == [
+                ("user", "Prompt 0"), ("assistant", "Old tail answer"),
+            ]
+        else:
+            assert recovered.context_messages == before
+            assert not any(row.get("content") == "Old tail answer" for row in _next_send_history(recovered))
+            assert all(row.get("_recovered_display_only") is True for row in _stream_output(recovered, streams[0]))

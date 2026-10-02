@@ -134,8 +134,9 @@ Interrupted output recovered behind a later display user enters provider history
 only when its display owner uniquely matches a context user by exact content,
 timestamp and source (with compatible attachments/API content and turn token),
 and the next context user uniquely matches an authoritative later display turn
-token. A surviving owner without a context successor still requires a token-bearing
-later display turn. Recovery inserts exact-stream output before that next user,
+token. A surviving owner without a context successor must be the context tail and
+still requires a token-bearing later display turn; compression summaries or
+unowned context suffixes do not prove an insertion boundary. Recovery inserts exact-stream output before that next user,
 retaining existing native tool call/result blocks together; truncated display tool
 metadata never becomes a provider call. This placement and hook retirement commit
 in one save, with in-memory rollback on failure. Empty, compressed, duplicate or
