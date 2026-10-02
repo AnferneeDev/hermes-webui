@@ -6772,36 +6772,35 @@ def _save_models_cache_to_disk(
             # other way round (the publishers call this with `_cache_build_cv`
             # released, because a file write must not run inside the catalog
             # lock).
+            # Hold the catalog lock through the rename: invalidation takes
+            # commit -> catalog in that same order and deletes under both.
+            # Otherwise it can revoke the build after this check, delete the
+            # file, and return before this stale rename restores it.
             with _cache_build_cv:
                 superseded = rebuild_seq is not None and _models_rebuild_superseded(
                     rebuild_seq
                 )
-            if superseded or (
-                rebuild_seq is not None
-                and (
-                    # A publisher that passed its check, was descheduled while a
-                    # newer build committed, and only then reached this lock would
-                    # otherwise revert the file it just lost to.
-                    int(rebuild_seq) < _models_disk_committed_seq
-                    or not _models_build_identity_current(
-                        build_fingerprint, build_profile
+                if superseded or (
+                    rebuild_seq is not None
+                    and (
+                        int(rebuild_seq) < _models_disk_committed_seq
+                        or not _models_build_identity_current(
+                            build_fingerprint, build_profile
+                        )
                     )
-                )
-            ):
-                logger.debug(
-                    "discarding models-cache disk commit from superseded rebuild "
-                    "#%s (latest allocated rebuild #%s, latest committed #%s)",
-                    rebuild_seq,
-                    _models_rebuild_seq,
-                    _models_disk_committed_seq,
-                )
-                return
-            os.replace(tmp, str(cache_path))
-            tmp = None
-            if rebuild_seq is not None:
-                _models_disk_committed_seq = max(
-                    _models_disk_committed_seq, int(rebuild_seq)
-                )
+                ):
+                    logger.debug(
+                        "discarding models-cache disk commit from superseded rebuild "
+                        "#%s (latest allocated rebuild #%s, latest committed #%s)",
+                        rebuild_seq, _models_rebuild_seq, _models_disk_committed_seq,
+                    )
+                    return
+                os.replace(tmp, str(cache_path))
+                tmp = None
+                if rebuild_seq is not None:
+                    _models_disk_committed_seq = max(
+                        _models_disk_committed_seq, int(rebuild_seq)
+                    )
     except Exception:
         pass  # Non-fatal -- cache will rebuild on next call
     finally:
@@ -6843,6 +6842,29 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
     return None
 
 
+def _invalidate_models_catalog_epoch() -> None:
+    """Revoke readers and workers, then remove the durable snapshot atomically.
+
+    Lock order is always disk-commit -> catalog. Keeping both through unlink
+    prevents an already-admitted rename from restoring a deleted cache. Readers
+    that loaded disk outside the lock use the epoch to reject those bytes.
+    """
+    global _available_models_cache, _available_models_cache_ts
+    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint
+    global _cache_build_in_progress
+    with _models_cache_disk_commit_lock:
+        with _cache_build_cv:
+            _allocate_models_rebuild_seq()
+            _available_models_cache = None
+            _available_models_cache_ts = 0.0
+            _available_models_live_rebuild_ts = 0.0
+            _available_models_cache_source_fingerprint = None
+            _sync_models_cache_provenance()
+            _cache_build_in_progress = False
+            _cache_build_cv.notify_all()
+            _delete_models_cache_on_disk()
+
+
 def invalidate_models_cache():
     """Force the TTL cache for get_available_models() to be cleared.
 
@@ -6867,28 +6889,10 @@ def invalidate_models_cache():
     boundary this function has to be, even when no successor rebuild is ever
     allocated.
     """
-    global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
-    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
+    _invalidate_models_catalog_epoch()
+    # A full reset also evicts credentials for every profile.
     with _available_models_cache_lock:
-        _available_models_cache = None
-        _available_models_cache_ts = 0.0
-        _available_models_live_rebuild_ts = 0.0
-        _available_models_cache_source_fingerprint = None
-        _sync_models_cache_provenance()
-        # Fence the in-flight generation first: taken under
-        # _available_models_cache_lock, which _allocate_models_rebuild_seq
-        # requires.
-        _allocate_models_rebuild_seq()
-        _cache_build_in_progress = False
-        _cache_build_cv.notify_all()
-        # Clear the credential pool cache too (all profiles). Without this,
-        # tests (and live provider key edits) see a stale CredentialPool from a
-        # prior auth_store payload — the test_credential_pool_providers suite was
-        # hitting this directly. A full reset is intentionally profile-wide.
         _CREDENTIAL_POOL_CACHE.clear()
-    # Also delete the disk cache so the next cold build starts fresh.
-    # Disk delete is outside the lock — file I/O shouldn't block other readers.
-    _delete_models_cache_on_disk()
     try:
         from api.plugin_providers import invalidate_plugin_model_provider_cache
 
@@ -6931,14 +6935,8 @@ def invalidate_provider_models_cache(provider_id: str):
     Args:
         provider_id: canonical provider id (e.g. 'openai', 'anthropic', 'custom:my-key')
     """
-    global _available_models_cache, _available_models_cache_ts
-    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _CREDENTIAL_POOL_CACHE
+    _invalidate_models_catalog_epoch()
     with _available_models_cache_lock:
-        _available_models_cache = None
-        _available_models_cache_ts = 0.0
-        _available_models_live_rebuild_ts = 0.0
-        _available_models_cache_source_fingerprint = None
-        _sync_models_cache_provenance()
         _provider_models_invalidated_ts[provider_id] = time.time()
         # Also evict the credential pool so the next cold path re-loads it.
         # Must evict both the original key and its canonical form (load_pool
@@ -6947,7 +6945,6 @@ def invalidate_provider_models_cache(provider_id: str):
         _cp_tag = _credential_pool_profile_tag()
         _CREDENTIAL_POOL_CACHE.pop((_cp_tag, provider_id), None)
         _CREDENTIAL_POOL_CACHE.pop((_cp_tag, _resolve_provider_alias(provider_id)), None)
-    _delete_models_cache_on_disk()
 
 
 def _get_label_for_model(model_id: str, existing_groups: list) -> str:
@@ -8883,10 +8880,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     _cfg_changed = _current_mtime != _cfg_mtime
 
     # Disk load BEFORE lock: ~0.1ms, lets concurrent requests skip entirely.
-    # Then acquire lock and check memory cache.  Cold path runs inside the lock
-    # so only one thread rebuilds while others wait.
+    # Capture the epoch before that load and reject the bytes if invalidation
+    # advanced it before publication. Cold rebuilds still serialize on the lock.
     disk_groups = None
     stale_disk_groups = None
+    disk_epoch = _models_rebuild_seq
     if _available_models_cache is None and not force_refresh:
         disk_groups = _load_models_cache_from_disk()
         if disk_groups is None:
@@ -8895,6 +8893,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         stale_disk_groups = _load_stale_models_cache_from_disk()
 
     with _available_models_cache_lock:
+        if disk_epoch != _models_rebuild_seq:
+            disk_groups = None
+            stale_disk_groups = None
         # If another thread is already building, wait for its result instead
         # of re-entering the cold path (avoids duplicate 10s zai load_pool calls).
         if should_wait:
@@ -8985,7 +8986,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     return copy.deepcopy(stale_disk_groups)
                 return copy.deepcopy(_static_models_catalog_without_live_probes())
 
-        # Cold path: disk cache hit — use it (fast, no lock contention)
+        # Cold path: disk cache hit — use it only from the captured epoch.
         if disk_groups is not None and not force_refresh:
             _available_models_cache = disk_groups
             _available_models_cache_ts = now
@@ -9496,21 +9497,26 @@ def get_available_models_for_session_visit() -> dict:
                 _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                 return cached
         _mark("memory_cache_miss_loading_disk")
+        disk_epoch = _models_rebuild_seq
         disk_cached = _load_models_cache_from_disk()
         if disk_cached is not None:
             with _available_models_cache_lock:
+                if disk_epoch != _models_rebuild_seq:
+                    disk_cached = None
                 cached = _get_fresh_memory_models_cache(time.monotonic())
                 if cached is not None:
                     _mark("disk_then_memory_cache_hit")
                     _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                     return cached
-                _available_models_cache = copy.deepcopy(disk_cached)
-                _available_models_cache_ts = time.monotonic()
-                _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
-                _sync_models_cache_provenance()
-            _mark("disk_cache_returned")
-            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-            return copy.deepcopy(disk_cached)
+                if disk_cached is not None:
+                    _available_models_cache = copy.deepcopy(disk_cached)
+                    _available_models_cache_ts = time.monotonic()
+                    _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                    _sync_models_cache_provenance()
+            if disk_cached is not None:
+                _mark("disk_cache_returned")
+                _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+                return copy.deepcopy(disk_cached)
 
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()

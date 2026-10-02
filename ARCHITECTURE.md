@@ -501,12 +501,13 @@ against the allocated generation rejects it, so invalidation is a real freshness
 and a newer rebuild that then fails leaves the cache empty instead of resurrecting the
 invalidated catalog.
 
-`invalidate_models_cache()` therefore **advances the allocated generation itself**. Every
-build already running when the cache was invalidated becomes superseded *even when no
-successor rebuild is ever allocated*; otherwise the delayed worker stayed eligible and
-repopulated the catalog that had just been cleared — memory, provenance and the durable file
-alike — and stamped it with a *new* source fingerprint, which is exactly how stale data
-acquires fresh-looking provenance.
+Both `invalidate_models_cache()` and the provider-scoped invalidator used by
+`/api/models/refresh` share one epoch/owner reset. They advance the allocated generation,
+clear memory and provenance, retire the in-flight owner, and delete the durable cache.
+Every build already running becomes superseded *even when no successor rebuild is ever
+allocated*; otherwise a delayed worker could repopulate the cleared catalog under a
+fresh-looking fingerprint. Disk snapshots read before taking the catalog lock (including
+the session-visit warmer) are published only if their captured epoch still matches.
 
 A build's **identity is captured when it starts and re-validated when it publishes**, in
 memory and at the durable commit: the source fingerprint (`_models_cache_source_fingerprint`
@@ -527,9 +528,11 @@ runs with the catalog lock released (a disk write must not hold it). Each build 
 own temp file — unique per build and thread, in the destination directory so the commit stays
 a same-filesystem atomic rename — and the rename is serialized by
 `_models_cache_disk_commit_lock` after re-checking the accepted generation, the last
-committed generation (`_models_disk_committed_seq`, which closes the remaining check-then-use
-window between "validated" and "rename") and the build's source identity. A superseded or
-re-sourced commit discards its temp file and leaves the durable catalog to the build that won.
+committed generation (`_models_disk_committed_seq`) and the build's source identity.
+The catalog lock remains held from that check **through** rename; invalidation takes the
+same fixed order (disk-commit lock, then catalog lock) through deletion, so an admitted
+writer cannot restore a file after invalidation returns. A superseded or re-sourced
+commit discards its temp file and leaves the durable catalog to the build that won.
 
 ---
 

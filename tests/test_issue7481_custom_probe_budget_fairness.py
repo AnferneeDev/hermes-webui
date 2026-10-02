@@ -113,6 +113,8 @@ def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts, clock=None):
 # with a no-op. The concurrency tests below opt back in to the real one, because
 # the durable file is part of what they assert (#7481 review).
 _REAL_SAVE_MODELS_CACHE_TO_DISK = cfg._save_models_cache_to_disk
+_REAL_LOAD_MODELS_CACHE_FROM_DISK = cfg._load_models_cache_from_disk
+_REAL_DELETE_MODELS_CACHE_ON_DISK = cfg._delete_models_cache_on_disk
 
 
 @pytest.fixture(autouse=True)
@@ -1128,7 +1130,8 @@ def test_superseded_publish_does_not_release_the_newer_rebuilds_ownership(
 
     caller_c = threading.Thread(target=_caller_c, name="issue7481-caller-c")
     caller_c.start()
-    assert not caller_c.join(timeout=0.3), "the third caller did not wait for B"
+    caller_c.join(timeout=0.3)
+    assert caller_c.is_alive(), "the third caller did not wait for B"
     assert calls["n"] == 2, "a third rebuild was admitted while the newer one lived"
     assert cfg._models_rebuild_seq == seq_before_c
 
@@ -1212,3 +1215,182 @@ def test_source_edit_during_a_rebuild_discards_the_stale_result(
     # The build owned the slot and nothing superseded it, so it must release it:
     # otherwise the next caller waits out the whole budget for nothing.
     assert cfg._cache_build_in_progress is False
+
+
+@pytest.mark.parametrize("start_successor", [False, True], ids=["a_only", "a_then_b"])
+def test_provider_refresh_revokes_in_flight_catalog(monkeypatch, isolate_models_catalog_state, start_successor):
+    """Provider-scoped invalidation fences A, with or without a successor B."""
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05)
+    old, new = _catalog("older"), _catalog("newer")
+    cache_path = cfg._get_models_cache_path()
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", _REAL_DELETE_MODELS_CACHE_ON_DISK)
+    a_started, release_a = threading.Event(), threading.Event()
+    b_started, release_b = threading.Event(), threading.Event()
+    workers, saves = [], []
+
+    def builder(_builder):
+        workers.append(threading.current_thread())
+        if len(workers) == 1:
+            a_started.set()
+            assert release_a.wait(5)
+            return copy.deepcopy(old)
+        b_started.set()
+        assert release_b.wait(5)
+        return copy.deepcopy(new)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", builder)
+    def record_save(value, **kwargs):
+        saves.append(value)
+        _REAL_SAVE_MODELS_CACHE_TO_DISK(value, **kwargs)
+
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", record_save)
+    try:
+        cfg.get_available_models()
+        assert a_started.wait(2)
+        cfg.invalidate_provider_models_cache("openai")
+        if start_successor:
+            cfg.get_available_models()
+            assert b_started.wait(2)
+        release_a.set()
+        workers[0].join(5)
+        assert not workers[0].is_alive()
+        assert cfg._available_models_cache is None
+        assert cfg._models_cache_provenance is None
+        assert old not in saves
+        assert _written_active_provider(cache_path) is None
+        assert cfg._cache_build_in_progress is start_successor
+        if start_successor:
+            release_b.set()
+            workers[1].join(5)
+            assert not workers[1].is_alive()
+            assert cfg._available_models_cache == new
+            assert saves == [new]
+            assert _written_active_provider(cache_path) == "newer"
+        else:
+            assert saves == []
+            assert _glob_cache_files(cache_path) == []
+    finally:
+        release_a.set()
+        release_b.set()
+        for worker in workers:
+            worker.join(5)
+        assert all(not worker.is_alive() for worker in workers)
+
+
+@pytest.mark.parametrize("start_successor", [False, True], ids=["delete_only", "newer_commit"])
+def test_invalidation_between_final_disk_check_and_rename_cannot_restore_stale_file(
+    monkeypatch, isolate_models_catalog_state, start_successor
+):
+    """Pause the real disk writer at its final rename, not at a mocked save."""
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", _REAL_SAVE_MODELS_CACHE_TO_DISK)
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", _REAL_DELETE_MODELS_CACHE_ON_DISK)
+    path = cfg._get_models_cache_path()
+    old, new = _catalog("older"), _catalog("newer")
+    at_rename, allow_rename = threading.Event(), threading.Event()
+    a_started, release_a = threading.Event(), threading.Event()
+    workers = []
+    real_replace = cfg.os.replace
+
+    def gated_replace(src, dst):
+        if workers and threading.current_thread() is workers[0] and str(dst) == str(path):
+            at_rename.set()
+            assert allow_rename.wait(5)
+        return real_replace(src, dst)
+
+    def builder(_builder):
+        workers.append(threading.current_thread())
+        if len(workers) == 1:
+            a_started.set()
+            assert release_a.wait(5)
+            return copy.deepcopy(old)
+        return copy.deepcopy(new)
+
+    monkeypatch.setattr(cfg.os, "replace", gated_replace)
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", builder)
+    try:
+        cfg.get_available_models()
+        assert a_started.wait(2)
+        release_a.set()
+        assert at_rename.wait(5), "A never reached its final disk rename"
+        invalidated = threading.Event()
+        def invalidate_later():
+            cfg.invalidate_models_cache()
+            invalidated.set()
+        invalidator = threading.Thread(target=invalidate_later)
+        invalidator.start()
+        # Invalidation must not return while A holds the commit through rename.
+        invalidator.join(0.1)
+        assert invalidator.is_alive()
+        allow_rename.set()
+        invalidator.join(5)
+        assert invalidated.is_set()
+        workers[0].join(5)
+        if start_successor:
+            cfg.get_available_models()
+            assert cfg._available_models_cache == new
+        assert not workers[0].is_alive()
+        for worker in workers[1:]:
+            worker.join(5)
+            assert not worker.is_alive()
+        assert _written_active_provider(path) == ("newer" if start_successor else None)
+        assert _glob_cache_files(path) == ([path.name] if start_successor else [])
+    finally:
+        release_a.set()
+        allow_rename.set()
+        for worker in workers:
+            worker.join(5)
+        assert all(not worker.is_alive() for worker in workers)
+
+
+@pytest.mark.parametrize("session_visit", [False, True], ids=["normal_cold_path", "session_visit"])
+def test_preloaded_disk_snapshot_is_not_published_after_invalidation(
+    monkeypatch, isolate_models_catalog_state, session_visit
+):
+    """An already-read disk value must not cross the post-invalidation memory lock."""
+    _configure(monkeypatch, active_base_url=None)
+    path = cfg._get_models_cache_path()
+    stale = _catalog("older")
+    _REAL_SAVE_MODELS_CACHE_TO_DISK(stale)
+    assert _written_active_provider(path) == "older"
+    loaded, resume = threading.Event(), threading.Event()
+    reader = None
+    outcome = {}
+
+    def gated_load():
+        snapshot = _REAL_LOAD_MODELS_CACHE_FROM_DISK()
+        if snapshot is not None:
+            loaded.set()
+            assert resume.wait(5)
+        return snapshot
+
+    def read_catalog():
+        try:
+            outcome["result"] = (
+                cfg.get_available_models_for_session_visit()
+                if session_visit else cfg.get_available_models(prefer_cache=True)
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", gated_load)
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", _REAL_DELETE_MODELS_CACHE_ON_DISK)
+    try:
+        reader = threading.Thread(target=read_catalog, name="issue7481-disk-reader")
+        reader.start()
+        assert loaded.wait(5), "the disk read was not intercepted"
+        cfg.invalidate_models_cache()
+        assert not path.exists()
+        resume.set()
+        reader.join(5)
+        assert not reader.is_alive()
+        assert "error" not in outcome, outcome
+        assert cfg._available_models_cache != stale
+        assert _written_active_provider(path) != "older"
+    finally:
+        resume.set()
+        if reader is not None:
+            reader.join(5)
+            assert not reader.is_alive()
