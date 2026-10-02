@@ -257,6 +257,20 @@ class TestAutolinkCjkProseContinuation:
         assert "</a>，節錄原文）" in out
         assert "</a>；文件也寫用量在那裡看）" in out
 
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_uts46_ideographic_dot_remains_in_authority(self, driver_path, prefix):
+        url = "https://example。com/path"
+        out = _render(driver_path, prefix + url)
+        assert f'href="{url}"' in out
+        assert f">{url}</a>" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_raw_cjk_path_preserves_interior_cjk_punctuation(self, driver_path, prefix):
+        url = "https://example.com/日本語，続き"
+        out = _render(driver_path, prefix + url)
+        assert f'href="{url}"' in out
+        assert f">{url}</a>" in out
+
     @pytest.mark.parametrize("iri_char", ["—", "’"])
     def test_outer_pass_preserves_unicode_iri_path_characters(self, driver_path, iri_char):
         url = f"https://example.com/owner{iri_char}s-guide"
