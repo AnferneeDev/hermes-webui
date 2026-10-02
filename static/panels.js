@@ -25,6 +25,7 @@ let _currentCronDetail = null; // full cron job object
 let _currentCronDetailKey = '';
 let _cronMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _cronPreFormDetail = null; // snapshot of prior selection when entering a form
+let _cronModelPickerTouched = false; // true once the user changes the model picker in the current form
 let _showAllCronProfiles = false;
 let _cronOtherProfileCount = 0;
 let _currentWorkspaceDetail = null; // { path, name, is_default }
@@ -1232,8 +1233,29 @@ function _renderCronDetail(job){
   if (!title || !body) return;
   title.textContent = job.name || job.schedule_display || '(unnamed)';
   const status = _cronStatusMeta(job);
-  const nextRun = job.next_run_at ? new Date(job.next_run_at).toLocaleString() : t('not_available');
-  const lastRun = job.last_run_at ? new Date(job.last_run_at).toLocaleString() : t('never');
+  // #7140: render `next_run_at` / `last_run_at` in the zone the timestamp
+  // itself was stamped in — NOT the operator's browser zone, and NOT a
+  // single process-wide server zone.
+  //
+  // The agent serialises these timestamps with the offset of the zone the
+  // job was scheduled in (per-profile: `hermes_time._resolve_timezone_name()`
+  // reads the ACTIVE PROFILE's config.yaml `timezone`).  So on a UTC
+  // container whose profile configures `timezone: America/New_York` the
+  // value on the wire is "2026-09-24T09:00:00-07:00" and the operator must
+  // read 9:00 AM — neither the browser zone nor `_server_tz_offset()` knows
+  // that, and per-profile the same process can host jobs on different
+  // offsets (DST flips the offset twice a year too).
+  //
+  // `_formatInIsoTz()` parses the ±HH:MM out of the string, shifts the
+  // instant by it and formats with timeZone:'UTC' — so the wall clock comes
+  // from the job's own data.  Fallback for a value with no offset (naive):
+  // render it in the browser zone exactly like the pre-fix panel did
+  // (`new Date(value).toLocaleString()`) — a naive string has no
+  // trustworthy server offset to apply, so the panel always renders.
+  const _isoTz = (typeof _formatInIsoTz === 'function') ? _formatInIsoTz : () => null;
+  const _fmtDate = (value) => _isoTz(value) || new Date(value).toLocaleString();
+  const nextRun = job.next_run_at ? _fmtDate(job.next_run_at) : t('not_available');
+  const lastRun = job.last_run_at ? _fmtDate(job.last_run_at) : t('never');
   const schedule = job.schedule_display || (job.schedule && job.schedule.expression) || '';
   const skills = Array.isArray(job.skills) && job.skills.length ? job.skills.join(', ') : '—';
   const deliver = job.deliver || 'local';
@@ -1273,6 +1295,7 @@ function _renderCronDetail(job){
         <p>Switch to ${esc(ownerProfileLabel)} to run, edit, or inspect live status and output for this cron job.</p>
       </div>` : '';
   const toastNotifications = job.toast_notifications !== false;
+  const badgeNotifications = job.badge_notifications !== false;
   const outputTitle = _cronOutputTitle(job);
   const skillsRow = isNoAgent ? '' : `<div class="detail-row"><div class="detail-row-label">${esc(t('cron_skills_label') || 'Skills')}</div><div class="detail-row-value">${esc(skills)}</div></div>`;
   const instructionCard = isNoAgent ? _cronScriptCardHtml(job) : _cronAgentPromptCardHtml(job);
@@ -1292,6 +1315,7 @@ function _renderCronDetail(job){
         ${showOwnerRow ? `<div class="detail-row"><div class="detail-row-label">Owner profile</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(ownerProfileTitle)}">${esc(ownerProfileLabel)}</span></div></div>` : ''}
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_profile_label') || 'Profile')}</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(profileTitle)}">${esc(profileLabel)}</span></div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</div><div class="detail-row-value"><span class="detail-badge ${toastNotifications ? 'active' : ''}">${esc(toastNotifications ? (t('cron_toast_notifications_enabled') || 'Enabled') : (t('cron_toast_notifications_disabled') || 'Disabled'))}</span></div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('cron_badge_notifications_label') || 'Tasks badge')}</div><div class="detail-row-value"><span class="detail-badge ${badgeNotifications ? 'active' : ''}">${esc(badgeNotifications ? (t('cron_badge_notifications_enabled') || 'Enabled') : (t('cron_badge_notifications_disabled') || 'Disabled'))}</span></div></div>
         ${skillsRow}
         ${lastError}
       </div>
@@ -1507,11 +1531,50 @@ function editCurrentCron(){
   if (!_currentCronDetail) return;
   openCronEdit(_currentCronDetail);
 }
+function _cronScheduleForEdit(job){
+  // #7352: when the user opens an existing job for edit or duplicate, the
+  // editable field must hold the canonical Agent-parseable schedule, not
+  // the human-readable ``schedule_display`` ("once at ..."). The Agent
+  // parser at cron/jobs.py rejects the display form with ValueError and
+  // the resulting round-trip has been failing with HTTP 500 since the
+  // initial WebUI release.
+  if(!job) return '';
+  const sched = job.schedule;
+  // Only the "once at ..." label is unparseable; every other schedule_display
+  // form the Agent emits (`every monday 9am`, `every 30m`, ...) round-trips
+  // through parse_schedule() AND is what the user actually typed. Prefer it
+  // over the canonical `expr`, otherwise editing or duplicating a
+  // natural-language recurring job silently rewrites it to raw cron
+  // (`every monday 9am` -> `0 9 * * 1`) — the Agent rebuilds schedule_display
+  // from whatever we submit, so the rewrite sticks.
+  const display = job.schedule_display;
+  const displayIsParseable = Boolean(display) && !/^\s*once at\s+/i.test(display);
+  if(sched && typeof sched === 'object'){
+    // One-shot: schedule_display is purely presentation; run_at is what the
+    // parser accepts.
+    if(sched.kind === 'once' && sched.run_at) return sched.run_at;
+    if(displayIsParseable) return display;
+    // Recurring cron: the current Agent schema is ``expr``; some legacy
+    // payloads still expose ``expression`` — accept either.
+    if(sched.expr) return sched.expr;
+    if(sched.expression) return sched.expression;
+    if(sched.run_at) return sched.run_at;
+  }
+  // Final fallback: only use schedule_display if it isn't the "once at ..."
+  // presentation label (which the parser rejects). For any other text
+  // (e.g. interval/every-30m) the display form is also a valid input.
+  if(displayIsParseable){
+    return display;
+  }
+  return '';
+}
+
 function duplicateCurrentCron(){
   if (!_currentCronDetail) return;
   const job = _currentCronDetail;
   if (typeof switchPanel === 'function' && _currentPanel !== 'tasks') switchPanel('tasks');
   _cronPreFormDetail = { ...job };
+  _cronModelPickerTouched = false;
   _editingCronId = null;
   _cronMode = 'create';
   _cronIsDuplicate = true;
@@ -1529,11 +1592,12 @@ function duplicateCurrentCron(){
   }
   _renderCronForm({
     name: dupName,
-    schedule: job.schedule_display || (job.schedule && job.schedule.expression) || '',
+    schedule: _cronScheduleForEdit(job),
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
     toast_notifications: job.toast_notifications !== false,
+    badge_notifications: job.badge_notifications !== false,
     no_agent: !!job.no_agent,
     script: job.script || '',
     model: job.model || '',
@@ -1568,6 +1632,7 @@ let _cronDeliveryOptionsCache=null;
 function openCronCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'tasks') switchPanel('tasks');
   _cronPreFormDetail = _currentCronDetail ? { ..._currentCronDetail } : null;
+  _cronModelPickerTouched = false;
   _editingCronId = null;
   _cronMode = 'create';
   _cronIsDuplicate = false;
@@ -1585,16 +1650,18 @@ function openCronCreate(){
 function openCronEdit(job){
   if (!job) return;
   _cronPreFormDetail = { ...job };
+  _cronModelPickerTouched = false;
   _editingCronId = job.id;
   _cronMode = 'edit';
   _cronSelectedSkills = Array.isArray(job.skills) ? [...job.skills] : [];
   _renderCronForm({
     name: job.name || '',
-    schedule: job.schedule_display || (job.schedule && job.schedule.expression) || '',
+    schedule: _cronScheduleForEdit(job),
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
     toast_notifications: job.toast_notifications !== false,
+    badge_notifications: job.badge_notifications !== false,
     no_agent: !!job.no_agent,
     script: job.script || '',
     model: job.model || '',
@@ -1609,13 +1676,14 @@ function openCronEdit(job){
   loadCronProfiles().then(()=>_refreshCronProfileSelect(job.profile || '')).catch(()=>{});
 }
 
-function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', model='', provider='', isEdit }){
+function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, badge_notifications=true, no_agent=false, script='', model='', provider='', isEdit }){
   const title = $('taskDetailTitle');
   const body = $('taskDetailBody');
   const empty = $('taskDetailEmpty');
   if (!body || !title) return;
   const isNoAgent = !!no_agent;
   const toastNotifications = toast_notifications !== false;
+  const badgeNotifications = badge_notifications !== false;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
   const promptBlock = isNoAgent ? '' : `
         <div class="detail-form-row">
@@ -1718,6 +1786,13 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
             <span>${esc(t('cron_toast_notifications_hint') || 'Show a toast when this cron finishes.')}</span>
           </label>
         </div>
+        <div class="detail-form-row">
+          <label for="cronFormBadgeNotifications">${esc(t('cron_badge_notifications_label') || 'Tasks badge')}</label>
+          <label class="detail-form-check" for="cronFormBadgeNotifications">
+            <input type="checkbox" id="cronFormBadgeNotifications" ${badgeNotifications ? 'checked' : ''}>
+            <span>${esc(t('cron_badge_notifications_hint') || 'Count this job\u0027s completions in the Tasks badge and new-run marker. Turn off for high-frequency silent jobs.')}</span>
+          </label>
+        </div>
         ${skillsBlock}
         <div id="cronFormError" class="detail-form-error" style="display:none"></div>
       </form>
@@ -1817,6 +1892,9 @@ async function _populateCronFormModelSelect(selectedModel, selectedProvider, dis
       sel.appendChild(opt);
     }
     sel.dataset.loaded = '1';
+    // Track deliberate picker changes so an untouched "Default" can keep a
+    // hidden provider-only pin on save (see _cronProviderForClear).
+    sel.addEventListener('change', () => { _cronModelPickerTouched = true; });
   } catch (e) {
     console.warn('Failed to load cron model picker:', e.message);
     // Load failed: dataset.loaded stays unset so saveCronForm omits model/provider
@@ -1902,6 +1980,18 @@ function _cronModelBareName(model, provider) {
   return _modelBareNameForProvider(model, provider);
 }
 
+function _cronProviderForClear(prevDetail, pickerTouched) {
+  // Provider to submit when the picker shows "Default" (no model) on save.
+  // An explicit return to Default honors "Default = no overrides" (#4030) and
+  // clears the provider. An untouched picker must not: provider-only jobs
+  // (a pinned provider with no model) render as "Default" in the combined
+  // picker, so saving any other field would silently erase the pin the user
+  // never touched.
+  const prev = prevDetail || {};
+  if (pickerTouched) return null;
+  return (prev.model == null) ? prev.provider : null;
+}
+
 async function saveCronForm(){
   const nameEl=$('cronFormName');
   const schEl=$('cronFormSchedule');
@@ -1909,6 +1999,7 @@ async function saveCronForm(){
   const delivEl=$('cronFormDeliver');
   const profileEl=$('cronFormProfile');
   const toastEl=$('cronFormToastNotifications');
+  const badgeEl=$('cronFormBadgeNotifications');
   const errEl=$('cronFormError');
   if(!schEl||!errEl) return;
   const isNoAgent = !!(_cronPreFormDetail && _cronPreFormDetail.no_agent);
@@ -1919,6 +2010,7 @@ async function saveCronForm(){
   const deliver=delivEl?delivEl.value:'local';
   const profile=profileEl?profileEl.value:'';
   const toastNotifications=toastEl?!!toastEl.checked:true;
+  const badgeNotifications=badgeEl?!!badgeEl.checked:true;
   errEl.style.display='none';
   if(!schedule){errEl.textContent=t('cron_schedule_required_example');errEl.style.display='';return;}
   if(!isNoAgent && !prompt){errEl.textContent=t('cron_prompt_required');errEl.style.display='';return;}
@@ -1927,7 +2019,7 @@ async function saveCronForm(){
     const modelLoaded = !!(modelEl && modelEl.dataset.loaded === '1');
     const selectedModel = modelEl ? (modelEl.value || '').trim() : '';
     if (_editingCronId) {
-      const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications};
+      const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications, badge_notifications: badgeNotifications};
       if (!isNoAgent) updates.prompt = prompt;
       if (name) updates.name = name;
       if (deliver) updates.deliver = deliver;
@@ -1939,8 +2031,11 @@ async function saveCronForm(){
           updates.model = _cronModelBareName(modelState.model, modelState.model_provider) || null;
           updates.provider = modelState.model_provider || null;
         } else if (modelLoaded) {
+          // "Default" selected (no model). An untouched picker preserves a
+          // hidden provider-only pin; a deliberate return to Default clears
+          // it (#4030 "Default = no overrides").
           updates.model = null;
-          updates.provider = null;
+          updates.provider = _cronProviderForClear(_cronPreFormDetail, _cronModelPickerTouched);
         }
         // else: select not yet populated — omit model/provider to preserve saved value
       }
@@ -1954,7 +2049,7 @@ async function saveCronForm(){
       if (job) openCronDetail(job);
       return;
     }
-    const body={schedule,prompt,deliver,profile: profile, toast_notifications: toastNotifications};
+    const body={schedule,prompt,deliver,profile: profile, toast_notifications: toastNotifications, badge_notifications: badgeNotifications};
     if(_cronIsDuplicate) body.enabled=false;
     if(name)body.name=name;
     if(_cronSelectedSkills.length)body.skills=_cronSelectedSkills;
@@ -5355,8 +5450,13 @@ function _renderExternalNotesSources() {
   const recall = data.automatic_recall_unchanged !== false
     ? `<div class="memory-detail-mtime">${esc(t('external_notes_auto_recall_hint'))}</div>`
     : '';
+  // Same withheld-runtime state as the MCP panel: sources still list, but their
+  // live status/tools are hidden until the profile's runtime scope is confirmed.
+  const scopeNotice = data.runtime_scope === 'unavailable'
+    ? `<div class="memory-detail-mtime">${esc(t('mcp_runtime_scope_unavailable'))}</div>`
+    : '';
   if (!sources.length) {
-    body.innerHTML = `<div class="main-view-content">${recall}<div class="memory-empty">${esc(t('external_notes_empty'))}</div></div>`;
+    body.innerHTML = `<div class="main-view-content">${recall}${scopeNotice}<div class="memory-empty">${esc(t('external_notes_empty'))}</div></div>`;
   } else {
     const selected = sources.find(src => (src.name || '').toLowerCase() === (_notesSelectedSource || '').toLowerCase()) || sources[0];
     _notesSelectedSource = (selected && selected.name) || 'joplin';
@@ -5403,7 +5503,7 @@ function _renderExternalNotesSources() {
       ${searchError}
       ${resultHtml}
     </section>`;
-    body.innerHTML = `<div class="main-view-content">${recall}${recentAiHtml}${searchUi}${previewHtml}${cards}</div>`;
+    body.innerHTML = `<div class="main-view-content">${recall}${scopeNotice}${recentAiHtml}${searchUi}${previewHtml}${cards}</div>`;
   }
   body.style.display = '';
   if (empty) empty.style.display = 'none';
@@ -7069,6 +7169,15 @@ async function switchToProfile(name) {
     S.activeProfileIsDefault = !!data.is_default;
     if (typeof _resetCronUnreadForProfileSwitch === 'function') {
       _resetCronUnreadForProfileSwitch();
+    }
+    // #7509: the slash-skill caches hold the previous profile's disabled-filtered
+    // /api/skills payload, so drop them once the switch has actually succeeded —
+    // otherwise a skill that is enabled in the new profile stays hidden behind the
+    // old payload. Invalidating here (rather than before the POST) also kills any
+    // response still in flight, so the previous profile's reply can't repopulate
+    // the caches after this point (see invalidateSlashSkillCaches in commands.js).
+    if (typeof window !== 'undefined' && typeof window.invalidateSlashSkillCaches === 'function') {
+      window.invalidateSlashSkillCaches();
     }
     const targetActiveProfile = S.activeProfile || 'default';
     let sessionProfileMatchesTarget = true;
@@ -9253,8 +9362,17 @@ async function loadSettingsPanel(){
     _setHiddenTabs(hiddenTabs);
     _applyTabVisibility(hiddenTabs);
     _renderTabVisibilityChips();
+    // #7622 (round 3): the settings payload's `settings.language` is
+    // absent (None) for a fresh install, so an explicit non-empty
+    // value is the user's genuine saved choice.  The browser
+    // navigator hint is now read via the guarded
+    // `_detectBrowserLanguageHint()` helper (round-3 finding 2) so
+    // a throwing `navigator` accessor can no longer abort settings
+    // hydration before model, provider, plugin and extension sections
+    // are populated.  The fallback ternary preserves the pre-#7622
+    // settings-modal behaviour when neither helper is in scope.
     const resolvedLanguage=(typeof resolvePreferredLocale==='function')
-      ? resolvePreferredLocale(settings.language, localStorage.getItem('hermes-lang'))
+      ? resolvePreferredLocale(settings.language, localStorage.getItem('hermes-lang'), _detectBrowserLanguageHint())
       : (settings.language || localStorage.getItem('hermes-lang') || 'en');
     // Keep settings modal and current page strings in sync with the resolved locale.
     if(typeof setLocale==='function'){
@@ -9631,7 +9749,10 @@ async function loadSettingsPanel(){
           return;
         }
         const voices=speechSynthesis.getVoices();
-        ttsVoiceSel.innerHTML='<option value="">Default system voice</option>';
+        // #7582: the rebuilt default option would otherwise be hardcoded
+        // English; route it through the same key the static HTML option
+        // uses so locale switching keeps both call sites in sync.
+        ttsVoiceSel.innerHTML=`<option value="" data-i18n="settings_tts_voice_default_system">${t('settings_tts_voice_default_system')}</option>`;
         voices.forEach(v=>{
           const opt=document.createElement('option');
           opt.value=v.name;opt.textContent=v.name+(v.lang?' ('+v.lang+')':'');
@@ -9766,31 +9887,31 @@ async function loadSettingsPanel(){
 // ── Extensions panel (browser-origin diagnostics + local enable controls) ──
 
 function _extensionStatusLabel(value){
-  return value ? 'Enabled' : 'Disabled';
+  return value ? t('plugins_enabled') : t('plugins_disabled');
 }
 
 function _extensionBooleanBadge(value){
   const cls=value?'extension-status-badge-on':'extension-status-badge-off';
-  return `<span class="extension-status-badge ${cls}">${value?'true':'false'}</span>`;
+  return `<span class="extension-status-badge ${cls}">${value?t('ext_status_true'):t('ext_status_false')}</span>`;
 }
 
 function _extensionAssetList(urls){
   if(!Array.isArray(urls)||urls.length===0){
-    return '<div class="extension-url-empty">None</div>';
+    return '<div class="extension-url-empty">'+t('ext_none')+'</div>';
   }
   return '<ul class="extension-url-list">'+urls.map(url=>`<li><code>${esc(url)}</code></li>`).join('')+'</ul>';
 }
 
 function _extensionWarningList(warnings){
   if(!Array.isArray(warnings)||warnings.length===0){
-    return '<div class="extension-url-empty">No warnings.</div>';
+    return '<div class="extension-url-empty">'+t('ext_no_warnings')+'</div>';
   }
   return '<ul class="extension-warning-list">'+warnings.map(item=>{
     const rawCode=(item&&item.code)||'unknown_warning';
     const code=esc(rawCode);
     const source=esc((item&&item.source)||'unknown');
     const hint=rawCode==='extension_state_unknown_ids'
-      ? '<span>Some saved disabled-extension overrides no longer match the current manifest; re-added extensions with the same id may stay disabled.</span>'
+      ? '<span>'+t('ext_state_unknown_ids_hint')+'</span>'
       : '';
     return `<li><code>${code}</code><span>${source}</span>${hint}</li>`;
   }).join('')+'</ul>';
@@ -9890,8 +10011,8 @@ function _extensionConfigureButton(entry,surface){
 function _extensionInstalledList(extensions,extensionDirConfigured,surface){
   const list=Array.isArray(extensions)?extensions:[];
   if(!list.length){
-    if(!extensionDirConfigured) return '<div class="extension-url-empty">No extension directory is configured.</div>';
-    return '<div class="extension-url-empty">No manifest extensions are installed in the configured bundle.</div>';
+    if(!extensionDirConfigured) return '<div class="extension-url-empty">'+t('settings_extensions_no_dir')+'</div>';
+    return '<div class="extension-url-empty">'+t('settings_extensions_installed_empty')+'</div>';
   }
   return `<div class="extension-installed-list">${list.map(entry=>{
     const id=(entry&&entry.id)||'';
@@ -10035,23 +10156,23 @@ function _extensionSidecarCard(sidecars){
       </div>
       <div class="extension-sidecar-meta">${esc(meta)}</div>
       <div class="extension-sidecar-fields">
-        <div><span>Origin</span><code>${esc(origin)}</code></div>
-        <div><span>Health path</span><code>${esc(healthPath)}</code></div>
-        <div><span>Health URL</span><code>${esc(healthUrl)}</code></div>
-        <div><span>Proxy</span><code>${esc(proxyStatus)}</code></div>
-        <div><span>Proxy path</span><code>${esc(proxyPath)}</code></div>
+        <div><span>${esc(t('ext_sidecar_origin'))}</span><code>${esc(origin)}</code></div>
+        <div><span>${esc(t('ext_sidecar_health_path'))}</span><code>${esc(healthPath)}</code></div>
+        <div><span>${esc(t('ext_sidecar_health_url'))}</span><code>${esc(healthUrl)}</code></div>
+        <div><span>${esc(t('ext_sidecar_proxy'))}</span><code>${esc(proxyStatus)}</code></div>
+        <div><span>${esc(t('ext_sidecar_proxy_path'))}</span><code>${esc(proxyPath)}</code></div>
       </div>
       <div class="extension-sidecar-actions">${proxyButton}</div>
       ${proxyWarning}
       <div class="extension-sidecar-runtime" data-sidecar-runtime-index="${index}" hidden></div>
     </div>`;
-  }).join('')}</div>`:'<div class="extension-url-empty">No loopback sidecars declared.</div>';
+  }).join('')}</div>`:'<div class="extension-url-empty">'+t('ext_sidecars_none')+'</div>';
   return `
     <div class="provider-card extension-sidecars-card">
       <div class="provider-card-header plugin-card-header">
         <div class="provider-card-info">
-          <div class="provider-card-name">Loopback sidecars</div>
-          <div class="provider-card-meta">Declared local companions; health is checked directly from this browser with WebUI credentials omitted.</div>
+          <div class="provider-card-name">${esc(t('ext_sidecars_title'))}</div>
+            <div class="provider-card-meta">${esc(t('ext_sidecars_meta'))}</div>
         </div>
       </div>
       <div class="provider-card-body extension-card-body">
@@ -10144,35 +10265,35 @@ function _renderExtensionsPanel(data,seq){
     <div class="provider-card extension-status-card ${statusClass}">
       <div class="provider-card-header plugin-card-header">
         <div class="provider-card-info">
-          <div class="provider-card-name">Extension runtime</div>
-          <div class="provider-card-meta">Status from /api/extensions/status; toggles persist a local override for installed manifest entries.</div>
+          <div class="provider-card-name">${esc(t('settings_extensions_runtime_title'))}</div>
+          <div class="provider-card-meta">${esc(t('settings_extensions_runtime_status_from'))}</div>
         </div>
         <span class="provider-card-badge ${data&&data.enabled?'':'plugin-card-badge-disabled'}">${_extensionStatusLabel(!!(data&&data.enabled))}</span>
       </div>
       <div class="provider-card-body extension-card-body">
         <div class="extension-summary-grid">
-          <div><span>Extension dir configured</span>${_extensionBooleanBadge(!!(data&&data.extension_dir_configured))}</div>
-          <div><span>Extension dir valid</span>${_extensionBooleanBadge(!!(data&&data.extension_dir_valid))}</div>
-          <div><span>Manifest configured</span>${_extensionBooleanBadge(!!manifest.configured)}</div>
-          <div><span>Manifest loaded</span>${_extensionBooleanBadge(!!manifest.loaded)}</div>
-          <div><span>Manifest status</span><code>${esc(manifest.status||'unknown')}</code></div>
-          <div><span>Manifest entries inspected</span><code>${Number(manifest.entry_count)||0}</code></div>
-          <div><span>Manifest script count</span><code>${Number(manifest.script_count)||0}</code></div>
-          <div><span>Manifest stylesheet count</span><code>${Number(manifest.stylesheet_count)||0}</code></div>
-          <div><span>Manifest sidecar count</span><code>${Number(manifest.sidecar_count)||0}</code></div>
-          <div><span>Final script count</span><code>${scriptCount}</code></div>
-          <div><span>Final stylesheet count</span><code>${styleCount}</code></div>
-          <div><span>Loopback sidecar count</span><code>${sidecarCount}</code></div>
-          <div><span>Installed manifest extensions</span><code>${manifestExtensionCount}</code></div>
-          <div><span>User-disabled extensions</span><code>${userDisabledCount}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_extension_dir_configured'))}</span>${_extensionBooleanBadge(!!(data&&data.extension_dir_configured))}</div>
+          <div><span>${esc(t('settings_extensions_diag_extension_dir_valid'))}</span>${_extensionBooleanBadge(!!(data&&data.extension_dir_valid))}</div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_configured'))}</span>${_extensionBooleanBadge(!!manifest.configured)}</div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_loaded'))}</span>${_extensionBooleanBadge(!!manifest.loaded)}</div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_status'))}</span><code>${esc(manifest.status||'unknown')}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_entries'))}</span><code>${Number(manifest.entry_count)||0}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_scripts'))}</span><code>${Number(manifest.script_count)||0}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_stylesheets'))}</span><code>${Number(manifest.stylesheet_count)||0}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_manifest_sidecars'))}</span><code>${Number(manifest.sidecar_count)||0}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_final_scripts'))}</span><code>${scriptCount}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_final_stylesheets'))}</span><code>${styleCount}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_loopback_sidecars'))}</span><code>${sidecarCount}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_installed_extensions'))}</span><code>${manifestExtensionCount}</code></div>
+          <div><span>${esc(t('settings_extensions_diag_user_disabled'))}</span><code>${userDisabledCount}</code></div>
         </div>
       </div>
     </div>
     <div class="provider-card extension-installed-card">
       <div class="provider-card-header plugin-card-header">
         <div class="provider-card-info">
-          <div class="provider-card-name">Installed manifest extensions</div>
-          <div class="provider-card-meta">Enable or disable already-present local extensions. Reload WebUI to apply injected asset changes to this browser tab.</div>
+          <div class="provider-card-name">${esc(t('settings_extensions_installed_section_title'))}</div>
+          <div class="provider-card-meta">${esc(t('settings_extensions_installed_section_meta'))}</div>
         </div>
       </div>
       <div class="provider-card-body extension-card-body">
@@ -10182,14 +10303,14 @@ function _renderExtensionsPanel(data,seq){
     <div class="provider-card extension-assets-card">
       <div class="provider-card-header plugin-card-header">
         <div class="provider-card-info">
-          <div class="provider-card-name">Final public asset URLs</div>
-          <div class="provider-card-meta">Same-origin URLs that may be injected into the app shell.</div>
+          <div class="provider-card-name">${esc(t('ext_assets_title'))}</div>
+          <div class="provider-card-meta">${esc(t('ext_assets_meta'))}</div>
         </div>
       </div>
       <div class="provider-card-body extension-card-body">
-        <div class="provider-card-label">Scripts</div>
+        <div class="provider-card-label">${esc(t('ext_assets_scripts'))}</div>
         ${_extensionAssetList(scripts)}
-        <div class="provider-card-label extension-section-label">Stylesheets</div>
+        <div class="provider-card-label extension-section-label">${esc(t('ext_assets_styles'))}</div>
         ${_extensionAssetList(styles)}
       </div>
     </div>
@@ -10197,8 +10318,8 @@ function _renderExtensionsPanel(data,seq){
     <div class="provider-card extension-warnings-card">
       <div class="provider-card-header plugin-card-header">
         <div class="provider-card-info">
-          <div class="provider-card-name">Sanitized warnings</div>
-          <div class="provider-card-meta">Codes and coarse sources only; paths and rejected values are not shown.</div>
+          <div class="provider-card-name">${esc(t('ext_warnings_title'))}</div>
+          <div class="provider-card-meta">${esc(t('ext_warnings_meta'))}</div>
         </div>
       </div>
       <div class="provider-card-body extension-card-body">
@@ -12315,11 +12436,22 @@ function _buildAuxProviderOptions(sel,providers,currentProvider){
  autoOpt.value='auto';autoOpt.textContent='auto ('+t('settings_aux_provider_auto')+')';
  if(currentProvider==='auto'||!currentProvider) autoOpt.selected=true;
  sel.appendChild(autoOpt);
+ let matched=currentProvider==='auto'||!currentProvider;
  for(const p of providers){
   const opt=document.createElement('option');
   opt.value=p.slug;opt.textContent=p.name;
-  if(p.slug===currentProvider) opt.selected=true;
+  if(p.slug===currentProvider){opt.selected=true;matched=true;}
   sel.appendChild(opt);
+ }
+ // The configured provider can be absent from the /api/models catalog (e.g. its
+ // group exposes no models). Keep it selectable: with no matching option the
+ // select falls back to its first entry ('auto') and the next Apply would
+ // persist that, silently discarding the configured value.
+ if(!matched&&currentProvider){
+  const configuredOpt=document.createElement('option');
+  configuredOpt.value=currentProvider;configuredOpt.textContent=currentProvider+' (configured)';
+  configuredOpt.selected=true;
+  sel.appendChild(configuredOpt);
  }
 }
 
@@ -12335,6 +12467,16 @@ function _buildAuxModelOptions(sel,provider,providers,currentModel){
  }
  // Find matching provider in cached list
  const pData=providers.find(p=>p.slug===provider);
+ // A provider kept in the list only because its models endpoint failed would
+ // otherwise render as a silent, empty model select. Echo the same hint the
+ // main picker shows instead of implying "no models to choose from". (#7521)
+ if(pData&&pData.modelsEndpointError){
+  const errOpt=document.createElement('option');
+  errOpt.value='';errOpt.disabled=true;
+  errOpt.dataset.modelsEndpointError='1';
+  errOpt.textContent='\u26a0 '+(pData.modelsEndpointError.message||'Models endpoint could not be reached for this provider.');
+  sel.appendChild(errOpt);
+ }
  const modelValues=new Set();
  if(pData&&pData.models){
   for(const modelEntry of pData.models){
@@ -12578,6 +12720,22 @@ function _bindMainAdvancedOptionsButton(){
  btn.addEventListener('click',()=>{if(_mainAdvancedConfig!==null)_openAuxAdvancedOptions('__main__',_mainAdvancedConfig||{});});
 }
 
+// Build the auxiliary picker provider list from /api/models groups.
+// A named custom provider whose /v1/models probe failed still reaches the UI as
+// a group with an empty ``models`` list plus ``models_endpoint_error``
+// (api/config.py). Zero-model groups used to be filtered out here, which made
+// the provider vanish from every auxiliary select even though the main model
+// picker renders that same group together with its unreachable-endpoint hint. (#7521)
+function _auxProvidersFromModelGroups(groups){
+ const list=Array.isArray(groups)?groups:[];
+ return list.filter(g=>g&&g.provider&&((g.models&&g.models.length>0)||(g.extra_models&&g.extra_models.length>0)||g.models_endpoint_error)).map(g=>({
+  slug:g.provider_id||g.provider,
+  name:g.provider,
+  modelsEndpointError:g.models_endpoint_error||null,
+  models:[...(g.models||[]),...(g.extra_models||[])].map(m=>({id:m.id,label:m.label||m.id})),
+ }));
+}
+
 async function _loadAuxiliaryModels(){
  const container=$('auxModelsContainer');
  if(!container) return;
@@ -12592,11 +12750,7 @@ async function _loadAuxiliaryModels(){
   // Build provider list from /api/models groups
   // /api/models returns: { groups: [{ provider: str, provider_id: str, models: [{id,label}] }] }
   const groups=(modelsData&&modelsData.groups)||[];
-  _auxProviders=groups.filter(g=>g.provider&&((g.models&&g.models.length>0)||(g.extra_models&&g.extra_models.length>0))).map(g=>({
-   slug:g.provider_id||g.provider,
-   name:g.provider,
-   models:[...(g.models||[]),...(g.extra_models||[])].map(m=>({id:m.id,label:m.label||m.id})),
-  }));
+  _auxProviders=_auxProvidersFromModelGroups(groups);
   if(auxData&&Object.prototype.hasOwnProperty.call(auxData,'main')){
    _mainAdvancedConfig=auxData.main||{};
   }else{
@@ -12989,7 +13143,7 @@ function startCronPolling(){
             showToast(t('cron_completion_status', c.name, c.status==='error' ? t('status_failed') : t('status_completed')),4000);
           }
           _cronPollSince=Math.max(_cronPollSince,c.completed_at);
-          if(c.job_id) _cronNewJobIds.add(String(c.job_id));
+          if(c.job_id && c.badge_notifications !== false) _cronNewJobIds.add(String(c.job_id));
           if(c.session_id && typeof _markSessionCompletionUnreadIfBackground === 'function'){
             const activeProfile=(typeof S!=='undefined'&&S&&S.activeProfile)||'default';
             _markSessionCompletionUnreadIfBackground(c.session_id, c.message_count, {
@@ -13123,7 +13277,12 @@ function loadMcpServers(){
       list.innerHTML=`<div class="mcp-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('mcp_no_servers'))}</div>`;
       return;
     }
-    list.innerHTML=r.servers.map(s=>{
+    // Live status is withheld while the profile's runtime scope cannot be confirmed
+    // (e.g. a chat turn on this profile is running); say so instead of "not connected".
+    const scopeNotice=r.runtime_scope==='unavailable'
+      ?`<div class="mcp-runtime-notice" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('mcp_runtime_scope_unavailable'))}</div>`
+      :'';
+    list.innerHTML=scopeNotice+r.servers.map(s=>{
       const transportLabel=s.transport==='http'?'HTTP':s.transport==='stdio'?'stdio':(''+(s.transport||'unknown'));
       const transportClass=s.transport==='http'?'mcp-http':s.transport==='stdio'?'mcp-stdio':'mcp-unknown';
       const transportBadge=`<span class="mcp-transport-badge ${transportClass}">${esc(transportLabel)}</span>`;
