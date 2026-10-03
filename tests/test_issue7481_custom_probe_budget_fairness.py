@@ -1464,3 +1464,248 @@ def test_preloaded_disk_snapshot_is_not_published_after_invalidation(
         if reader is not None:
             reader.join(5)
             assert not reader.is_alive()
+
+
+class _BudgetBoundaryClock:
+    """Real clock, except the foreground's post-worker deadline read.
+
+    The budget-boundary foreground winner — ``build_done.wait()`` reporting that
+    the window elapsed while the build has in fact completed — needs the worker
+    to finish inside the gap between ``Event.wait`` timing out and the following
+    ``build_done.is_set()`` re-check, which is a real-clock race no test can
+    schedule. This clock reaches it deterministically through the seam the rest
+    of the module already uses: the foreground's ``time.monotonic()`` read that
+    computes ``timeout_remaining`` (the third one on the calling thread — the
+    cold-path ``now``, the deadline capture, then this) first waits for the
+    builder to finish and then reports the window as already spent, so
+    ``max(0, deadline - now)`` is exactly 0 while the result is already in hand.
+
+    Only the thread that calls ``get_available_models`` counts: the worker's own
+    reads delegate to the real clock, as before.
+    """
+
+    def __init__(self, foreground, builder_done) -> None:
+        self._foreground = foreground
+        self._builder_done = builder_done
+        self._calls = 0
+
+    def monotonic(self) -> float:
+        if threading.current_thread() is self._foreground:
+            self._calls += 1
+            if self._calls >= 3:
+                assert self._builder_done.wait(5.0), "the builder never ran"
+                return time.monotonic() + 3600.0
+        return time.monotonic()
+
+    def time(self) -> float:
+        return time.time()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def _start_foreground_publisher(monkeypatch, modes, *, fresh):
+    """Drive one real foreground cold-path publication and hold its commit.
+
+    Returns ``(publisher, entered_commit, commit_held_release, outcome)`` — the
+    caller owns releasing the commit mutex and joining the thread.
+
+    ``modes`` selects which foreground winner is exercised:
+      * ``"sync"`` — the legacy unbounded path (``budget <= 0``), which publishes
+        on the calling thread;
+      * ``"within_budget"`` — the bounded path whose worker finishes inside the
+        window, so the foreground publishes synchronously;
+      * ``"budget_boundary"`` — ``wait`` reports the window elapsed while the
+        build had completed, so the foreground still publishes.
+
+    The caller must acquire ``cfg._models_cache_disk_commit_lock`` *before*
+    starting the publisher: that is what pins it inside its durable commit, the
+    window the lock-order assertion needs.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(
+        cfg, "_save_models_cache_to_disk", _REAL_SAVE_MODELS_CACHE_TO_DISK
+    )
+    builder_done = threading.Event()
+
+    def builder(_builder):
+        builder_done.set()
+        return copy.deepcopy(fresh)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", builder)
+    monkeypatch.setattr(
+        cfg,
+        "_LIVE_REBUILD_BUDGET_SECONDS",
+        0.0 if modes == "sync" else _BUDGET,
+        raising=False,
+    )
+
+    outcome: dict = {}
+    publisher = threading.Thread(
+        target=lambda: outcome.update(catalog=cfg.get_available_models()),
+        name="issue7481-foreground-publisher",
+    )
+    if modes == "budget_boundary":
+        monkeypatch.setattr(
+            cfg, "time", _BudgetBoundaryClock(publisher, builder_done), raising=False
+        )
+
+    entered_commit = threading.Event()
+    commit_threads: list = []
+
+    def recording_save(cache, **kwargs):
+        commit_threads.append(threading.current_thread())
+        entered_commit.set()
+        return _REAL_SAVE_MODELS_CACHE_TO_DISK(cache, **kwargs)
+
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", recording_save)
+    return publisher, entered_commit, outcome, commit_threads
+
+
+def _assert_no_catalog_lock_taken_for_commit(cfg_module, entered_commit, publisher):
+    """The publisher must own no catalog lock while it commits to disk.
+
+    An invalidator takes the commit mutex and *then* the catalog lock
+    (``_invalidate_models_catalog_epoch``), and the writer itself takes
+    commit -> catalog. A foreground publisher that still owns the catalog lock
+    inside its commit therefore acquires the two in the opposite order, and with
+    both acquisitions unbounded in production the two threads wait on each other
+    forever. This is the deterministic witness for that: prove the catalog lock
+    is free while the publisher sits in its durable commit.
+    """
+    assert entered_commit.wait(5.0), "the foreground never reached its durable commit"
+    acquired = cfg_module._available_models_cache_lock.acquire(timeout=2.0)
+    try:
+        assert acquired, (
+            "the foreground publisher still owns the catalog lock while blocked "
+            "on the commit mutex — a foreground load and an invalidation "
+            "deadlock against each other"
+        )
+    finally:
+        if acquired:
+            cfg_module._available_models_cache_lock.release()
+
+
+@pytest.mark.parametrize(
+    "modes", ["sync", "within_budget", "budget_boundary"]
+)
+def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_commit(
+    monkeypatch, isolate_models_catalog_state, modes
+):
+    """Every foreground publisher commits to disk with no catalog lock held.
+
+    Maintainer re-gate, 2026-10-03: ``get_available_models`` owns the outer
+    ``_available_models_cache_lock`` RLock across its whole cold path, and its
+    synchronous writer / within-budget / budget-boundary publishers called
+    ``_save_models_cache_to_disk`` — which takes commit-lock then catalog-lock —
+    from inside that ownership. ``_invalidate_models_catalog_epoch`` takes the
+    same two in that order, so a publisher blocked on a commit mutex an
+    invalidator already holds, with that invalidator blocked on the catalog lock
+    the publisher owns, is an unbounded cycle: neither the ``/api/models`` load
+    nor the invalidation can finish. The fix allocates/reads the owner, source
+    identity and deadline and updates memory in short catalog critical sections,
+    and runs the durable publication after that critical section has fully
+    ended.
+    """
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", _REAL_DELETE_MODELS_CACHE_ON_DISK)
+    cache_path = cfg._get_models_cache_path()
+    fresh = _catalog("fresh")
+    cfg._models_cache_disk_commit_lock.acquire()
+    try:
+        publisher, entered_commit, outcome, commit_threads = _start_foreground_publisher(
+            monkeypatch, modes, fresh=fresh
+        )
+        publisher.start()
+        _assert_no_catalog_lock_taken_for_commit(cfg, entered_commit, publisher)
+    finally:
+        cfg._models_cache_disk_commit_lock.release()
+        if "publisher" in locals():
+            publisher.join(5.0)
+
+    assert not publisher.is_alive()
+    assert "error" not in outcome, outcome
+    # The foreground winner is the publisher: the durable commit must have been
+    # queued by it (not performed by an out-of-band worker) for every mode,
+    # including the budget-boundary one.
+    assert commit_threads == [publisher], commit_threads
+    # The foreground still honours the pre-existing contract: the caller gets the
+    # fresh catalog and the durable file is written by the time the call returns.
+    assert outcome["catalog"]["active_provider"] == "fresh"
+    assert cfg._available_models_cache == fresh
+    assert _written_active_provider(cache_path) == "fresh"
+    assert _glob_cache_files(cache_path) == [cache_path.name]
+    assert cfg._cache_build_in_progress is False
+
+
+@pytest.mark.parametrize("entry", ["function", "route"], ids=["full_invalidate", "post_refresh_route"])
+@pytest.mark.parametrize("modes", ["sync", "within_budget"])
+def test_foreground_publication_and_invalidation_complete_without_a_lock_cycle(
+    monkeypatch, isolate_models_catalog_state, modes, entry
+):
+    """A foreground publish and a real invalidation must both finish, no cycle.
+
+    The four combinations the re-gate asked for: the synchronous foreground
+    winner and the within-budget one, each against the full invalidator and the
+    actual ``POST /api/models/refresh`` entry point. The test holds the commit
+    mutex so both operations queue behind one real mutex in the documented order,
+    asserts the publisher owns no catalog lock while it waits there (in the
+    broken shape the invalidator would now be blocked on that lock forever),
+    then releases it and requires *bounded* completion of both — no diagnostic
+    escape, no timeout papering over the cycle.
+
+    Afterwards the invalidation must be observable: nothing stale in memory, in
+    provenance, or on disk, and the single-flight slot still released.
+    """
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", _REAL_DELETE_MODELS_CACHE_ON_DISK)
+    cache_path = cfg._get_models_cache_path()
+    seed = _catalog("seed")
+    _REAL_SAVE_MODELS_CACHE_TO_DISK(seed)
+    assert _written_active_provider(cache_path) == "seed"
+
+    fresh = _catalog("fresh")
+    cfg._models_cache_disk_commit_lock.acquire()
+    started = False
+    try:
+        publisher, entered_commit, outcome, _commit_threads = _start_foreground_publisher(
+            monkeypatch, modes, fresh=fresh
+        )
+        publisher.start()
+        started = True
+        _assert_no_catalog_lock_taken_for_commit(cfg, entered_commit, publisher)
+
+        invalidated = threading.Event()
+
+        def invalidate() -> None:
+            if entry == "route":
+                _refresh_provider_via_route("openai")
+            else:
+                cfg.invalidate_models_cache()
+            invalidated.set()
+
+        invalidator = threading.Thread(target=invalidate, name="issue7481-invalidator")
+        invalidator.start()
+        # It is queued behind the commit mutex this test holds — bounded, not
+        # deadlocked.
+        invalidator.join(0.2)
+        assert invalidator.is_alive(), "the invalidation did not queue behind the commit"
+    finally:
+        cfg._models_cache_disk_commit_lock.release()
+        if started:
+            publisher.join(5.0)
+        if "invalidator" in locals():
+            invalidator.join(5.0)
+
+    assert not publisher.is_alive(), "the foreground publication never completed"
+    invalidator.join(0.0)
+    assert not invalidator.is_alive(), "the invalidation never completed"
+    assert invalidated.is_set()
+    assert "error" not in outcome, outcome
+
+    assert cfg._available_models_cache is None, (
+        "the foreground publisher restored a catalog after invalidation"
+    )
+    assert cfg._models_cache_provenance is None
+    assert cfg._available_models_cache_source_fingerprint is None
+    assert _written_active_provider(cache_path) is None
+    assert _glob_cache_files(cache_path) == []
+    assert cfg._cache_build_in_progress is False
