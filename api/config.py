@@ -6785,6 +6785,28 @@ def _models_rebuild_superseded(rebuild_seq: int) -> bool:
     return rebuild_seq < _models_rebuild_seq
 
 
+def _clear_build_in_progress(rebuild_seq: int) -> None:
+    """Release the single-flight slot only if this build still owns it.
+
+    ``_cache_build_in_progress`` is one shared flag, so a build that has been
+    superseded — a newer rebuild was allocated, or an invalidation advanced the
+    generation — must leave it alone: clearing it here would wake waiters to an
+    empty cache and let another cold rebuild start beside the newer one (#7481
+    review). Used by the error paths inside the catalog critical section and by
+    the post-lock durable commit, so it lives at module scope rather than being
+    redefined inside ``get_available_models``.
+    """
+    global _cache_build_in_progress
+    with _cache_build_cv:
+        if _models_rebuild_superseded(rebuild_seq):
+            # A newer rebuild owns the flag now; releasing it here would wake
+            # waiters to an empty cache and let another cold rebuild start
+            # concurrently with the newer one.
+            return
+        _cache_build_in_progress = False
+        _cache_build_cv.notify_all()
+
+
 def _models_build_identity_current(
     build_fingerprint, build_profile
 ) -> bool:
@@ -8911,6 +8933,88 @@ def _save_models_cache_to_disk(
                 pass  # already gone / never created
 
 
+def _commit_models_cache_to_disk_after_lock(
+    cache: dict, rebuild_seq, build_fingerprint, build_profile
+) -> None:
+    """Foreground durable publication, run with the catalog lock NOT held.
+
+    ``get_available_models`` publishes the catalog to memory inside short
+    ``_available_models_cache_lock`` critical sections and *queues* the durable
+    commit for this helper, which the caller runs only after that critical
+    section has fully ended (#7481 review). Calling
+    ``_save_models_cache_to_disk`` while the catalog lock was still held acquired
+    the two locks in the order catalog -> commit, while
+    ``_invalidate_models_catalog_epoch`` (and the writer itself) uses
+    commit -> catalog: a foreground publisher then blocked on a commit mutex an
+    invalidator already held, while that invalidator blocked on the catalog lock
+    the publisher owned. Both acquisitions are unbounded in production, so that
+    is a cycle with no escape — the foreground `/api/models` load and the
+    invalidation would each wait forever.
+
+    Running the commit here keeps the writer's own order (commit -> catalog)
+    intact with no outer catalog ownership held, so the two can never cycle.
+    The single-flight release rides with the commit, so ownership still spans
+    the durable write; ``_clear_build_in_progress`` refuses to release a slot a
+    newer rebuild owns, so a superseded foreground publisher cannot clear the
+    newer build's flag (#7481 review).
+    """
+    try:
+        _save_models_cache_to_disk(
+            cache,
+            rebuild_seq=rebuild_seq,
+            build_fingerprint=build_fingerprint,
+            build_profile=build_profile,
+        )
+    except Exception:
+        logger.debug("models cache disk save failed", exc_info=True)
+    finally:
+        _clear_build_in_progress(rebuild_seq)
+
+
+class _DeferredCatalogPublication:
+    """Hold the models-catalog lock for one cold path, then flush the commits.
+
+    ``get_available_models`` runs its whole cold path under
+    ``_available_models_cache_lock`` and, on the foreground paths, publishes the
+    catalog to memory *and* to disk. Committing to disk while that lock is held
+    acquires the two locks as catalog -> commit, while
+    ``_invalidate_models_catalog_epoch`` and ``_save_models_cache_to_disk``
+    itself take commit -> catalog (#7481 review): a foreground publisher then
+    waits forever on a commit mutex an invalidator already holds, and that
+    invalidator waits forever on the catalog lock the publisher owns. Both
+    acquisitions are unbounded in production, so this is a hard deadlock, not a
+    latency bug.
+
+    This scope owns the catalog lock for the critical section and, on exit,
+    releases it *before* running the queued durable commits. Ordering is the
+    whole point: the exit runs after the ``with`` body (including on the way out
+    of a ``return``), and the release happens first, so the commits below acquire
+    commit -> catalog with no outer catalog ownership — the writer's own order,
+    which cannot cycle with an invalidator.
+
+    The queue is handed to the body (``as deferred``) so the closures inside it
+    can enqueue instead of committing inline.
+    """
+
+    def __init__(self, lock) -> None:
+        self._lock = lock
+        self._commits: list = []
+
+    def __enter__(self) -> list:
+        self._lock.acquire()
+        return self._commits
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # Release exactly the level acquired in __enter__ — the body's own
+        # re-entries (``_cache_build_cv`` shares this RLock) are balanced, so
+        # the lock is fully free from here on. Doing this before the flush is
+        # what removes the cycle; holding it would recreate the deadlock.
+        self._lock.release()
+        while self._commits:
+            _commit_models_cache_to_disk_after_lock(*self._commits.pop(0))
+        return False
+
+
 def _get_fresh_memory_models_cache(now: float) -> dict | None:
     """Return a valid fresh in-memory /api/models cache, or clear stale shapes."""
     global _available_models_cache, _available_models_cache_ts
@@ -11017,7 +11121,17 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     elif force_refresh:
         stale_disk_groups = _load_stale_models_cache_from_disk()
 
-    with _available_models_cache_lock:
+    # Durable commits queued while the catalog lock is held, run after it is
+    # released (#7481 review). A foreground publisher owns
+    # ``_available_models_cache_lock`` for this whole critical section, and the
+    # durable writer takes commit-lock -> catalog-lock — so committing inline
+    # here would acquire the two in the reverse order of
+    # ``_invalidate_models_catalog_epoch`` and deadlock against a concurrent
+    # invalidation. Memory publication stays inside the short critical sections
+    # below; the durable commit is queued and executed by the scope's exit
+    # (after the catalog lock is released) via
+    # ``_commit_models_cache_to_disk_after_lock``.
+    with _DeferredCatalogPublication(_available_models_cache_lock) as deferred_disk_commits:
         if disk_epoch != _models_rebuild_seq:
             # Invalidation advanced the epoch after the unlocked read, so these
             # bytes may describe the catalog it just cleared: they must not be
@@ -11203,21 +11317,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             _active_profile_name if _profile_resolver is not None else None
         )
 
-        def _clear_build_in_progress(rebuild_seq: int):
-            """Release the single-flight slot only if this build still owns it.
-
-            Defined before both publishers (the legacy synchronous path and the
-            bounded worker path) because both use it on their exit paths.
-            """
-            global _cache_build_in_progress
-            with _cache_build_cv:
-                if _models_rebuild_superseded(rebuild_seq):
-                    # A newer rebuild owns the flag now; releasing it here would
-                    # wake waiters to an empty cache and let another cold rebuild
-                    # start concurrently with the newer one (#7481 review).
-                    return
-                _cache_build_in_progress = False
-                _cache_build_cv.notify_all()
+        # ``_clear_build_in_progress`` is the module-level single-flight release
+        # used by every exit path here and by the post-lock durable commit.
 
 
         # Legacy synchronous (unbounded) rebuild — opt-in via budget<=0.
@@ -11276,15 +11377,15 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 )
                 _clear_build_in_progress(rebuild_seq)
                 return copy.deepcopy(result)
-            try:
-                _save_models_cache_to_disk(
-                    result,
-                    rebuild_seq=rebuild_seq,
-                    build_fingerprint=rebuild_source_fingerprint,
-                    build_profile=rebuild_profile,
-                )
-            finally:
-                _clear_build_in_progress(rebuild_seq)
+            # Foreground durable commit, queued rather than performed here: the
+            # caller still holds the catalog lock, and taking the commit mutex in
+            # that state is the lock-order cycle the #7481 review reproduced. The
+            # single-flight release rides with the queued commit (see
+            # _commit_models_cache_to_disk_after_lock), so ownership still spans
+            # it.
+            deferred_disk_commits.append(
+                (result, rebuild_seq, rebuild_source_fingerprint, rebuild_profile)
+            )
             return copy.deepcopy(result)
 
         # ── Bounded rebuild (defense-in-depth) ───────────────────────────────
@@ -11317,11 +11418,17 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         box: dict = {}
 
         def _publish_models_result(
-            result, *, rebuild_seq: int, build_fingerprint, build_profile
+            result,
+            *,
+            rebuild_seq: int,
+            build_fingerprint,
+            build_profile,
+            defer_durable: bool = False,
         ):
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
             global _available_models_cache_source_fingerprint, _models_published_seq
+            deferred = False
             try:
                 with _cache_build_cv:
                     if _models_rebuild_superseded(rebuild_seq):
@@ -11367,6 +11474,17 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _available_models_cache_source_fingerprint = build_fingerprint
                     _models_published_seq = rebuild_seq
                     _sync_models_cache_provenance()
+                if defer_durable:
+                    # Foreground caller: it still owns the outer catalog lock,
+                    # so the durable commit is queued for the post-lock flush
+                    # instead of taking commit -> catalog underneath it (#7481
+                    # review). The single-flight release rides with the queued
+                    # commit, so ownership still spans the durable write.
+                    deferred_disk_commits.append(
+                        (result, rebuild_seq, build_fingerprint, build_profile)
+                    )
+                    deferred = True
+                    return
                 try:
                     _save_models_cache_to_disk(
                         result,
@@ -11383,8 +11501,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 # unconditionally there ended that rebuild's single-flight
                 # ownership and let a third rebuild in beside it (#7481 review).
                 # This also covers the error paths, including anything raised
-                # after the disk I/O.
-                _clear_build_in_progress(rebuild_seq)
+                # after the disk I/O. A deferred (foreground) publication skips
+                # the release here: it is queued, and the flush performs the
+                # commit and then the release, in that order.
+                if not deferred:
+                    _clear_build_in_progress(rebuild_seq)
 
         def _claim_publish() -> bool:
             """Return True iff the caller won the right to publish."""
@@ -11460,6 +11581,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     rebuild_seq=rebuild_seq,
                     build_fingerprint=rebuild_source_fingerprint,
                     build_profile=rebuild_profile,
+                    # Foreground publisher: queue the durable commit for the
+                    # post-catalog-lock flush (#7481 review).
+                    defer_durable=True,
                 )
             return copy.deepcopy(box["result"])
 
@@ -11478,6 +11602,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     rebuild_seq=rebuild_seq,
                     build_fingerprint=rebuild_source_fingerprint,
                     build_profile=rebuild_profile,
+                    # Budget-boundary foreground winner: same deferred durable
+                    # commit as the within-budget path above (#7481 review).
+                    defer_durable=True,
                 )
             return copy.deepcopy(box["result"])
 

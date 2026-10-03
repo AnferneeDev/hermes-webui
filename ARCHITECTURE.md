@@ -682,6 +682,24 @@ same fixed order (disk-commit lock, then catalog lock) through deletion, so an a
 writer cannot restore a file after invalidation returns. A superseded or re-sourced
 commit discards its temp file and leaves the durable catalog to the build that won.
 
+**The two locks have one order everywhere: disk-commit then catalog.** The writer and the
+invalidator both take them that way, so a caller that takes them in the opposite order is a
+deadlock, not a latency bug — and both acquisitions are unbounded in production. A foreground
+publisher used to: `get_available_models` owns the catalog lock across its whole cold path,
+and its synchronous, within-budget and budget-boundary winners called
+`_save_models_cache_to_disk` from inside that ownership, i.e. catalog → commit. A publisher
+blocked on the commit mutex an invalidator held, with that invalidator then blocked on the
+catalog lock the publisher owned, waited on each other forever, so a `/api/models` load and a
+config-save/`/api/models/refresh` invalidation could each hang (#7481 review). The foreground
+paths therefore do not commit inline: memory publication still happens in short
+`_available_models_cache_lock` critical sections (owner, source identity and the absolute
+deadline are read there too), while the durable commit is **queued** and run by
+`_DeferredCatalogPublication` on its way out — after the catalog lock has been released — by
+`_commit_models_cache_to_disk_after_lock`. The caller still gets the cache and the durable
+file populated before `get_available_models` returns, and the single-flight release rides
+with the queued commit, so ownership still spans the durable write. The out-of-band worker
+commits directly, which is correct because it holds no catalog lock by then.
+
 
 ---
 
