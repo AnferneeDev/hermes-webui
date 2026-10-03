@@ -60,7 +60,10 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "_available_models_cache_source_fingerprint", None, raising=False)
     monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
     monkeypatch.setattr(cfg, "_models_rebuild_seq", 0, raising=False)
-    monkeypatch.setattr(cfg, "_models_published_seq", 0, raising=False)
+    # Parity with the fairness fixture: the module drives the real cold path, so a
+    # stale committed sequence from an earlier test would make the durable commit
+    # discard itself (api/config.py `_models_disk_committed_seq` fence).
+    monkeypatch.setattr(cfg, "_models_disk_committed_seq", 0, raising=False)
     monkeypatch.setattr(cfg, "cfg", {}, raising=False)
     # Any provider left in the catalog would otherwise shell out to the Hermes
     # CLI for a live id list; the rebuild must stay network-free apart from the

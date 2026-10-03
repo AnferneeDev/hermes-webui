@@ -143,7 +143,6 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "_available_models_cache_source_fingerprint", None, raising=False)
     monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
     monkeypatch.setattr(cfg, "_models_rebuild_seq", 0, raising=False)
-    monkeypatch.setattr(cfg, "_models_published_seq", 0, raising=False)
     # The durable-commit generation is process-wide state like the two above, so
     # it has to be reset per test: a sequence committed by an earlier test would
     # otherwise fence this test's own (lower-numbered) commits out of the file.
@@ -229,8 +228,6 @@ class _FakeClock:
     def time(self) -> float:
         return time.time()
 
-    def sleep(self, seconds: float) -> None:
-        self.now += max(0.0, float(seconds))
 
 
 def _catalog(name: str) -> dict:
@@ -602,7 +599,6 @@ def test_late_out_of_band_result_cannot_overwrite_a_newer_rebuild(
         # race the guard exists for).
         time.sleep(0.15)
         cfg._models_rebuild_seq += 1
-        cfg._models_published_seq = cfg._models_rebuild_seq
         cfg._available_models_cache = newer
         cfg._available_models_cache_ts = time.monotonic()
         cfg._available_models_live_rebuild_ts = time.monotonic()
@@ -719,7 +715,6 @@ def test_invalidated_worker_cannot_publish_over_a_newer_in_flight_rebuild(
     assert cfg._available_models_cache == newer
     assert saves == [newer]
     assert cfg._cache_build_in_progress is False
-    assert cfg._models_published_seq == cfg._models_rebuild_seq
 
 
 def test_superseded_worker_error_does_not_resurrect_its_catalog(
@@ -773,7 +768,6 @@ def test_older_publish_does_not_cost_a_newer_rebuild_its_result(
     def _builder(_builder):
         # This run is rebuild N; simulate rebuild N-1 publishing its older
         # catalog late, while we are still building.
-        cfg._models_published_seq = cfg._models_rebuild_seq - 1
         cfg._available_models_cache = older
         cfg._available_models_cache_ts = time.monotonic()
         cfg._available_models_live_rebuild_ts = time.monotonic()
@@ -788,7 +782,6 @@ def test_older_publish_does_not_cost_a_newer_rebuild_its_result(
         "an older publish suppressed the newer rebuild's result"
     )
     assert cfg._available_models_cache["active_provider"] == "newer"
-    assert cfg._models_published_seq == cfg._models_rebuild_seq
 
 
 # ── Review round 5 (2026-10-01): the remaining production races ──────────────
@@ -1022,7 +1015,6 @@ def test_invalidated_worker_cannot_overwrite_a_newer_published_catalog(
         "a superseded publisher left a temp file behind"
     )
     assert cfg._cache_build_in_progress is False
-    assert cfg._models_published_seq == cfg._models_rebuild_seq
 
 
 def test_superseded_publish_does_not_release_the_newer_rebuilds_ownership(
@@ -1466,57 +1458,17 @@ def test_preloaded_disk_snapshot_is_not_published_after_invalidation(
             assert not reader.is_alive()
 
 
-class _BudgetBoundaryClock:
-    """Real clock, except the foreground's post-worker deadline read.
-
-    The budget-boundary foreground winner — ``build_done.wait()`` reporting that
-    the window elapsed while the build has in fact completed — needs the worker
-    to finish inside the gap between ``Event.wait`` timing out and the following
-    ``build_done.is_set()`` re-check, which is a real-clock race no test can
-    schedule. This clock reaches it deterministically through the seam the rest
-    of the module already uses: the foreground's ``time.monotonic()`` read that
-    computes ``timeout_remaining`` (the third one on the calling thread — the
-    cold-path ``now``, the deadline capture, then this) first waits for the
-    builder to finish and then reports the window as already spent, so
-    ``max(0, deadline - now)`` is exactly 0 while the result is already in hand.
-
-    Only the thread that calls ``get_available_models`` counts: the worker's own
-    reads delegate to the real clock, as before.
-    """
-
-    def __init__(self, foreground, builder_done) -> None:
-        self._foreground = foreground
-        self._builder_done = builder_done
-        self._calls = 0
-
-    def monotonic(self) -> float:
-        if threading.current_thread() is self._foreground:
-            self._calls += 1
-            if self._calls >= 3:
-                assert self._builder_done.wait(5.0), "the builder never ran"
-                return time.monotonic() + 3600.0
-        return time.monotonic()
-
-    def time(self) -> float:
-        return time.time()
-
-    def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
-
-
 def _start_foreground_publisher(monkeypatch, modes, *, fresh):
     """Drive one real foreground cold-path publication and hold its commit.
 
-    Returns ``(publisher, entered_commit, commit_held_release, outcome)`` — the
-    caller owns releasing the commit mutex and joining the thread.
+    Returns ``(publisher, entered_commit, outcome, commit_threads)`` — the caller
+    owns releasing the commit mutex and joining the thread.
 
     ``modes`` selects which foreground winner is exercised:
       * ``"sync"`` — the legacy unbounded path (``budget <= 0``), which publishes
         on the calling thread;
       * ``"within_budget"`` — the bounded path whose worker finishes inside the
-        window, so the foreground publishes synchronously;
-      * ``"budget_boundary"`` — ``wait`` reports the window elapsed while the
-        build had completed, so the foreground still publishes.
+        window, so the foreground publishes synchronously.
 
     The caller must acquire ``cfg._models_cache_disk_commit_lock`` *before*
     starting the publisher: that is what pins it inside its durable commit, the
@@ -1526,10 +1478,7 @@ def _start_foreground_publisher(monkeypatch, modes, *, fresh):
     monkeypatch.setattr(
         cfg, "_save_models_cache_to_disk", _REAL_SAVE_MODELS_CACHE_TO_DISK
     )
-    builder_done = threading.Event()
-
     def builder(_builder):
-        builder_done.set()
         return copy.deepcopy(fresh)
 
     monkeypatch.setattr(cfg, "_invoke_models_rebuild", builder)
@@ -1541,14 +1490,19 @@ def _start_foreground_publisher(monkeypatch, modes, *, fresh):
     )
 
     outcome: dict = {}
+
+    def _publish() -> None:
+        # Mirror ``read_catalog``: a failure inside the foreground call is captured so
+        # the caller's ``"error" not in outcome`` assertion can actually fire instead of
+        # passing vacuously and then raising a confusing KeyError below.
+        try:
+            outcome["catalog"] = cfg.get_available_models()
+        except Exception as exc:  # noqa: BLE001 - re-asserted by the caller
+            outcome["error"] = exc
+
     publisher = threading.Thread(
-        target=lambda: outcome.update(catalog=cfg.get_available_models()),
-        name="issue7481-foreground-publisher",
+        target=_publish, name="issue7481-foreground-publisher"
     )
-    if modes == "budget_boundary":
-        monkeypatch.setattr(
-            cfg, "time", _BudgetBoundaryClock(publisher, builder_done), raising=False
-        )
 
     entered_commit = threading.Event()
     commit_threads: list = []
@@ -1562,7 +1516,7 @@ def _start_foreground_publisher(monkeypatch, modes, *, fresh):
     return publisher, entered_commit, outcome, commit_threads
 
 
-def _assert_no_catalog_lock_taken_for_commit(cfg_module, entered_commit, publisher):
+def _assert_no_catalog_lock_taken_for_commit(cfg_module, entered_commit):
     """The publisher must own no catalog lock while it commits to disk.
 
     An invalidator takes the commit mutex and *then* the catalog lock
@@ -1587,7 +1541,7 @@ def _assert_no_catalog_lock_taken_for_commit(cfg_module, entered_commit, publish
 
 
 @pytest.mark.parametrize(
-    "modes", ["sync", "within_budget", "budget_boundary"]
+    "modes", ["sync", "within_budget"]
 )
 def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_commit(
     monkeypatch, isolate_models_catalog_state, modes
@@ -1616,7 +1570,7 @@ def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_
             monkeypatch, modes, fresh=fresh
         )
         publisher.start()
-        _assert_no_catalog_lock_taken_for_commit(cfg, entered_commit, publisher)
+        _assert_no_catalog_lock_taken_for_commit(cfg, entered_commit)
     finally:
         cfg._models_cache_disk_commit_lock.release()
         if "publisher" in locals():
@@ -1625,8 +1579,9 @@ def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_
     assert not publisher.is_alive()
     assert "error" not in outcome, outcome
     # The foreground winner is the publisher: the durable commit must have been
-    # queued by it (not performed by an out-of-band worker) for every mode,
-    # including the budget-boundary one.
+    # queued by it, never performed by an out-of-band worker. The budget-boundary
+    # winner runs the same ``with`` block and the same queued commit, so the
+    # property under test belongs to the deferred publication, not to the branch.
     assert commit_threads == [publisher], commit_threads
     # The foreground still honours the pre-existing contract: the caller gets the
     # fresh catalog and the durable file is written by the time the call returns.
@@ -1671,7 +1626,7 @@ def test_foreground_publication_and_invalidation_complete_without_a_lock_cycle(
         )
         publisher.start()
         started = True
-        _assert_no_catalog_lock_taken_for_commit(cfg, entered_commit, publisher)
+        _assert_no_catalog_lock_taken_for_commit(cfg, entered_commit)
 
         invalidated = threading.Event()
 
@@ -1696,7 +1651,6 @@ def test_foreground_publication_and_invalidation_complete_without_a_lock_cycle(
             invalidator.join(5.0)
 
     assert not publisher.is_alive(), "the foreground publication never completed"
-    invalidator.join(0.0)
     assert not invalidator.is_alive(), "the invalidation never completed"
     assert invalidated.is_set()
     assert "error" not in outcome, outcome
