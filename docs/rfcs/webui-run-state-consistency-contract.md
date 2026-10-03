@@ -145,7 +145,9 @@ Text comparison removes only a leading workspace
 tag and a terminal attachment suffix and extracts known native text parts; it
 never rewrites provider payloads or image bytes. Contradictory/malformed identities,
 reused shared identities, and conflicting API content or attachments carried by
-both projections fail closed. Context-only API content and display-only attachment
+both projections fail closed. Missing, null, or empty-string source metadata has
+the legacy WebUI default; non-string source values, including falsy values, never
+authorize provider-context insertion. Context-only API content and display-only attachment
 descriptors do not defeat ownership. The next context user must likewise uniquely
 match an authoritative later display turn token. A surviving owner without a context successor must be the context tail and
 still requires a token-bearing later display turn; compression summaries or

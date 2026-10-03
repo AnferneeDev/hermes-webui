@@ -3951,7 +3951,11 @@ def _journal_user_metadata_key(row):
     if timestamp is not None and (type(timestamp) not in (int, float)
                                  or (isinstance(timestamp, float) and not math.isfinite(timestamp))):
         return None
-    source = row.get('_source') or 'webui'
+    source = row.get('_source')
+    # Only absent/blank string metadata has the legacy WebUI default. Falsy
+    # non-strings are malformed authority, not permission to infer an owner.
+    if source is None or source == '':
+        source = 'webui'
     if not isinstance(source, str):
         return None
     return timestamp, source.strip().casefold()
