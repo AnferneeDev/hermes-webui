@@ -630,9 +630,8 @@ Publication is ordered by **generation, not by wall clock**. Each cold rebuild t
 next sequence number (`_allocate_models_rebuild_seq`), and a result is dropped when it is
 older than the newest *allocated* generation (`_models_rebuild_seq`) — in which case it also
 leaves the build flag alone rather than clearing it, because that flag now belongs to the
-newer rebuild. The published catalog records the sequence it came from
-(`_models_published_seq`) for observability. This matters for the out-of-band publisher,
-which outlives the foreground caller: without the guard it could resurrect a superseded
+newer rebuild. This matters for the out-of-band publisher, which outlives the
+foreground caller: without the guard it could resurrect a superseded
 catalog over a newer one. A timestamp comparison cannot express the ordering, because an
 older build can publish *after* a newer build has already started.
 

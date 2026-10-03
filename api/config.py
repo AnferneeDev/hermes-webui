@@ -6746,7 +6746,6 @@ _cache_build_in_progress = False  # True while a cold path is actively building
 # read that publication as "newer" and wrongly discard the newer build's result
 # (#7481 review).
 _models_rebuild_seq: int = 0
-_models_published_seq: int = 0
 
 
 def _allocate_models_rebuild_seq() -> int:
@@ -7816,7 +7815,6 @@ def _has_explicit_pool_credentials(provider_id: str) -> bool:
     cost more than once per TTL window.
     """
     return bool(_pool_entry_payloads(provider_id))
-_provider_models_invalidated_ts: dict[str, float] = {}  # provider_id -> timestamp of last invalidation
 
 # Disk-backed in-memory cache for get_available_models().
 # Written to disk on every cache population so the cache survives server restarts.
@@ -9127,16 +9125,13 @@ def invalidate_provider_models_cache(provider_id: str):
 
     Also invalidates the full cache so that the next get_available_models()
     call rebuilds all groups cleanly (the rebuilt provider is merged with any
-    other cached groups from the 24h TTL window).  After the next
-    get_available_models() call, _provider_models_invalidated_ts[provider_id]
-    is cleared so the provider's fresh models are used.
+    other cached groups from the 24h TTL window).
 
     Args:
         provider_id: canonical provider id (e.g. 'openai', 'anthropic', 'custom:my-key')
     """
     _invalidate_models_catalog_epoch()
     with _available_models_cache_lock:
-        _provider_models_invalidated_ts[provider_id] = time.time()
         # Also evict the credential pool so the next cold path re-loads it.
         # Must evict both the original key and its canonical form (load_pool
         # may be called with either, and both paths cache under their own key),
@@ -9400,7 +9395,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
-    global _models_published_seq
     # Config mtime check — must come before any config reads.
     # (Test #585 verifies _current_mtime appears before active_provider = None)
     try:
@@ -11353,7 +11347,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _available_models_cache_ts = published_at
                     _available_models_live_rebuild_ts = published_at
                     _available_models_cache_source_fingerprint = rebuild_source_fingerprint
-                    _models_published_seq = rebuild_seq
                     _sync_models_cache_provenance()
             if _superseded:
                 # An invalidated/older generation must not overwrite the disk
@@ -11427,7 +11420,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         ):
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
-            global _available_models_cache_source_fingerprint, _models_published_seq
+            global _available_models_cache_source_fingerprint
             deferred = False
             try:
                 with _cache_build_cv:
@@ -11472,7 +11465,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _available_models_cache_ts = published_at
                     _available_models_live_rebuild_ts = published_at
                     _available_models_cache_source_fingerprint = build_fingerprint
-                    _models_published_seq = rebuild_seq
                     _sync_models_cache_provenance()
                 if defer_durable:
                     # Foreground caller: it still owns the outer catalog lock,
