@@ -3112,7 +3112,7 @@ def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
         return False
     try:
         from api.run_journal import read_run_events
-        journal = read_run_events(session.session_id, stream_id)
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
     except Exception:
         return False
     for event in journal.get('events') or []:
@@ -3163,7 +3163,7 @@ def _run_journal_terminal_state(session, stream_id: str | None) -> str | None:
             read_run_events,
             select_authoritative_terminal_event,
         )
-        journal = read_run_events(session.session_id, stream_id)
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
         terminal = select_authoritative_terminal_event(journal.get('events') or [])
     except Exception:
         return None
@@ -3237,7 +3237,7 @@ def _recoverable_unsaved_gateway_terminal_error(
             read_run_events,
             select_authoritative_terminal_event,
         )
-        journal = read_run_events(session.session_id, stream_id)
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
     except Exception:
         logger.debug(
             "Session %s: failed to read terminal error journal for stream %s",
@@ -3466,7 +3466,7 @@ def _append_journaled_partial_output(
 
     try:
         from api.run_journal import read_run_events
-        journal = read_run_events(session.session_id, stream_id)
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
     except Exception:
         logger.debug(
             "Session %s: failed to read run journal for stream %s",
@@ -4172,21 +4172,6 @@ def _rehome_cancel_journal_context(
     if not isinstance(context, list) or not isinstance(messages, list):
         return
 
-    # Cancel recovery deliberately bypasses the generic text-deduping context
-    # helper. An earlier or successor assistant is allowed to emit identical
-    # text; only the exact recovered stream owns these rows.
-    recovered = []
-    for row in messages:
-        if not (
-            isinstance(row, dict)
-            and row.get('_recovered_from_run_journal') is True
-            and str(row.get('_recovered_stream_id') or '') == str(stream_id)
-        ):
-            continue
-        projected = _recovered_model_context_projection(row)
-        if projected is not None:
-            recovered.append(projected)
-
     remaining = [
         row
         for row in context
@@ -4196,10 +4181,6 @@ def _rehome_cancel_journal_context(
             and str(row.get('_recovered_stream_id') or '') == str(stream_id)
         )
     ]
-    if not recovered:
-        session.context_messages = remaining
-        return
-
     owner_token = str(owner_token or '').strip()
     if not owner_token:
         session.context_messages = remaining
@@ -4221,6 +4202,27 @@ def _rehome_cancel_journal_context(
         return
     owner_position = owner_positions[0]
 
+    # Display rows start without model authority. Only this unique owner can
+    # authorize a candidate projection; do not use text dedupe across turns.
+    recovered = []
+    projected_rows = []
+    for row in messages:
+        if not (
+            isinstance(row, dict)
+            and row.get('_recovered_from_run_journal') is True
+            and str(row.get('_recovered_stream_id') or '') == str(stream_id)
+        ):
+            continue
+        candidate = dict(row)
+        candidate.pop('_recovered_display_only', None)
+        projected = _recovered_model_context_projection(candidate)
+        if projected is not None:
+            recovered.append(projected)
+            projected_rows.append(row)
+    if not recovered:
+        session.context_messages = remaining
+        return
+
     if any(row.get('role') == 'assistant' for row in recovered):
         # Only model-visible assistant output promotes the provisional owner.
         # Display-only reasoning and terminal errors do not answer the prompt.
@@ -4239,6 +4241,8 @@ def _rehome_cancel_journal_context(
             insert_at = index
             break
     session.context_messages = remaining[:insert_at] + recovered + remaining[insert_at:]
+    for row in projected_rows:
+        row.pop('_recovered_display_only', None)
 
 
 def _session_has_pending_journal_retry(session) -> bool:
@@ -4417,11 +4421,7 @@ def _retry_journal_recovery_in_place(
                         continue
                     if candidate_process_token == _JOURNAL_RECOVERY_PROCESS_TOKEN:
                         try:
-                            from api.run_journal import latest_run_summary
-
-                            if not latest_run_summary(
-                                session.session_id, candidate_stream_id
-                            ).get('terminal'):
+                            if not _run_journal_terminal_state(session, candidate_stream_id):
                                 continue
                         except Exception:
                             continue
@@ -4492,11 +4492,7 @@ def _retry_journal_recovery_in_place(
                     # recover a nonterminal durable tail because the old writer
                     # cannot survive into the new interpreter.
                     try:
-                        from api.run_journal import latest_run_summary
-
-                        if not latest_run_summary(
-                            session.session_id, str(stream_id)
-                        ).get('terminal'):
+                        if not _run_journal_terminal_state(session, str(stream_id)):
                             continue
                     except Exception:
                         continue
@@ -4516,6 +4512,7 @@ def _retry_journal_recovery_in_place(
                     dedupe_min_index=owner_index + 1,
                     dedupe_max_index=idx,
                     append_context=False,
+                    display_only=True,
                 )
                 terminal_error_recovered = False
             else:

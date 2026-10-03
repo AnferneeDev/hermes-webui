@@ -491,6 +491,44 @@ def journal_replay_visible(event) -> bool:
     return name not in REPLAY_SKIPPED_SSE_EVENTS
 
 
+def _read_validated_recovery_events(
+    path: Path, session_id: str, run_id: str,
+) -> tuple[list[dict], list[dict]]:
+    """Read one bounded, contiguous owner before granting recovery authority."""
+    events: list[dict] = []
+    line_no = 0
+    try:
+        for line_no, raw, _total_bytes in _iter_bounded_raw_jsonl_lines(
+            path, max_bytes=_SESSION_REPLAY_MAX_BYTES,
+        ):
+            if not raw.strip():
+                continue
+            event = json.loads(raw.decode("utf-8"))
+            expected_seq = len(events) + 1
+            if not isinstance(event, dict) or (
+                type(event.get("seq")) is not int
+                or event["seq"] != expected_seq
+                or event.get("event_id") != f"{run_id}:{expected_seq}"
+                or event.get("run_id") != run_id
+                or event.get("session_id") != session_id
+            ):
+                raise ValueError("recovery_identity_or_sequence")
+            name = event.get("event")
+            if not isinstance(name, str) or not name or event.get("type", name) != name:
+                raise ValueError("recovery_event_type")
+            terminal_state = _terminal_state_for_event(name, event.get("payload"))
+            if (event.get("terminal") is not bool(terminal_state)
+                    or event.get("terminal_state") != terminal_state):
+                raise ValueError("recovery_terminal_identity")
+            if expected_seq > _SESSION_REPLAY_MAX_ROWS:
+                raise ValueError("recovery_limit_rows")
+            events.append(event)
+    except (UnicodeDecodeError, ValueError) as exc:
+        # Never materialize a valid prefix or suffix from a rejected window.
+        return [], [{"line": line_no, "reason": str(exc)}]
+    return events, []
+
+
 def read_run_events(
     session_id: str,
     run_id: str,
@@ -498,9 +536,13 @@ def read_run_events(
     after_seq: int | None = None,
     max_seq: int | None = None,
     session_dir: Path | None = None,
+    validated_recovery: bool = False,
 ) -> dict:
     path = _run_path(session_id, run_id, session_dir=session_dir)
-    events, malformed = _read_jsonl(path)
+    if validated_recovery:
+        events, malformed = _read_validated_recovery_events(path, str(session_id), str(run_id))
+    else:
+        events, malformed = _read_jsonl(path)
     if after_seq is not None:
         events = [event for event in events if int(event.get("seq") or 0) > int(after_seq)]
     if max_seq is not None:

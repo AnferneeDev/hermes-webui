@@ -2184,3 +2184,169 @@ def test_proven_legacy_owner_is_not_promoted_without_model_visible_answer(kind):
     history=_next_send_history(recovered)
     assert not any(row.get('content')=='Private saved reasoning' for row in history)
     assert not any(row.get('content')=='Old terminal error' for row in history)
+
+
+# October 3 gate: cancelled recovery cannot grant model authority by display alone.
+@pytest.mark.parametrize("consumer", ["next-send", "manual-compression"])
+@pytest.mark.parametrize("context_owner", ["empty", "absent", "duplicate", "exact"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_cancelled_display_answer_requires_owner_at_real_model_inputs(
+    consumer, context_owner, cached, monkeypatch,
+):
+    sid = f"gate-cancel-owner-{consumer}-{context_owner}-{cached}"
+    stream = sid + "-run"
+    answer = "Already emitted cancelled answer"
+    session = _start_cancelled_turn(sid, stream)
+    previous = [
+        {"role": "user", "content": "Prior question one", "timestamp": 1},
+        {"role": "assistant", "content": "Prior answer one", "timestamp": 2},
+        {"role": "user", "content": "Prior question two", "timestamp": 3},
+        {"role": "assistant", "content": "Prior answer two", "timestamp": 4},
+    ]
+    session.messages = copy.deepcopy(previous)
+    session.context_messages = copy.deepcopy(previous)
+    session.save()
+    assert cancel_stream(stream)
+    stopped = Session.load(sid)
+    owner = next(row for row in stopped.messages if row.get("role") == "user"
+                 and row.get("content") == "Do the cancellable task.")
+    stopped.context_messages = [] if context_owner == "empty" else copy.deepcopy(previous)
+    if context_owner in {"duplicate", "exact"}:
+        stopped.context_messages.append(copy.deepcopy(owner))
+        if context_owner == "duplicate":
+            stopped.context_messages.append(copy.deepcopy(owner))
+    stopped.save()
+    writer = RunJournalWriter(sid, stream)
+    writer.append_sse_event("token", {"text": answer})
+    writer.append_sse_event("cancel", {"message": "Stopped"})
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    if cached:
+        assert models.get_session(sid) is recovered
+    else:
+        models.SESSIONS.clear()
+        recovered = models.get_session(sid)
+    if consumer == "next-send":
+        inputs = _next_send_history(recovered)
+    else:
+        from tests.test_issue4836_manual_compression_recovery import (
+            _FakeAgent, _FakeCompressor, _FakeHandler, _install_fake_compression_runtime,
+        )
+        from api.routes import _handle_session_compress
+        captured = []
+
+        class RecordingCompressor(_FakeCompressor):
+            def compress(self, messages, current_tokens=None, focus_topic=None):
+                captured.extend(copy.deepcopy(messages))
+                return super().compress(messages, current_tokens, focus_topic)
+
+        class RecordingAgent(_FakeAgent):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.context_compressor = RecordingCompressor()
+
+        _install_fake_compression_runtime(monkeypatch, RecordingAgent)
+        handler = _FakeHandler()
+        _handle_session_compress(handler, {"session_id": sid})
+        assert handler.status == 200, handler.payload()
+        inputs = captured
+    proven = context_owner == "exact"
+    assert any(row.get("content") == answer for row in inputs) is proven
+    outputs = _stream_output(recovered, stream)
+    assert any(row.get("content") == answer for row in outputs)
+    assert all((row.get("_recovered_display_only") is True) is (not proven)
+               for row in outputs if row.get("content") == answer)
+    assert not _pending_stream_hook(recovered, stream)
+
+
+@pytest.mark.parametrize("same_process", [False, True])
+@pytest.mark.parametrize("corruption", [
+    "foreign-session", "foreign-run", "foreign-event", "seq77", "duplicate-seq",
+    "foreign-session-run-seq77", "foreign-terminal-session", "foreign-terminal-run",
+    "bool-seq", "string-seq", "float-seq", "malformed-json", "array-row",
+    "forged-terminal", "hidden-terminal", "wrong-terminal-state",
+])
+def test_cancel_restart_rejects_invalid_entire_journal_before_recovery(
+    corruption, same_process,
+):
+    import json
+    from api.run_journal import _run_path
+    sid = f"gate-journal-{corruption}-{same_process}"
+    stream = sid + "-run"
+    _start_cancelled_turn(sid, stream)
+    assert cancel_stream(stream)
+    writer = RunJournalWriter(sid, stream)
+    writer.append_sse_event("token", {"text": "Validated prefix must not bypass bad suffix"})
+    writer.append_sse_event("token", {"text": " Foreign seq77 answer"})
+    writer.append_sse_event("cancel", {"message": "Terminal"})
+    path = _run_path(sid, stream)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    bad = rows[1]
+    if corruption == "foreign-session":
+        bad["session_id"] = "different-session"
+    elif corruption == "foreign-session-run-seq77":
+        bad.update(session_id="different-session", run_id="different-run",
+                   seq=77, event_id="different-run:77")
+    elif corruption == "foreign-terminal-session":
+        rows[2]["session_id"] = "different-session"
+    elif corruption == "foreign-terminal-run":
+        rows[2].update(run_id="different-run", event_id="different-run:3")
+    elif corruption == "foreign-run":
+        bad["run_id"] = "different-run"
+    elif corruption == "foreign-event":
+        bad["event_id"] = "different-run:2"
+    elif corruption == "seq77":
+        bad.update(seq=77, event_id=f"{stream}:77")
+    elif corruption == "duplicate-seq":
+        bad.update(seq=1, event_id=f"{stream}:1")
+    elif corruption == "bool-seq":
+        rows[0].update(seq=True, event_id=f"{stream}:1")
+    elif corruption == "string-seq":
+        bad.update(seq="2")
+    elif corruption == "float-seq":
+        bad.update(seq=2.0)
+    elif corruption == "array-row":
+        rows[1] = [bad]
+    elif corruption == "forged-terminal":
+        bad.update(terminal=True, terminal_state="completed")
+    elif corruption == "hidden-terminal":
+        rows[2].update(terminal=False)
+    elif corruption == "wrong-terminal-state":
+        rows[2].update(terminal_state="completed")
+    lines = [json.dumps(row) for row in rows]
+    if corruption == "malformed-json":
+        lines[1] = "{unfinished"
+    path.write_text("\n".join(lines) + "\n")
+    if same_process:
+        config.ACTIVE_RUNS.clear()
+        models.SESSIONS.clear()
+    else:
+        _simulate_restart()
+    for _ in range(2):
+        recovered = models.get_session(sid)
+        assert not _stream_output(recovered, stream)
+        assert _pending_stream_hook(recovered, stream) is not None
+        models.SESSIONS.clear()
+
+
+@pytest.mark.parametrize("limit", ["rows", "bytes"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_cancel_recovery_journal_boundaries_are_explicit(limit, oversized, monkeypatch):
+    from api import run_journal
+    sid = f"gate-journal-limit-{limit}-{oversized}"
+    stream = sid + "-run"
+    _start_cancelled_turn(sid, stream)
+    assert cancel_stream(stream)
+    writer = RunJournalWriter(sid, stream)
+    writer.append_sse_event("token", {"text": "Bounded valid answer"})
+    writer.append_sse_event("cancel", {"message": "Terminal"})
+    path = run_journal._run_path(sid, stream)
+    if limit == "rows":
+        monkeypatch.setattr(run_journal, "_SESSION_REPLAY_MAX_ROWS", 1 if oversized else 2)
+    else:
+        size = path.stat().st_size
+        monkeypatch.setattr(run_journal, "_SESSION_REPLAY_MAX_BYTES", size - 1 if oversized else size)
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    assert bool(_stream_output(recovered, stream)) is (not oversized)
+    assert (_pending_stream_hook(recovered, stream) is not None) is oversized

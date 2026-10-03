@@ -111,6 +111,22 @@ evidence. The hook is retired only in the same successful session save that
 commits the recovered projection; a failed save restores the in-memory hook for
 a later retry.
 
+Cancelled journal rows are created display-only (`_recovered_display_only:
+true`). Only a unique exact-token provider-context owner and successful answer
+insertion authorize removing that flag. Missing or duplicate context owners
+retain visible output but cannot feed empty-context next-send replay or manual
+compression. Display-only reasoning and tool anchors retain that flag.
+
+Session-sidecar run-journal recovery consumers, including same-process terminal admission,
+validate the complete bounded read before materializing any row: exact session,
+run and event identity, strictly integer sequences starting at 1 without gaps or
+duplicates, and terminal metadata matching the actual event. A malformed,
+foreign, noncontiguous or over-limit window yields no recovered rows and no
+terminal authority. Recovery reuses the existing 4 MiB / 4,096-row replay limits;
+it does not silently truncate a larger window. The hook remains retryable within
+its existing lifetime. Ordinary journal inspection/replay API reads retain their
+existing behavior; recovery explicitly opts into this stricter boundary.
+
 Journal-recovered segments retain `_recovered_from_run_journal` provenance,
 without the live `_partial` snapshot marker: distinct equal-text segments and
 their tool owner indexes must survive cold loading unchanged. Cancelled-sidecar
