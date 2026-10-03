@@ -332,6 +332,65 @@ def test_bare_source_checkout_yields_to_the_installed_agent(tmp_path):
     assert code == 0, output
 
 
+def test_selected_pip_install_without_a_venv_keeps_its_root(tmp_path):
+    """A selected pip-style Agent is authoritative even with no venv of its own.
+
+    The install at %LOCALAPPDATA% is what both the source-first and pip passes
+    reach first, so it is what api/config.py selects and what master selected
+    too. It has no venv because a pip-style Agent's packages are importable
+    from the interpreter this script already runs, and managed activation
+    returns for it without importing a bootstrap. A venv sitting on a LATER
+    candidate - here %USERPROFILE%\\hermes-agent, the launcher's last server
+    candidate, which master never searched at all - must not take the launch
+    away from it: neither the root nor the interpreter may move.
+    """
+    fixture = tmp_path / "fx"
+    selected = _make_agent(fixture / "local" / "hermes" / "hermes-agent")
+    _make_agent(fixture / "user" / "hermes-agent", venv=True)
+
+    code, output = _run_start_ps1(fixture)
+
+    assert _agent_dir(output) == str(selected), (
+        "the selected install is the one the server would use and the one this "
+        "script used before discovery was aligned with the server; a later venv "
+        "is not authority to move it. Got:\n" + output
+    )
+    assert _python(output) == str(_write_stub_python(fixture)), (
+        "$Python has to stay the interpreter the selected install already works "
+        "with, instead of a venv from a different Agent; got:\n" + output
+    )
+    assert code == 0, output
+
+
+def test_bootstrap_managed_root_without_a_venv_keeps_its_root(tmp_path):
+    """A source checkout whose deps the bootstrap manages keeps its root too.
+
+    Same shape as the pip case above, but the selected root is a checkout with
+    hermes_bootstrap.py and no hermes_cli, so it supplies its own dependencies
+    through the managed hook and needs no venv. Master's hermes_cli-only pass
+    never accepted such a root, so nothing it would have picked was displaced
+    and there is nothing to repair toward: the checkout stays selected, and the
+    later venv must not move either the root or the interpreter.
+    """
+    fixture = tmp_path / "fx"
+    selected = _make_agent(
+        fixture / "local" / "hermes" / "hermes-agent", source=True, bootstrap=True
+    )
+    _make_agent(fixture / "user" / "hermes-agent", venv=True)
+
+    code, output = _run_start_ps1(fixture)
+
+    assert _agent_dir(output) == str(selected), (
+        "a bootstrap-managed checkout needs no venv, so a later one is no reason "
+        "to displace it; got:\n" + output
+    )
+    assert _python(output) == str(_write_stub_python(fixture)), (
+        "$Python has to stay the interpreter the selected checkout already works "
+        "with; got:\n" + output
+    )
+    assert code == 0, output
+
+
 def test_source_checkout_with_its_own_venv_still_wins(tmp_path):
     """Source-first must survive when the checkout can actually be launched."""
     fixture = tmp_path / "fx"

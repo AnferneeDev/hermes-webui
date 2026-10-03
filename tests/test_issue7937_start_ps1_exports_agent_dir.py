@@ -250,9 +250,15 @@ def test_home_hermes_agent_precedes_program_files_roots():
         "HOME/hermes-agent must be appended before Program Files roots "
         f"(home@{home_pos}, pf@{pf_pos})"
     )
-    # LOCALAPPDATA must not ride along in the Program Files loop anymore
-    assert "@($env:LOCALAPPDATA," not in block
-    assert "$env:LOCALAPPDATA, ${env:ProgramW6432}" not in block
+    # LOCALAPPDATA must not ride along in the Program Files loop anymore.
+    # Scope this to the server-candidate list: the narrow repair below rebuilds
+    # master's OWN candidate order on purpose, and master's order does fold
+    # LOCALAPPDATA into the Program Files loop. Asserting it repo-wide would
+    # forbid re-deriving master's list at all, which is the point of the repair.
+    server_block = block[block.index("$serverCandidates = @()") :]
+    server_block = server_block[: server_block.index("Select-Object -Unique")]
+    assert "@($env:LOCALAPPDATA," not in server_block
+    assert "$env:LOCALAPPDATA, ${env:ProgramW6432}" not in server_block
 
 
 def test_program_files_only_after_both_server_passes():

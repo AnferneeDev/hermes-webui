@@ -20,6 +20,11 @@ on:
       - '.github/workflows/native-windows-startup.yml'
   workflow_dispatch:
 
+# Read-only token: this workflow only checks the PR's own tree out and runs
+# start.ps1 against fixtures it creates itself. Nothing here needs write access.
+permissions:
+  contents: read
+
 jobs:
   native-windows-startup:
     name: start.ps1 path discovery (mock hermes-agent)
@@ -165,6 +170,7 @@ jobs:
             'import os, sys'
             "print('PROBE_HERMES_HOME=' + os.environ.get('HERMES_HOME', ''))"
             "print('PROBE_AGENT_DIR=' + os.environ.get('HERMES_WEBUI_AGENT_DIR', ''))"
+            "print('PROBE_PYTHON=' + sys.executable)"
             "print('PROBE_STATE_DIR=' + os.environ.get('HERMES_WEBUI_STATE_DIR', ''))"
             'sys.exit(0)'
           ) -join "`n"
@@ -383,6 +389,67 @@ jobs:
             throw "explicit-state-legacy-webui-state: custom STATE_DIR was not preserved"
           }
           Write-Host "OK probe6: legacy Agent candidate with explicit STATE_DIR and LOCALAPPDATA HERMES_HOME"
+
+          # Probe 7: a selected PIP-STYLE install with no venv of its own keeps
+          # its root AND its interpreter, even though a later candidate has a
+          # venv. The repair that used to run here treated "some later root has
+          # a venv" as authority and moved the launch off a working install;
+          # %USERPROFILE%\hermes-agent is the launcher's last server candidate
+          # and master never searched it at all.
+          $local7 = Join-Path $root 'local7'
+          $user7 = Join-Path $root 'user7'
+          $pf7 = Join-Path $root 'pf7'
+          $selected7 = Join-Path (Join-Path $local7 'hermes') 'hermes-agent'
+          $later7 = Join-Path $user7 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path (Join-Path $selected7 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $later7 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $later7 'venv\Scripts') | Out-Null
+          New-Item -ItemType Directory -Force -Path $local7 | Out-Null
+          New-Item -ItemType Directory -Force -Path $pf7 | Out-Null
+          $out7 = Invoke-StartPs1Probe -Label 'pip-install-no-venv-keeps-root' -EnvMap @{
+            LOCALAPPDATA = $local7
+            USERPROFILE = $user7
+            ProgramW6432 = $pf7
+            ProgramFiles = $pf7
+            'ProgramFiles(x86)' = $pf7
+          }
+          if ($out7 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$selected7")) {
+            throw "pip-install-no-venv-keeps-root: a later venv displaced the selected install $selected7"
+          }
+          $laterVenv7 = Join-Path $later7 'venv\Scripts\python.exe'
+          if ($out7 -match [regex]::Escape("PROBE_PYTHON=$laterVenv7")) {
+            throw "pip-install-no-venv-keeps-root: interpreter moved onto $laterVenv7, which belongs to a different Agent"
+          }
+          Write-Host "OK probe7: selected pip install without a venv keeps its root and interpreter"
+
+          # Probe 8: same layout, but the selected root is a BOOTSTRAP-MANAGED
+          # source checkout (hermes_bootstrap.py, no hermes_cli) and so supplies
+          # its own dependencies. Master's hermes_cli-only pass never accepted
+          # such a root, so there is no displaced install to repair toward and
+          # the checkout stays selected.
+          $local8 = Join-Path $root 'local8'
+          $user8 = Join-Path $root 'user8'
+          $pf8 = Join-Path $root 'pf8'
+          $selected8 = Join-Path (Join-Path $local8 'hermes') 'hermes-agent'
+          $later8 = Join-Path $user8 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path $selected8 | Out-Null
+          Set-Content -Path (Join-Path $selected8 'run_agent.py') -Value '# source checkout'
+          Set-Content -Path (Join-Path $selected8 'hermes_bootstrap.py') -Value 'pass'
+          New-Item -ItemType Directory -Force -Path (Join-Path $later8 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $later8 'venv\Scripts') | Out-Null
+          New-Item -ItemType Directory -Force -Path $local8 | Out-Null
+          New-Item -ItemType Directory -Force -Path $pf8 | Out-Null
+          $out8 = Invoke-StartPs1Probe -Label 'bootstrap-managed-no-venv-keeps-root' -EnvMap @{
+            LOCALAPPDATA = $local8
+            USERPROFILE = $user8
+            ProgramW6432 = $pf8
+            ProgramFiles = $pf8
+            'ProgramFiles(x86)' = $pf8
+          }
+          if ($out8 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$selected8")) {
+            throw "bootstrap-managed-no-venv-keeps-root: a later venv displaced the selected checkout $selected8"
+          }
+          Write-Host "OK probe8: bootstrap-managed checkout without a venv keeps its root"
 
 
       - name: Restore server.py
