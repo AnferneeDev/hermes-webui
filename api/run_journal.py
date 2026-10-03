@@ -498,9 +498,10 @@ def _read_validated_recovery_events(
     events: list[dict] = []
     line_no = 0
     try:
-        for line_no, raw, _total_bytes in _iter_bounded_raw_jsonl_lines(
+        for current_line, raw, _total_bytes in _iter_bounded_raw_jsonl_lines(
             path, max_bytes=_SESSION_REPLAY_MAX_BYTES,
         ):
+            line_no = current_line
             if not raw.strip():
                 continue
             event = json.loads(raw.decode("utf-8"))
