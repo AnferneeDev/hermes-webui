@@ -3,6 +3,7 @@ Hermes Web UI -- HTTP helper functions.
 """
 import base64 as _base64
 import binascii as _binascii
+import errno
 import functools
 import json as _json
 import logging
@@ -41,6 +42,52 @@ _CLIENT_DISCONNECT_ERRORS = (
 )
 
 
+# A peer that vanishes at the *network* layer (a phone that left the LAN, a
+# Tailscale peer that dropped, an ARP entry that went stale) surfaces on the
+# next write as a bare OSError carrying a routing errno — most commonly
+# EHOSTUNREACH ("No route to host"). Those are not BrokenPipe/Reset, so they
+# escape _CLIENT_DISCONNECT_ERRORS and every long-lived SSE strand ends as a
+# 500 + traceback instead of a clean disconnect.
+#
+# OSError itself stays OUT of the tuple on purpose (too broad — it also covers
+# ENOSPC and file errors, see TestClientDisconnectErrorsTuple), so the
+# narrowing lives here, by errno, and is applied by the SSE write helpers.
+_CLIENT_DISCONNECT_ERRNOS = frozenset({
+    errno.EPIPE,
+    errno.ECONNRESET,
+    errno.ECONNABORTED,
+    errno.EHOSTUNREACH,
+    errno.ENETUNREACH,
+    errno.ENETDOWN,
+    errno.EHOSTDOWN,
+    errno.ENOTCONN,
+    errno.ECONNREFUSED,
+    errno.ETIMEDOUT,
+})
+
+
+def _is_client_disconnect_error(exc: BaseException) -> bool:
+    """True when `exc` means "the client is gone", not "the server is broken".
+
+    Narrow by design: the explicit tuple first, then an errno check for the
+    bare-OSError routing failures the tuple deliberately excludes. Anything
+    else (ENOSPC, EACCES, file errors) returns False and still propagates.
+    """
+    if isinstance(exc, _CLIENT_DISCONNECT_ERRORS):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _CLIENT_DISCONNECT_ERRNOS
+
+
+def _as_client_disconnect(exc: OSError) -> ConnectionResetError:
+    """Rebrand a routing-errno OSError as ConnectionResetError.
+
+    The SSE loops in api/routes.py already read `except
+    _CLIENT_DISCONNECT_ERRORS:`, so converting once here fixes every one of
+    them without touching their catches.
+    """
+    return ConnectionResetError(exc.errno, exc.strerror or 'client disconnected')
+
+
 def require(body: dict, *fields) -> None:
     """Phase D: Validate required fields. Raises ValueError with clean message."""
     missing = [f for f in fields if not body.get(f) and body.get(f) != 0]
@@ -67,6 +114,68 @@ def safe_resolve(root: Path, requested: str) -> Path:
     resolved = (root / requested).resolve()
     resolved.relative_to(root.resolve())  # raises ValueError if outside root
     return resolved
+
+
+def split_media_token_ref(text: str, match) -> tuple[str, str] | None:
+    """Split a MEDIA regex match into its clean ref and detached prose suffix."""
+    ref = str(match.group(1) or "")
+    suffix = ""
+    before = str(text or "")[: match.start()]
+    for value, forms in (
+        ('"', ('"', "&quot;")),
+        ("'", ("'", "&#39;")),
+    ):
+        if not any(before.endswith(form) for form in forms):
+            continue
+        close_form = ""
+        close_at = -1
+        for form in forms:
+            index = ref.rfind(form)
+            if index > close_at:
+                close_form = form
+                close_at = index
+        if close_at <= 0:
+            continue
+        after_quote = ref[close_at + len(close_form) :]
+        if not _re.fullmatch(r"[.,;:!?]*", after_quote):
+            continue
+        ref = ref[:close_at]
+        suffix = value + after_quote
+        break
+    punctuation_start = len(ref)
+    while punctuation_start and ref[punctuation_start - 1] in ".,;:!?":
+        punctuation_start -= 1
+    trailing_punctuation = ref[punctuation_start:]
+    for delimiter in ("***", "___", "**", "__", "*", "_", "`"):
+        if not before.endswith(delimiter):
+            continue
+        opener_start = len(before) - len(delimiter)
+        if opener_start > 0 and before[opener_start - 1] == delimiter[0]:
+            continue
+        candidate = ref
+        after_delimiter = ""
+        if trailing_punctuation and candidate[: -len(trailing_punctuation)].endswith(delimiter):
+            candidate = candidate[: -len(trailing_punctuation)]
+            after_delimiter = trailing_punctuation
+        if candidate == delimiter:
+            return None
+        if candidate.endswith(delimiter) and len(candidate) > len(delimiter):
+            closer_start = len(candidate) - len(delimiter)
+            if candidate[closer_start - 1] == delimiter[0]:
+                continue
+            ref = candidate[: -len(delimiter)]
+            # The matching closer proves only its own bytes are outside the
+            # reference. Punctuation immediately before it may be a legal
+            # filename or URL byte and must remain bound to the ref.
+            suffix = delimiter + after_delimiter + suffix
+            break
+    # A bare trailing punctuation byte is ambiguous: it may be prose, but it
+    # may also be part of a real local filename or remote URL. Only the quote
+    # and delimiter branches above have evidence from a matching opener that a
+    # closer is outside the MEDIA ref, so preserve every other byte verbatim.
+    if not ref:
+        return None
+    return ref, suffix
 
 
 _CSP_CONNECT_BASE = (

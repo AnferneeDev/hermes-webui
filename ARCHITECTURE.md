@@ -66,7 +66,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       onboarding.py        First-run onboarding status, real provider config writes, OAuth linking, readiness detection
       routes.py            All GET + POST route handlers (if/elif dispatch, no decorators)
       startup.py           Startup helpers: auto_install_agent_deps()
-      state_sync.py        /insights sync — message_count to the agent's state.db
+      state_sync.py        state.db bridge — opt-in /insights usage/title sync; always mirrors the session workspace into sessions.cwd
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
@@ -540,6 +540,26 @@ name and the global registry slot, which belong to the process profile.
 Status and inventory stay passive: they never start or probe an MCP server. Ledger key
 helpers resolve to Hermes Agent's `tools.mcp_tool_scope` when present so the key shape
 has one owner; the local fallbacks only cover Agents that predate that module.
+
+#### MCP configuration writes
+
+MCP create/update, toggle and delete are separate from Agent runtime ownership.
+Each edit resolves the existing `_get_config_path()` once under `_cfg_lock`,
+reads a private raw YAML mapping, and commits to that same path with the existing
+atomic writer. `HERMES_CONFIG_PATH` keeps its documented precedence; this does
+not redirect operator-configured files or change profile resolution.
+
+Raw `${ENV_VAR}` references, unrelated configuration and masked credentials keep
+their original stored values. YAML-aliased containers and the selected server
+entry are detached before mutation so an edit cannot change a sibling or template. Runtime-expanded cache dictionaries are never the
+write source. An unreadable, malformed or non-mapping existing document aborts
+without overwriting it; a missing/empty document can be initialized. Failed disk
+writes do not publish uncommitted mutations into the runtime cache. Reloading
+that cache and sending HTTP responses happen after the lock is released.
+
+This transaction serializes cooperating writes/reloads in one WebUI process.
+It does not lock out other processes or provide Agent status/schema/dispatch
+isolation; those remain the runtime boundary described above.
 
 ---
 
