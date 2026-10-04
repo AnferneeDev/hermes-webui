@@ -122,3 +122,28 @@ def test_shared_owner_identity_disambiguates_an_earlier_legacy_tuple(identity):
     merged = models.merge_session_messages_append_only(sidecar, state, incoming_provenance='state_db')
     assert [row['content'] for row in merged][-2:] == ['LATER_USER', 'LATER_ANSWER']
     assert 'CANCELLED_REPLAY' not in [row['content'] for row in merged]
+
+
+@pytest.mark.parametrize('restamped', [False, True])
+def test_visible_saved_successors_remain_available_to_older_model_context(
+    tmp_path, monkeypatch, restamped,
+):
+    sid = 'older-context-'+str(restamped)
+    db = tmp_path/'state.db'
+    monkeypatch.setattr(models, '_active_state_db_path', lambda: db)
+    session, owner = _recover(sid)
+    accepted = [{'role': 'user', 'content': 'LATER_USER', 'timestamp': 20},
+                {'role': 'assistant', 'content': 'LATER_ANSWER', 'timestamp': 21}]
+    session.messages += copy.deepcopy(accepted)
+    session.save(touch_updated_at=False)
+    _simulate_restart()
+    session = models.get_session(sid)
+    assert 'LATER_USER' not in [row.get('content') for row in session.context_messages]
+    state = [owner, {'role': 'assistant', 'content': 'CANCELLED_REPLAY', 'timestamp': 11}]
+    state += [{**row, 'timestamp': row['timestamp']+(30 if restamped else 0)} for row in accepted]
+    _make_state_db(db, sid, state)
+    merged = models.reconciled_state_db_messages_for_session(session, prefer_context=True)
+    contents = [row.get('content') for row in merged]
+    assert contents[-2:] == ['LATER_USER', 'LATER_ANSWER']
+    assert contents.count('LATER_USER') == contents.count('LATER_ANSWER') == 1
+    assert 'CANCELLED_REPLAY' not in contents

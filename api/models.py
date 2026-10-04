@@ -12592,7 +12592,9 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
     return list(state_messages[start:]) if start is not None else []
 
 
-def _state_db_after_saved_cancel_successors(owner_messages: list, state_messages: list) -> list:
+def _state_db_after_saved_cancel_successors(
+    owner_messages: list, state_messages: list, local_messages: list,
+) -> list:
     """Remove only an ordered mirror of successors already saved after Stop.
 
     The cancelled owner/carrier are excluded from this alignment. Require a
@@ -12608,6 +12610,26 @@ def _state_db_after_saved_cancel_successors(owner_messages: list, state_messages
     saved = [row for row in owner_messages[carrier_index + 1:] if isinstance(row, dict)]
     if not saved or saved[0].get('role') != 'user':
         return state_messages
+    # The display can be newer than authoritative model context. Remove only
+    # the saved prefix also represented in this call's selected local view;
+    # visible ownership alone does not prove context has consumed those rows.
+    represented = 0
+    for offset in range(len(local_messages)):
+        length = 0
+        while length < len(saved) and offset + length < len(local_messages):
+            local, visible = local_messages[offset + length], saved[length]
+            if (not isinstance(local, dict)
+                    or not _message_private_identity_compatible(local, visible)
+                    or _message_exact_timestamp_details(local)
+                    != _message_exact_timestamp_details(visible)
+                    or _session_message_content_key(local, normalize_workspace_prefix=False)
+                    != _session_message_content_key(visible, normalize_workspace_prefix=False)):
+                break
+            length += 1
+        represented = max(represented, length)
+    if represented < 2:
+        return state_messages
+    saved = saved[:represented]
     _reconcile_api_content_sidecars(saved, state_messages)
     matched = 0
     for local, incoming in zip(saved, state_messages, strict=False):
@@ -13031,7 +13053,7 @@ def _merge_session_messages_append_only_impl(
     elif incoming_provenance == 'state_db' and _cancelled_journal_turn_owner(owner_messages):
         source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
         proved_suffix = _state_db_after_cancelled_journal_turn(owner_messages, source_messages)
-        proved_suffix = _state_db_after_saved_cancel_successors(owner_messages, proved_suffix)
+        proved_suffix = _state_db_after_saved_cancel_successors(owner_messages, proved_suffix, sidecar_messages)
         if cancelled_journal_source_messages is None:
             state_messages = proved_suffix
         else:

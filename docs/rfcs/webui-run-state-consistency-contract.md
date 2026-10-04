@@ -154,6 +154,9 @@ After proving the cancelled boundary, reconcile saved successors only against
 an ordered prefix after the terminal carrier. Require at least two legacy
 mirrored rows, tolerate restamped timestamps, retain occurrence counts, and
 reject conflicting private identities; additional repeated turns remain new.
+Only deduplicate a saved prefix also represented in the selected display/context
+view. Newer visible history does not authorize dropping rows from older
+model-facing context.
 Context compression intersects its accepted tail with the proved successor
 suffix of the full SQLite read, retaining both owner proof and anchor authority.
 Session reads, exports, shares and next-send context use the same proved suffix.
