@@ -156,7 +156,15 @@ mirrored rows, tolerate restamped timestamps, retain occurrence counts, and
 reject conflicting private identities; additional repeated turns remain new.
 Only deduplicate a saved prefix also represented in the selected display/context
 view. Newer visible history does not authorize dropping rows from older
-model-facing context.
+model-facing context. Content-only similarity at different timestamps cannot
+prove a mirror: a legitimate new identical turn has the same legacy shape.
+Consume each saved successor only with shared valid message/positive row identity
+or an exact non-null timestamp, plus compatible provider content. Cancelled
+consumers opt into private SQLite row IDs so newly accepted successors retain
+that proof through sidecar persistence; ordinary reader projection is unchanged.
+Historical rows without that mapping remain distinct rather than losing a new
+turn. This can retain an ambiguous historical duplicate; do not claim universal
+deduplication of unidentifiable legacy/restamped histories.
 Context compression intersects its accepted tail with the proved successor
 suffix of the full SQLite read, retaining both owner proof and anchor authority.
 Session reads, exports, shares and next-send context use the same proved suffix.

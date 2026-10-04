@@ -13727,6 +13727,8 @@ def _handle_session_get(handler, parsed) -> bool:
                     msg_before=msg_before,
                 )
             _state_db_reader_kwargs = {"profile": _session_profile}
+            if _cancelled_journal_turn_owner(getattr(s, "messages", None) or []):
+                _state_db_reader_kwargs["include_row_identity"] = True
             if state_db_since_timestamp is not None:
                 _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
             # Apply the display-path row backstop ONLY on provably-safe
@@ -18864,7 +18866,9 @@ def _handle_session_export(handler, parsed):
     # alias-stripping boundary as the visible transcript.
     snapshot = dict(s.__dict__)
     if _cancelled_journal_turn_owner(getattr(s, "messages", None) or []):
-        state_messages = get_state_db_session_messages(sid, profile=getattr(s, "profile", None))
+        state_messages = get_state_db_session_messages(
+            sid, profile=getattr(s, "profile", None), include_row_identity=True,
+        )
         snapshot["messages"] = reconciled_state_db_messages_for_session(s, state_messages=state_messages)
         snapshot["context_messages"] = reconciled_state_db_messages_for_session(
             s, prefer_context=True, state_messages=state_messages

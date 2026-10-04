@@ -1,5 +1,6 @@
 """Ordered cancellation ownership and persisted successor mirrors in SQLite."""
 import copy
+import sqlite3
 
 import pytest
 from api import models
@@ -68,18 +69,23 @@ def test_restamped_saved_successor_prefix_preserves_occurrence_count(
             {'role': 'assistant', 'content': 'LATER_ANSWER', 'timestamp': 21}]
     saved = [{**row, 'timestamp': row['timestamp']+2*i}
              for i in range(copies) for row in pair]
-    session.messages += copy.deepcopy(saved)
-    session.context_messages += copy.deepcopy(saved)
+    # Content-only restamping is ambiguous with a new identical turn. Build
+    # real SQLite admission first, then save/cold-load its durable provenance.
+    initial_state = [owner, {'role': 'assistant', 'content': 'CANCELLED_REPLAY', 'timestamp': 11}, *saved]
+    _make_state_db(db, sid, initial_state)
+    session.messages = models.reconciled_state_db_messages_for_session(session)
+    session.context_messages = models.reconciled_state_db_messages_for_session(session, prefer_context=True)
+    assert all(row.get('_state_db_row_id', 0) > 0 for row in session.messages[-len(saved):])
     session.save(touch_updated_at=False)
     _simulate_restart()
     session = models.get_session(sid)
-    state = [owner, {'role': 'assistant', 'content': 'CANCELLED_REPLAY', 'timestamp': 11}]
-    state += [{**row, 'timestamp': row['timestamp']+30} for row in saved]
     fresh = pair if new_identical else [
         {'role': 'user', 'content': 'FRESH_USER', 'timestamp': 60},
         {'role': 'assistant', 'content': 'FRESH_ANSWER', 'timestamp': 61}]
-    state += [{**row, 'timestamp': 60+i} for i, row in enumerate(fresh)]
-    _make_state_db(db, sid, state)
+    with sqlite3.connect(db) as conn:
+        conn.execute('UPDATE messages SET timestamp=timestamp+30 WHERE session_id=? AND id>2', (sid,))
+        conn.executemany('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                         [(sid, row['role'], row['content'], 60+i) for i, row in enumerate(fresh)])
     original = copy.deepcopy(session.messages)
     for _ in range(2):
         merged = models.reconciled_state_db_messages_for_session(session, prefer_context=prefer_context)

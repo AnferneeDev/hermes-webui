@@ -10536,7 +10536,7 @@ def _decode_state_db_content(value):
     return decoded
 
 
-def _project_state_db_message(row, available, id_col, optional):
+def _project_state_db_message(row, available, id_col, optional, *, include_row_identity=False):
     """Authoritative state.db row → WebUI message projection (#6826 r4).
 
     Shared by ``get_state_db_session_messages`` and the regeneration
@@ -10568,7 +10568,8 @@ def _project_state_db_message(row, available, id_col, optional):
         id_col
         and row['id'] is not None
         and (
-            native_image_projection
+            include_row_identity
+            or native_image_projection
             or (
                 isinstance(msg.get('api_content'), str)
                 and msg['api_content']
@@ -10590,6 +10591,7 @@ def get_state_db_session_messages(
     since_timestamp=None,
     include_inactive: bool = False,
     limit=None,
+    include_row_identity: bool = False,
     with_revision: Literal[False] = False,
 ) -> list: ...
 
@@ -10603,6 +10605,7 @@ def get_state_db_session_messages(
     since_timestamp=None,
     include_inactive: bool = False,
     limit=None,
+    include_row_identity: bool = False,
     with_revision: Literal[True],
 ) -> StateDBSessionMessagesSnapshot: ...
 
@@ -10615,6 +10618,7 @@ def get_state_db_session_messages(
     since_timestamp=None,
     include_inactive: bool = False,
     limit=None,
+    include_row_identity: bool = False,
     with_revision: bool = False,
 ):
     """Read messages for a Hermes session from state.db.
@@ -10651,6 +10655,11 @@ def get_state_db_session_messages(
     Its revision is derived from the exact rows fetched by the same SQLite
     query and is available only for an unbounded, active, current-segment read.
     Existing callers keep the historical list return by default.
+
+    ``include_row_identity=True`` retains private durable row IDs for every
+    projected row. Cancelled-journal consumers use this to carry proven SQLite
+    successor identity through sidecar persistence; ordinary projections retain
+    their historical shape. Public/provider projections strip the private IDs.
     """
     try:
         import sqlite3
@@ -10839,7 +10848,10 @@ def get_state_db_session_messages(
             msgs = []
             for row in rows:
                 msgs.append(
-                    _project_state_db_message(row, available, bool(id_col), optional)
+                    _project_state_db_message(
+                        row, available, bool(id_col), optional,
+                        include_row_identity=include_row_identity,
+                    )
                 )
     except Exception:
         return _state_db_session_messages_result([], None, with_revision=with_revision)
@@ -12633,7 +12645,25 @@ def _state_db_after_saved_cancel_successors(
     _reconcile_api_content_sidecars(saved, state_messages)
     matched = 0
     for local, incoming in zip(saved, state_messages, strict=False):
+        # Content alone cannot distinguish a restamped legacy mirror from a
+        # genuinely new identical turn. Only a shared valid identity or exact
+        # non-null clock grants authority to consume this occurrence.
+        local_stable, local_stable_valid = _stable_message_identity_details(local)
+        incoming_stable, incoming_stable_valid = _stable_message_identity_details(incoming)
+        local_row, local_row_valid = _state_db_row_identity_details(local)
+        incoming_row, incoming_row_valid = _state_db_row_identity_details(incoming)
+        shared_identity = (
+            (local_stable_valid and incoming_stable_valid and local_stable is not None
+             and local_stable == incoming_stable)
+            or (local_row_valid and incoming_row_valid and local_row is not None
+                and int(local_row) > 0 and local_row == incoming_row)
+        )
+        local_time, local_time_valid = _message_exact_timestamp_details(local)
+        incoming_time, incoming_time_valid = _message_exact_timestamp_details(incoming)
+        exact_clock = (local_time_valid and incoming_time_valid and local_time is not None
+                       and local_time == incoming_time)
         if (not isinstance(incoming, dict)
+                or not (shared_identity or exact_clock)
                 or not _message_private_identity_compatible(local, incoming)
                 or _session_message_content_key(local, normalize_workspace_prefix=False)
                 != _session_message_content_key(incoming, normalize_workspace_prefix=True)):
@@ -13840,7 +13870,12 @@ def reconciled_state_db_messages_for_session(
     if state_messages is None:
         session_id = getattr(session, 'session_id', None)
         session_profile = getattr(session, 'profile', None)
-        if with_revision:
+        if _cancelled_journal_turn_owner(getattr(session, 'messages', None) or []):
+            state_result = get_state_db_session_messages(
+                session_id, profile=session_profile,
+                with_revision=with_revision, include_row_identity=True,
+            )
+        elif with_revision:
             state_result = get_state_db_session_messages(
                 session_id,
                 profile=session_profile,
