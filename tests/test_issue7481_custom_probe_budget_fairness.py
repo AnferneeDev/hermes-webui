@@ -1489,6 +1489,29 @@ def _start_foreground_publisher(monkeypatch, modes, *, fresh):
         raising=False,
     )
 
+    if modes == "budget_boundary":
+        from types import SimpleNamespace
+        import sys
+
+        class BoundaryEvent(threading.Event):
+            def wait(self, timeout=None):
+                frame = sys._getframe(1)
+                if frame.f_code.co_name == "get_available_models" and frame.f_locals.get("build_done") is self:
+                    # Complete the worker before reporting an elapsed foreground
+                    # wait. This deterministically enters the boundary branch,
+                    # with no call-ordinal clock or scheduler race.
+                    assert super().wait(5)
+                    frame.f_locals["_worker"].join(5)
+                    assert not frame.f_locals["_worker"].is_alive()
+                    outcome["boundary_wait"] = True
+                    return False
+                return super().wait(timeout)
+
+        monkeypatch.setattr(cfg, "threading", SimpleNamespace(
+            Event=BoundaryEvent, Lock=threading.Lock, Thread=threading.Thread,
+            get_ident=threading.get_ident,
+        ))
+
     outcome: dict = {}
 
     def _publish() -> None:
@@ -1541,7 +1564,7 @@ def _assert_no_catalog_lock_taken_for_commit(cfg_module, entered_commit):
 
 
 @pytest.mark.parametrize(
-    "modes", ["sync", "within_budget"]
+    "modes", ["sync", "within_budget", "budget_boundary"]
 )
 def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_commit(
     monkeypatch, isolate_models_catalog_state, modes
@@ -1556,10 +1579,9 @@ def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_
     same two in that order, so a publisher blocked on a commit mutex an
     invalidator already holds, with that invalidator blocked on the catalog lock
     the publisher owns, is an unbounded cycle: neither the ``/api/models`` load
-    nor the invalidation can finish. The fix allocates/reads the owner, source
-    identity and deadline and updates memory in short catalog critical sections,
-    and runs the durable publication after that critical section has fully
-    ended.
+    nor the invalidation can finish. The catalog lock still spans the whole
+    cold path; the fix moves only durable publication after that outer lock
+    scope has fully ended.
     """
     monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", _REAL_DELETE_MODELS_CACHE_ON_DISK)
     cache_path = cfg._get_models_cache_path()
@@ -1583,6 +1605,8 @@ def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_
     # winner runs the same ``with`` block and the same queued commit, so the
     # property under test belongs to the deferred publication, not to the branch.
     assert commit_threads == [publisher], commit_threads
+    if modes == "budget_boundary":
+        assert outcome.get("boundary_wait") is True
     # The foreground still honours the pre-existing contract: the caller gets the
     # fresh catalog and the durable file is written by the time the call returns.
     assert outcome["catalog"]["active_provider"] == "fresh"
@@ -1593,7 +1617,7 @@ def test_foreground_publication_never_holds_the_catalog_lock_across_the_durable_
 
 
 @pytest.mark.parametrize("entry", ["function", "route"], ids=["full_invalidate", "post_refresh_route"])
-@pytest.mark.parametrize("modes", ["sync", "within_budget"])
+@pytest.mark.parametrize("modes", ["sync", "within_budget", "budget_boundary"])
 def test_foreground_publication_and_invalidation_complete_without_a_lock_cycle(
     monkeypatch, isolate_models_catalog_state, modes, entry
 ):

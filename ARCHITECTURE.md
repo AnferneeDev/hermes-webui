@@ -587,10 +587,10 @@ slice of the *remaining* window instead of letting one probe take the whole per-
 cap, so an unreachable endpoint cannot leave the reachable providers behind it with no
 in-band probe at all (#7481).
 
-- Each slice is `min(cap, left / (remaining + 1))`, with **no lower bound**. The `+1`
-  reserves a slot of headroom, so a chain of N probes can spend at most `N/(N+1)` of the
-  window and always finishes inside it — that is what keeps the foreground caller on a
-  published catalog instead of the over-budget fallback. A floor (however small) would make
+- Each slice is `min(cap, left / (remaining + 0.1))`, with **no lower bound**. The fractional
+  slot reserves headroom without halving a lone target's window. Unused time is lent to
+  later probes; the matching active/LM Studio target does not reserve a duplicate slot.
+  Wall-clock overhead can still cross the foreground deadline. A floor would make
   the chain's cumulative spend grow with the endpoint count, and `custom_providers` has no
   count limit, so a long enough chain of dead endpoints could again outspend the window and
   push the reachable providers behind it out of the in-band rebuild.
@@ -611,13 +611,15 @@ in-band probe at all (#7481).
     to spend past the window. The narrow race where a probe finds the window spent while
     the caller *is* still waiting is not that state: it gets the attempt-only timeout
     above, never the cap.
-- Trade-off to know about: slices shrink as the chain grows, because the window is fixed
-  and shared. A slow-but-reachable endpoint in a long chain can be cut off; size
-  `HERMES_WEBUI_MODELS_REBUILD_BUDGET` for the endpoints actually in use, or give a
-  `custom_providers` entry a static `models:` allowlist so it is never probed live.
-- An endpoint is probed **at most once per rebuild**. The three live-probe consumers
+- A slice can truncate healthy endpoints even in short chains. Such timeouts are not
+  reported as unreachable and the partial catalog is never cached in memory or on disk.
+  The same worker retries truncated targets once at the full endpoint cap after the
+  foreground returns, retaining successful probes and publishing the complete catalog
+  through the existing generation, source-identity, ownership and durable fences.
+- An endpoint is probed **once per rebuild, except for that full-cap retry**. The three live-probe consumers
   (active `model.base_url`, named `custom_providers`, LM Studio provider-group fallback)
-  share a per-rebuild memo keyed by the endpoint URL plus the credential sent, so the
+  share a per-rebuild memo keyed by the complete request URL (path slashes and query
+  preserved) plus the Authorization header sent, so the
   common config where the active endpoint and `providers.lmstudio.base_url` are the same
   LAN host no longer pays that host's connect timeout twice, and two named entries on one
   endpoint probe it once. A different URL — or the same URL with a different key, which can
@@ -646,7 +648,8 @@ invalidated catalog.
 
 Both `invalidate_models_cache()` and the provider-scoped invalidator used by
 `/api/models/refresh` share one epoch/owner reset. They advance the allocated generation,
-clear memory and provenance, retire the in-flight owner, and delete the durable cache.
+clear memory and provenance, evict the relevant credential pools before admission reopens,
+retire the in-flight owner, and delete the durable cache.
 Every build already running becomes superseded *even when no successor rebuild is ever
 allocated*; otherwise a delayed worker could repopulate the cleared catalog under a
 fresh-looking fingerprint. Disk snapshots read before taking the catalog lock (including
@@ -690,9 +693,10 @@ and its synchronous, within-budget and budget-boundary winners called
 blocked on the commit mutex an invalidator held, with that invalidator then blocked on the
 catalog lock the publisher owned, waited on each other forever, so a `/api/models` load and a
 config-save/`/api/models/refresh` invalidation could each hang (#7481 review). The foreground
-paths therefore do not commit inline: memory publication still happens in short
-`_available_models_cache_lock` critical sections (owner, source identity and the absolute
-deadline are read there too), while the durable commit is **queued** and run by
+paths therefore do not commit inline: the catalog lock still spans the whole cold path,
+including the foreground wait and memory publication (owner, source identity and the
+absolute deadline are read there too). Only the durable commit moves outside: it is
+**queued** and run by
 `_DeferredCatalogPublication` on its way out — after the catalog lock has been released — by
 `_commit_models_cache_to_disk_after_lock`. The caller still gets the cache and the durable
 file populated before `get_available_models` returns, and the single-flight release rides

@@ -233,6 +233,36 @@ def test_named_provider_repeating_the_active_endpoint_is_probed_once(
     assert _hosts(observed, "dead") == ["lan-dead.example:1234"]
 
 
+@pytest.mark.parametrize("second_base", [
+    "https://shared.example/tenant//v1",
+    "https://shared.example/tenant/v1?tenant=two",
+])
+def test_full_request_url_keeps_tenant_catalogs_distinct(
+    monkeypatch, isolate_models_catalog_state, second_base
+):
+    import urllib.request
+    from tests.test_issue7481_custom_probe_budget_fairness import _FakeResponse
+
+    first_base = ("https://shared.example/tenant/v1?tenant=one"
+                  if "?" in second_base else "https://shared.example/tenant/v1")
+    _configure(monkeypatch, active_base_url=None, custom_providers=[
+        {"name": "Tenant One", "base_url": first_base, "api_key": "same-key"},
+        {"name": "Tenant Two", "base_url": second_base, "api_key": "same-key"},
+    ])
+    requests = []
+
+    def probe(req, timeout=None):
+        requests.append(req.full_url)
+        model = "two" if "//v1" in req.full_url or "tenant=two" in req.full_url else "one"
+        return _FakeResponse({"data": [{"id": model}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", probe)
+    models = _models_by_provider(cfg.get_available_models())
+    assert models["custom:tenant-one"] == ["one"]
+    assert models["custom:tenant-two"] == ["two"]
+    assert len(requests) == 2
+
+
 def test_trailing_slash_spelling_of_one_endpoint_is_a_single_probe(
     monkeypatch, isolate_models_catalog_state
 ):

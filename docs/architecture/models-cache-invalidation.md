@@ -100,6 +100,16 @@ new catalog input must become an axis first. `delete_profile_api()` and
 `create_profile_api()` unlink `models_cache.<name>.json`, so a recreated profile
 never inherits the old catalog.
 
+Credential eviction is part of the same epoch-reset critical section as memory
+invalidation, before rebuild admission reopens. Full invalidation clears all
+profile pools; provider invalidation removes the original and canonical provider
+keys for the active profile. Both retain disk-commit → catalog lock order.
+
+A custom-endpoint timeout below the full endpoint cap is a truncated attempt,
+not evidence of unreachability. A partial catalog can be returned but is not
+published to either cache. The existing worker retries truncated targets at the
+full cap and publishes only through the generation/source/ownership fences.
+
 ## Change protocol
 
 1. Add or change a source axis in `_models_cache_source_fingerprint()` only —
