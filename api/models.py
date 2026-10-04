@@ -12566,6 +12566,19 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
         owner_token, matched_token = owner.get('_active_turn_token'), matched.get('_active_turn_token')
         if owner_token and matched_token and owner_token != matched_token:
             return []
+        # A unique SQLite tuple can still be an earlier visible occurrence.
+        # Plaintext SQLite rows have no durable row identity in this projection;
+        # do not mistake an old repeated prompt for the absent/restamped owner.
+        bound_identity = bool(known_claims or (owner_token and owner_token == matched_token))
+        if not bound_identity:
+            owner_index = next(i for i, row in enumerate(sidecar_messages) if row is owner)
+            if any(isinstance(row, dict) and row.get('role') == 'user'
+                   and timestamp(row) == owner_time
+                   and _session_message_content_key(row, normalize_workspace_prefix=False)
+                   == _session_message_content_key(owner, normalize_workspace_prefix=False)
+                   and _message_private_identity_compatible(row, matched)
+                   for row in sidecar_messages[:owner_index]):
+                return []
         start = next((i for i in range(matches[0] + 1, len(state_messages))
                       if isinstance(state_messages[i], dict) and state_messages[i].get('role') == 'user'), None)
     else:
@@ -12577,6 +12590,36 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
                       and terminal_time is not None and timestamp(row) is not None
                       and timestamp(row) > terminal_time), None)
     return list(state_messages[start:]) if start is not None else []
+
+
+def _state_db_after_saved_cancel_successors(owner_messages: list, state_messages: list) -> list:
+    """Remove only an ordered mirror of successors already saved after Stop.
+
+    The cancelled owner/carrier are excluded from this alignment. Require a
+    two-row prefix for legacy content-only evidence; retain occurrence counts
+    and reject conflicting private identities so a genuinely new identical
+    turn is not collapsed. Timestamps may change when SQLite restamps mirrors.
+    """
+    turn_owner = _cancelled_journal_turn_owner(owner_messages)
+    if turn_owner is None:
+        return state_messages
+    carrier = turn_owner[1]
+    carrier_index = next(i for i, row in enumerate(owner_messages) if row is carrier)
+    saved = [row for row in owner_messages[carrier_index + 1:] if isinstance(row, dict)]
+    if not saved or saved[0].get('role') != 'user':
+        return state_messages
+    _reconcile_api_content_sidecars(saved, state_messages)
+    matched = 0
+    for local, incoming in zip(saved, state_messages, strict=False):
+        if (not isinstance(incoming, dict)
+                or not _message_private_identity_compatible(local, incoming)
+                or _session_message_content_key(local, normalize_workspace_prefix=False)
+                != _session_message_content_key(incoming, normalize_workspace_prefix=True)):
+            break
+        matched += 1
+    if matched < 2:
+        return state_messages
+    return state_messages[matched:]
 
 
 def state_db_delta_after_context(sidecar_context: list, state_messages: list) -> list:
@@ -12988,6 +13031,7 @@ def _merge_session_messages_append_only_impl(
     elif incoming_provenance == 'state_db' and _cancelled_journal_turn_owner(owner_messages):
         source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
         proved_suffix = _state_db_after_cancelled_journal_turn(owner_messages, source_messages)
+        proved_suffix = _state_db_after_saved_cancel_successors(owner_messages, proved_suffix)
         if cancelled_journal_source_messages is None:
             state_messages = proved_suffix
         else:

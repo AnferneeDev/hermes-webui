@@ -148,6 +148,12 @@ or ambiguous ownership grants no replay authority. Keep this cutoff after later
 rows persist, before display pagination or model-context delta selection; live
 partial, exact identity/deduplication, compression and truncation guards remain.
 Known owner IDs with changed content/time cannot enter the later-only fallback.
+A content/time tuple shared by an earlier saved user cannot identify a missing
+or restamped cancelled owner without a shared durable identity or turn token.
+After proving the cancelled boundary, reconcile saved successors only against
+an ordered prefix after the terminal carrier. Require at least two legacy
+mirrored rows, tolerate restamped timestamps, retain occurrence counts, and
+reject conflicting private identities; additional repeated turns remain new.
 Context compression intersects its accepted tail with the proved successor
 suffix of the full SQLite read, retaining both owner proof and anchor authority.
 Session reads, exports, shares and next-send context use the same proved suffix.
