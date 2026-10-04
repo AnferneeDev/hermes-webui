@@ -148,6 +148,16 @@ def test_invalidation_evicts_credentials_before_readmission(
 ):
     _configure(monkeypatch, active_base_url=None)
     cfg.cfg["model"] = {}
+    # This test owns the credential-pool admission signal. Agent auth discovery
+    # is independent evidence: earlier tests can leave synthetic credentials in
+    # the session home, and pool invalidation must not revoke those credentials.
+    # Isolate that external source without replacing the pool/cache paths below.
+    monkeypatch.setitem(sys.modules, "hermes_cli.models", SimpleNamespace(
+        list_available_providers=lambda: [],
+    ))
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", SimpleNamespace(
+        get_auth_status=lambda _pid: {"logged_in": False},
+    ))
     auth_path = isolate_models_catalog_state["auth_store_path"]
     auth_path.write_text(json.dumps({"credential_pool": {"anthropic": []}}))
     pool = SimpleNamespace(entries=lambda: [SimpleNamespace(source="manual")])
