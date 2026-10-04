@@ -2979,6 +2979,7 @@ from api.helpers import (
     safe_resolve,
     arm_connection_close_if_body_pending,
     j,
+    _json_response_body,
     t,
     read_body,
     MAX_BODY_BYTES,
@@ -5860,6 +5861,8 @@ def _share_snapshot_messages_for_session(session, *, cli_meta: dict | None = Non
     current_messages = list(getattr(session, "messages", None) or [])
     if not sid:
         return current_messages
+    if _cancelled_journal_turn_owner(current_messages):
+        return reconciled_state_db_messages_for_session(session)
     profile = getattr(session, "profile", None)
     is_messaging = (
         _is_messaging_session_record(session)
@@ -9474,6 +9477,7 @@ def _state_db_backstop_limit_for_display(session, msg_before) -> int | None:
         msg_before is not None
         or getattr(session, "truncation_watermark", None) not in (None, "")
         or getattr(session, "truncation_boundary", None) not in (None, "")
+        or _cancelled_journal_turn_owner(getattr(session, "messages", None) or []) is not None
     )
     return None if has_boundary_prefix else _STATE_DB_DISPLAY_ROW_BACKSTOP
 
@@ -9686,6 +9690,7 @@ def _limited_webui_messages_for_display_with_sidecar(
         truncation_watermark=getattr(session, "truncation_watermark", None),
         truncation_boundary=getattr(session, "truncation_boundary", None),
         incoming_provenance="state_db",
+        cancelled_journal_owner_messages=getattr(session, "messages", None) or [],
     )
     merged = _project_native_image_payload_conflicts_for_display(
         sidecar_messages,
@@ -10134,6 +10139,8 @@ def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before
         return None, None
     if getattr(session, "truncation_boundary", None) not in (None, ""):
         return None, None
+    if _cancelled_journal_turn_owner(getattr(session, "messages", None) or []):
+        return None, None  # The exact cancelled owner is needed before slicing.
 
     sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
     if not sidecar_messages:
@@ -11066,6 +11073,8 @@ from api.models import (
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
     merge_session_messages_append_only,
+    reconciled_state_db_messages_for_session,
+    _cancelled_journal_turn_owner,
     _project_native_image_payload_conflicts_for_display,
     _suppress_native_image_display_mirrors,
     _reconcile_api_content_sidecars,
@@ -13832,6 +13841,8 @@ def _handle_session_get(handler, parsed) -> bool:
                     state_db_messages,
                     truncation_watermark=getattr(s, "truncation_watermark", None),
                     truncation_boundary=getattr(s, "truncation_boundary", None),
+                    incoming_provenance="state_db",
+                    cancelled_journal_owner_messages=getattr(s, "messages", None) or [],
                 )
                 _all_msgs = _merged_webui_lineage_messages_for_display(
                     s,
@@ -18851,7 +18862,14 @@ def _handle_session_export(handler, parsed):
     # ``public_session_projection`` supersedes the narrower
     # ``redact_session_data`` path so export context_messages uses the same
     # alias-stripping boundary as the visible transcript.
-    safe = public_session_projection(s.__dict__)
+    snapshot = dict(s.__dict__)
+    if _cancelled_journal_turn_owner(getattr(s, "messages", None) or []):
+        state_messages = get_state_db_session_messages(sid, profile=getattr(s, "profile", None))
+        snapshot["messages"] = reconciled_state_db_messages_for_session(s, state_messages=state_messages)
+        snapshot["context_messages"] = reconciled_state_db_messages_for_session(
+            s, prefer_context=True, state_messages=state_messages
+        )
+    safe = public_session_projection(snapshot)
     qs = parse_qs(parsed.query)
     fmt = qs.get("format", ["json"])[0].lower()
     if fmt == "html":
@@ -18870,11 +18888,13 @@ def _handle_session_export(handler, parsed):
                         palette = parsed_palette
             except Exception:
                 palette = None
-        payload = render_session_html(safe, theme=theme, palette=palette)
+        payload = render_session_html(safe, theme=theme, palette=palette).encode(
+            "utf-8", errors="replace"
+        )
         content_type = "text/html; charset=utf-8"
         ext = "html"
     else:
-        payload = json.dumps(safe, ensure_ascii=False, indent=2)
+        payload = _json_response_body(safe, pretty=True)
         content_type = "application/json; charset=utf-8"
         ext = "json"
     handler.send_response(200)
@@ -18882,10 +18902,10 @@ def _handle_session_export(handler, parsed):
     handler.send_header(
         "Content-Disposition", f'attachment; filename="hermes-{sid}.{ext}"'
     )
-    handler.send_header("Content-Length", str(len(payload.encode("utf-8"))))
+    handler.send_header("Content-Length", str(len(payload)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
-    handler.wfile.write(payload.encode("utf-8"))
+    handler.wfile.write(payload)
     return True
 
 

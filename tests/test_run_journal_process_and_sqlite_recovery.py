@@ -128,7 +128,7 @@ def test_real_sqlite_new_turn_after_recovered_journal(kind, tmp_path, monkeypatc
     assert any(row.get('content')=='LATER_GATEWAY_ANSWER' for row in persisted)
     merged = models.reconciled_state_db_messages_for_session(session)
     assert session.messages == original
-    if kind in {'cancel','live-partial-control'}:
+    if kind == 'live-partial-control':
         assert merged == original
     else:
         assert any(row.get('content')=='LATER_GATEWAY_REQUEST' for row in merged)

@@ -131,11 +131,26 @@ counts, atomic replacement and error cleanup keep their existing authority.
 JSON responses and SSE frames apply the same UnicodeEncodeError-only lossless
 escape fallback before sending UTF-8 bytes. Ordinary Unicode, event IDs, payload
 shape and compact/pretty JSON formatting retain their existing behavior, so a
-persisted recovered answer is both reloadable and observable over HTTP.
+persisted recovered answer is both reloadable and observable over HTTP. JSON
+exports and atomic share snapshots use the same lossless byte encoder. HTML
+exports replace unencodable surrogate code units at their UTF-8 presentation
+boundary. Exports prepare the complete body before sending headers, and use
+those same bytes for Content-Length and the response body; journal and JSON
+transcript text remain lossless.
 Ordinary journal-recovered rows do not by themselves suppress newer state.db
 turns. The interrupted partial display guard retains live partials and explicit
-cancel-journal recovery ownership; later Gateway rows after ordinary crash
-recovery continue through the existing SQLite reconciliation path.
+cancel-journal recovery ownership. A unique compatible cancelled user in the
+ordered SQLite transcript proves the next user boundary: suppress only that
+cancelled run's assistant/tool replay and merge the successor suffix in durable
+order, even when it predates recovery-time sidecar timestamps. A later-only
+store needs a user strictly newer than the terminal carrier. Missing, conflicting
+or ambiguous ownership grants no replay authority. Keep this cutoff after later
+rows persist, before display pagination or model-context delta selection; live
+partial, exact identity/deduplication, compression and truncation guards remain.
+Known owner IDs with changed content/time cannot enter the later-only fallback.
+Context compression intersects its accepted tail with the proved successor
+suffix of the full SQLite read, retaining both owner proof and anchor authority.
+Session reads, exports, shares and next-send context use the same proved suffix.
 
 
 ## Cancelled journal-only restart recovery

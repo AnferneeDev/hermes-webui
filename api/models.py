@@ -12459,7 +12459,7 @@ def _has_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]) -> bool
     return _matching_visible_duplicate(visible_key, visible_keys) is not None
 
 
-def _sidecar_has_terminal_partial_error(sidecar_messages: list) -> bool:
+def _sidecar_has_terminal_partial_error(sidecar_messages: list, *, live_only: bool = False) -> bool:
     """Return True when WebUI already owns an interrupted live partial turn.
 
     After a cancelled/error terminal event, the WebUI sidecar contains the
@@ -12490,10 +12490,93 @@ def _sidecar_has_terminal_partial_error(sidecar_messages: list) -> bool:
             break
     for msg in messages[segment_start:latest_error_idx]:
         if str(msg.get("role") or "").lower() == "assistant" and (
-            msg.get("_partial") or msg.get("_recovered_from_cancel_journal") is True
+            msg.get("_partial") or (not live_only and msg.get("_recovered_from_cancel_journal") is True)
         ):
             return True
     return False
+
+
+def _cancelled_journal_turn_owner(sidecar_messages: list) -> tuple[dict, dict] | None:
+    """Find the latest cancelled journal segment, including historical ones."""
+    messages = [row for row in sidecar_messages if isinstance(row, dict)]
+    for error_idx in range(len(messages) - 1, -1, -1):
+        carrier = messages[error_idx]
+        if carrier.get('role') != 'assistant' or not carrier.get('_error'):
+            continue
+        owner_idx = next((i for i in range(error_idx - 1, -1, -1)
+                          if messages[i].get('role') == 'user'), None)
+        if owner_idx is None:
+            continue
+        segment = messages[owner_idx + 1:error_idx]
+        if any(row.get('_partial') for row in segment):
+            continue
+        if any(row.get('_recovered_from_cancel_journal') is True for row in segment):
+            return messages[owner_idx], carrier
+    return None
+
+
+def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_messages: list) -> list:
+    """Exclude the cancelled owner's replay, retaining only a proved next turn.
+
+    Recovery timestamps are not execution timestamps. An exact, unique owner
+    in SQLite's ordered transcript proves its next user is a successor even
+    when that successor predates the recovered sidecar's terminal carrier.
+    """
+    turn_owner = _cancelled_journal_turn_owner(sidecar_messages)
+    if turn_owner is None:
+        return []
+    owner, carrier = turn_owner
+
+    def timestamp(row):
+        if any(isinstance(row.get(key), bool) for key in ('timestamp', '_ts')):
+            return None
+        return _message_exact_timestamp(row)
+
+    owner_time = timestamp(owner)
+    owner_stable, stable_valid = _stable_message_identity_details(owner)
+    owner_row, row_valid = _state_db_row_identity_details(owner)
+    if not stable_valid or not row_valid:
+        return []
+    known_claims = []
+    for i, row in enumerate(state_messages):
+        if not isinstance(row, dict) or row.get('role') != 'user':
+            continue
+        stable, stable_valid = _stable_message_identity_details(row)
+        row_id, row_valid = _state_db_row_identity_details(row)
+        if not stable_valid or not row_valid:
+            return []
+        if ((owner_stable is not None and stable == owner_stable)
+                or (owner_row is not None and row_id == owner_row)):
+            known_claims.append(i)
+    matches = [i for i, row in enumerate(state_messages)
+               if isinstance(row, dict) and row.get('role') == 'user'
+               and owner_time is not None and timestamp(row) == owner_time
+               and _session_message_content_key(row, normalize_workspace_prefix=True)
+               == _session_message_content_key(owner, normalize_workspace_prefix=False)]
+    # A row claiming the cancelled owner's known ID is never a later-only
+    # successor merely because its content or timestamp changed.
+    if known_claims and (len(known_claims) != 1 or known_claims[0] not in matches):
+        return []
+    if matches:
+        if len(matches) != 1:
+            return []
+        matched = state_messages[matches[0]]
+        if not _message_private_identity_compatible(owner, matched):
+            return []
+        owner_token, matched_token = owner.get('_active_turn_token'), matched.get('_active_turn_token')
+        if owner_token and matched_token and owner_token != matched_token:
+            return []
+        start = next((i for i in range(matches[0] + 1, len(state_messages))
+                      if isinstance(state_messages[i], dict) and state_messages[i].get('role') == 'user'), None)
+    else:
+        # A later-only store can still prove a successor with a timestamp newer
+        # than the terminal carrier. Unknown/older timestamps grant no authority.
+        terminal_time = timestamp(carrier)
+        start = next((i for i, row in enumerate(state_messages)
+                      if isinstance(row, dict) and row.get('role') == 'user'
+                      and terminal_time is not None and timestamp(row) is not None
+                      and timestamp(row) > terminal_time), None)
+    return list(state_messages[start:]) if start is not None else []
 
 
 def state_db_delta_after_context(sidecar_context: list, state_messages: list) -> list:
@@ -12771,6 +12854,8 @@ def merge_session_messages_append_only(
     truncation_watermark=None,
     truncation_boundary=None,
     incoming_provenance: Literal["unverified", "state_db"] = "unverified",
+    cancelled_journal_owner_messages: list | None = None,
+    cancelled_journal_source_messages: list | None = None,
 ) -> list:
     """Merge sidecar/context and state.db messages without deleting local rows.
 
@@ -12785,6 +12870,8 @@ def merge_session_messages_append_only(
             truncation_watermark=truncation_watermark,
             truncation_boundary=truncation_boundary,
             incoming_provenance=incoming_provenance,
+            cancelled_journal_owner_messages=cancelled_journal_owner_messages,
+            cancelled_journal_source_messages=cancelled_journal_source_messages,
         )
     finally:
         _STRUCTURED_IDENTITY_MEMO.reset(token)
@@ -12880,6 +12967,8 @@ def _merge_session_messages_append_only_impl(
     truncation_watermark=None,
     truncation_boundary=None,
     incoming_provenance=None,
+    cancelled_journal_owner_messages=None,
+    cancelled_journal_source_messages=None,
 ) -> list:
     """Merge sidecar/context and state.db messages without deleting local rows.
 
@@ -12891,6 +12980,23 @@ def _merge_session_messages_append_only_impl(
     """
     sidecar_messages = list(sidecar_messages or [])
     state_messages = list(state_messages or [])
+    owner_messages = sidecar_messages if cancelled_journal_owner_messages is None else cancelled_journal_owner_messages
+    post_cancel_state = False
+    if (_sidecar_has_terminal_partial_error(owner_messages, live_only=True)
+            or (incoming_provenance != 'state_db' and _sidecar_has_terminal_partial_error(owner_messages))):
+        state_messages = []  # Retain the current live-partial guard, including model context.
+    elif incoming_provenance == 'state_db' and _cancelled_journal_turn_owner(owner_messages):
+        source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
+        proved_suffix = _state_db_after_cancelled_journal_turn(owner_messages, source_messages)
+        if cancelled_journal_source_messages is None:
+            state_messages = proved_suffix
+        else:
+            # Context/compression slicing retains these invocation-local row
+            # objects. Intersect with the proved suffix of the full read, so an
+            # anchor cannot erase owner proof or re-admit a pre-anchor row.
+            suffix_row_ids = {id(row) for row in proved_suffix}
+            state_messages = [row for row in state_messages if id(row) in suffix_row_ids]
+        post_cancel_state = bool(state_messages)
     _reconcile_api_content_sidecars(sidecar_messages, state_messages)
     # The reconciler's quarantine sets are invocation-local. Mirror the
     # identity-bucket guards here because this append-only merge has its own
@@ -13145,8 +13251,6 @@ def _merge_session_messages_append_only_impl(
                 sidecar_multimodal_mirrors[multimodal_mirror_key] = msg
         merged_messages.append(msg)
         _remember_merged_message(msg, source="sidecar")
-    if _sidecar_has_terminal_partial_error(sidecar_messages):
-        return merged_messages
     sidecar_visible_lookup = _build_visible_duplicate_lookup(sidecar_visible_keys)
     state_multimodal_mirror_keys = {}
     ambiguous_state_multimodal_mirrors = set()
@@ -13434,7 +13538,7 @@ def _merge_session_messages_append_only_impl(
             continue
         replays_sidecar_prefix = False
         replay_target = None
-        if state_replay_idx < len(sidecar_visible_sequence):
+        if not post_cancel_state and state_replay_idx < len(sidecar_visible_sequence):
             expected_visible_key = sidecar_visible_sequence[state_replay_idx]
             if visible_key == expected_visible_key or _has_visible_duplicate(
                 visible_key, {expected_visible_key}
@@ -13496,7 +13600,7 @@ def _merge_session_messages_append_only_impl(
         if dedup_key in seen_dedup_keys:
             _merge_session_display_metadata(merged_by_dedup_key.get(dedup_key), msg)
             continue
-        if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
+        if not post_cancel_state and max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
             # For message_id keys the merge key is authoritative — skip if
             # already seen.  For legacy keys the dedup check above already
             # handled true duplicates; same-second distinct messages must
@@ -13521,7 +13625,7 @@ def _merge_session_messages_append_only_impl(
             sidecar_visible_keys,
             sidecar_visible_lookup,
         )
-        if matched_visible_key is not None:
+        if matched_visible_key is not None and not post_cancel_state:
             skipped_count = skipped_state_visible_counts.get(matched_visible_key, 0)
             sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
             if skipped_count < sidecar_count:
@@ -13540,6 +13644,7 @@ def _merge_session_messages_append_only_impl(
         # only when their visible content is not already present.
         if (
             key[0] != "message_id"
+            and not post_cancel_state
             and max_sidecar_timestamp is not None
             and timestamp is not None
             and timestamp <= max_sidecar_timestamp
@@ -13610,6 +13715,7 @@ def _merge_session_messages_append_only_impl(
         # archived parent was restamped later.
         if (
             incoming_provenance == "state_db"
+            and not post_cancel_state
             and max_sidecar_timestamp is not None
             and timestamp is not None
             and timestamp < max_sidecar_timestamp
@@ -13694,6 +13800,7 @@ def reconciled_state_db_messages_for_session(
         suppress_api_content=not using_context_messages,
         suppress_pending_turn=not prefer_context,
     )
+    cancelled_journal_source_messages = state_messages
     if prefer_context and local_messages:
         if using_context_messages:
             sidecar_messages = getattr(session, 'messages', None) or []
@@ -13737,13 +13844,17 @@ def reconciled_state_db_messages_for_session(
                             with_revision=with_revision,
                         )
                     state_messages = list(state_messages or [])[anchor_index + 1 :]
-        state_messages = state_db_delta_after_context(local_messages, state_messages)
+        if not (_sidecar_has_terminal_partial_error(getattr(session, 'messages', None) or [])
+                or _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [])):
+            state_messages = state_db_delta_after_context(local_messages, state_messages)
     reconciled_messages = merge_session_messages_append_only(
         local_messages,
         state_messages,
         truncation_watermark=getattr(session, "truncation_watermark", None),
         truncation_boundary=getattr(session, "truncation_boundary", None),
         incoming_provenance="state_db",
+        cancelled_journal_owner_messages=(getattr(session, 'messages', None) or []) if prefer_context else None,
+        cancelled_journal_source_messages=cancelled_journal_source_messages if prefer_context else None,
     )
     if not prefer_context:
         reconciled_messages = _project_native_image_payload_conflicts_for_display(
