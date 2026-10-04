@@ -111,6 +111,10 @@ The same encoding check applies before creating a shrink-backup temp file when
 exact replay cleanup reserializes that backup. Retain distinct recovered rows,
 metadata and the cleaned message count; ordinary raw-copy backups remain byte
 preserving. This does not expand which message identities authorize deletion.
+Guarded backup restoration uses the same lossless encoding before opening its
+temp file, including raw-copy and orphan backups. Restore the exact snapshot
+that authorized recovery; clear and intentional-shrink checks, effective row
+counts, atomic replacement and error cleanup keep their existing authority.
 
 
 ## Cancelled journal-only restart recovery
