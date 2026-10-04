@@ -1875,6 +1875,13 @@ class Session:
                             cleaned_existing['messages'] = existing_guarded_messages
                             cleaned_existing['message_count'] = len(existing_guarded_messages)
                             backup_text = json.dumps(cleaned_existing, ensure_ascii=False, indent=2)
+                            try:
+                                backup_text.encode('utf-8')
+                            except UnicodeEncodeError:
+                                # Keep recovered surrogates lossless when
+                                # replay cleanup rewrites the shrink backup,
+                                # before creating its atomic temp file.
+                                backup_text = json.dumps(cleaned_existing, ensure_ascii=True, indent=2)
                             logger.warning(
                                 "Removed %d exact stable replay messages from backup for session %s",
                                 existing_exact_replay_rows_removed,

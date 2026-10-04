@@ -107,6 +107,10 @@ remain outside the per-process ownership contract.
 Session-sidecar atomic saves also use lossless JSON escapes when recovered
 provider surrogates cannot be encoded as UTF-8, so journal recovery survives
 subsequent cold loads rather than only appearing in the in-memory session.
+The same encoding check applies before creating a shrink-backup temp file when
+exact replay cleanup reserializes that backup. Retain distinct recovered rows,
+metadata and the cleaned message count; ordinary raw-copy backups remain byte
+preserving. This does not expand which message identities authorize deletion.
 
 
 ## Cancelled journal-only restart recovery
