@@ -12512,6 +12512,43 @@ def _sidecar_has_terminal_partial_error(sidecar_messages: list, *, live_only: bo
     return False
 
 
+def _selected_history_owns_live_partial(selected: list, owner_messages: list) -> bool:
+    """Require the selected user and saved partial, not its optional carrier."""
+    if not _sidecar_has_terminal_partial_error(owner_messages, live_only=True):
+        return False
+    owner_rows = [row for row in owner_messages if isinstance(row, dict)]
+    error_index = max(i for i, row in enumerate(owner_rows)
+                      if row.get('role') == 'assistant' and row.get('_error'))
+    user_index = max(i for i, row in enumerate(owner_rows[:error_index]) if row.get('role') == 'user')
+    user = owner_rows[user_index]
+    partials = [row for row in owner_rows[user_index+1:error_index]
+                if row.get('role') == 'assistant' and row.get('_partial')]
+    selected = [row for row in selected if isinstance(row, dict)]
+    for index, row in enumerate(selected):
+        if row.get('role') != 'user' or not _message_private_identity_compatible(row, user):
+            continue
+        if (row.get('_active_turn_token') and user.get('_active_turn_token')
+                and row['_active_turn_token'] != user['_active_turn_token']):
+            continue
+        clock, valid = _message_exact_timestamp_details(row)
+        owner_clock, owner_valid = _message_exact_timestamp_details(user)
+        row_id, _ = _state_db_row_identity_details(row)
+        owner_id, _ = _state_db_row_identity_details(user)
+        stable, _ = _stable_message_identity_details(row)
+        owner_stable, _ = _stable_message_identity_details(user)
+        if not ((valid and owner_valid and clock is not None and clock == owner_clock)
+                or (row_id is not None and int(row_id) > 0 and row_id == owner_id)
+                or (stable is not None and stable == owner_stable)
+                or (row.get('_active_turn_token') and row.get('_active_turn_token') == user.get('_active_turn_token'))):
+            continue
+        end = next((i for i in range(index+1, len(selected)) if selected[i].get('role') == 'user'), len(selected))
+        if all(any(_message_private_identity_compatible(local, partial)
+                   and _session_message_visible_key(local) == _session_message_visible_key(partial)
+                   for local in selected[index+1:end]) for partial in partials):
+            return True
+    return False
+
+
 def _cancelled_journal_turn_owner(sidecar_messages: list) -> tuple[dict, dict] | None:
     """Find the latest cancelled journal segment, including historical ones."""
     messages = [row for row in sidecar_messages if isinstance(row, dict)]
@@ -13081,7 +13118,7 @@ def _merge_session_messages_append_only_impl(
     state_messages = list(state_messages or [])
     owner_messages = sidecar_messages if cancelled_journal_owner_messages is None else cancelled_journal_owner_messages
     post_cancel_state = False
-    if (_sidecar_has_terminal_partial_error(sidecar_messages, live_only=True)
+    if (_selected_history_owns_live_partial(sidecar_messages, owner_messages)
             or (incoming_provenance != 'state_db' and _sidecar_has_terminal_partial_error(owner_messages))):
         # The selected history owns the veto. Deferred model context can still
         # precede the displayed Stop; SQLite must fill that older snapshot.

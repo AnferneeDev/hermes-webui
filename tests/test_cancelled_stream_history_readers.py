@@ -48,7 +48,7 @@ def _worker(monkeypatch, tmp_path, session, prompt, captured):
 
 
 @pytest.mark.requires_agent_modules
-@pytest.mark.parametrize('saved_context', [False, True])
+@pytest.mark.parametrize('saved_context', [False, True, 'stopped-projection'])
 def test_same_process_stop_real_followup_worker_retains_subject(tmp_path, monkeypatch, saved_context):
     sid = 'live-worker-' + str(saved_context)
     db = tmp_path/'state.db'
@@ -65,6 +65,15 @@ def test_same_process_stop_real_followup_worker_retains_subject(tmp_path, monkey
     _make_state_db(db, sid, prior+stopped)
     config.STREAM_PARTIAL_TEXT[sid+'-stop'] = stopped[1]['content']
     assert streaming.cancel_stream(sid+'-stop')
+    if saved_context == 'stopped-projection':
+        # The real live partial carries exact run authority, but model context
+        # omits the display-only terminal. Late raw replay must stay excluded.
+        session.context_messages = copy.deepcopy([row for row in session.messages if not row.get('_error')])
+        session.save(touch_updated_at=False)
+        clock = max(float(row.get('timestamp') or 0) for row in session.messages)
+        with sqlite3.connect(db) as conn:
+            conn.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                         (sid, 'assistant', 'FORBIDDEN_CANCELLED_RAW', clock+5))
     models.SESSIONS.clear()  # cold sidecar load, same interpreter/process token
     session = models.get_session(sid)
     assert any(row.get('_partial') for row in session.messages)
