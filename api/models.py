@@ -12539,10 +12539,24 @@ def _selected_history_owns_live_partial(selected: list, owner_messages: list) ->
         saved_id, _ = _state_db_row_identity_details(saved)
         stable, _ = _stable_message_identity_details(local)
         saved_stable, _ = _stable_message_identity_details(saved)
-        return bool((valid and saved_valid and clock is not None and clock == saved_clock)
-                    or (row_id is not None and int(row_id) > 0 and row_id == saved_id)
-                    or (stable is not None and stable == saved_stable)
-                    or (token and token == saved_token))
+        if ((row_id is not None and int(row_id) > 0 and row_id == saved_id)
+                or (stable is not None and stable == saved_stable)
+                or (token and token == saved_token)):
+            return True
+        if not (valid and saved_valid and clock is not None and clock == saved_clock):
+            return False
+        if saved.get('_partial') and not local.get('_partial'):
+            return False  # An ordinary settled answer is not a live partial.
+        if _message_sidecar_role(saved) == 'user':
+            # Clock-only authority cannot choose between an earlier identical
+            # user and the current Stop owner. A trusted ID/token above can.
+            candidates = [row for row in owner_rows
+                          if _session_message_visible_key(row) == _session_message_visible_key(saved)
+                          and _message_exact_timestamp_details(row) == (saved_clock, True)
+                          and _message_private_identity_compatible(local, row)]
+            if len(candidates) != 1:
+                return False
+        return True
 
     for index, row in enumerate(selected):
         if str(row.get('role') or '').lower() != 'user' or not same_saved_row(row, user):

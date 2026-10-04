@@ -190,13 +190,14 @@ def test_partial_and_error_without_selected_user_cannot_veto_sqlite():
 
 
 @pytest.mark.parametrize('same_question', [False, True])
-def test_earlier_clock_collision_does_not_own_current_partial(tmp_path, monkeypatch, same_question):
+@pytest.mark.parametrize('older_clock', [10, 11])
+def test_earlier_clock_collision_does_not_own_current_partial(tmp_path, monkeypatch, same_question, older_clock):
     db = tmp_path/'state.db'
     monkeypatch.setattr(models, '_active_state_db_path', lambda: db)
     user = {'role': 'user', 'content': 'CURRENT_QUESTION', 'timestamp': 10}
     partial = {'role': 'assistant', 'content': 'Working on it', 'timestamp': 11, '_partial': True}
     older = [{'role': 'user', 'content': 'CURRENT_QUESTION' if same_question else 'OTHER_QUESTION', 'timestamp': 10},
-             {'role': 'assistant', 'content': 'Working on it', 'timestamp': 10}]
+             {'role': 'assistant', 'content': 'Working on it', 'timestamp': older_clock}]
     visible = copy.deepcopy(older)+[user, partial,
         {'role': 'assistant', 'content': 'Cancelled', 'timestamp': 12, '_error': True}]
     session = models.Session(session_id='clock-collision-'+str(same_question), messages=visible, context_messages=older)
@@ -213,4 +214,63 @@ def test_live_selected_guard_preserves_existing_role_casing_contract():
              {'role': 'ASSISTANT', 'content': 'PARTIAL', 'timestamp': 11, '_partial': True},
              {'role': 'ASSISTANT', 'content': 'Cancelled', 'timestamp': 12, '_error': True}]
     assert models._sidecar_has_terminal_partial_error(owner, live_only=True)
+    assert models._selected_history_owns_live_partial(owner[:2], owner)
+
+
+@pytest.mark.requires_agent_modules
+@pytest.mark.parametrize('older_partial', [False, True])
+def test_real_stop_earlier_identical_clocks_cannot_veto_next_worker(tmp_path, monkeypatch, older_partial):
+    sid = 'live-worker-identical-clocks-' + str(older_partial)
+    db = tmp_path/'state.db'
+    monkeypatch.setattr(models, '_active_state_db_path', lambda: db)
+    import time
+    from types import SimpleNamespace
+    actual_clock = streaming.time
+    monkeypatch.setattr(streaming, 'time', SimpleNamespace(
+        time=lambda: 11.0, monotonic=time.monotonic,
+        perf_counter=time.perf_counter, sleep=time.sleep))
+    prior = [{'role': 'user', 'content': 'SAME_QUESTION', 'timestamp': 10},
+             {'role': 'assistant', 'content': 'SAME_ANSWER', 'timestamp': 11}]
+    if older_partial:
+        prior[1]['_partial'] = True
+    session = _start_cancelled_turn(sid, sid+'-stop')
+    # A real chat-start checkpoint already contains the new user before Stop.
+    session.messages = copy.deepcopy(prior + [prior[0]])
+    session.context_messages = copy.deepcopy(prior)
+    session.pending_user_message = prior[0]['content']
+    session.save()
+    _make_state_db(db, sid, prior+[prior[0],
+        {'role': 'assistant', 'content': 'NEW_STOPPED_DB_CONTEXT', 'timestamp': 13}])
+    config.STREAM_PARTIAL_TEXT[sid+'-stop'] = prior[1]['content']
+    assert streaming.cancel_stream(sid+'-stop')
+    monkeypatch.setattr(streaming, 'time', actual_clock)
+    models.SESSIONS.clear()
+    session = models.get_session(sid)
+    captured = []
+    _worker(monkeypatch, tmp_path, session, 'Continue', captured)
+    assert 'NEW_STOPPED_DB_CONTEXT' in [row.get('content') for row in captured[0]]
+
+
+@pytest.mark.parametrize('authority', ['token', 'row-id', 'stable-id'])
+def test_trusted_current_owner_can_veto_despite_earlier_identical_clocks(authority):
+    earlier = [{'role': 'user', 'content': 'QUESTION', 'timestamp': 10},
+               {'role': 'assistant', 'content': 'PARTIAL', 'timestamp': 11, '_partial': True}]
+    current = copy.deepcopy(earlier)
+    key, value = {'token': ('_active_turn_token', 'CURRENT_RUN'),
+                  'row-id': ('_state_db_row_id', 7),
+                  'stable-id': ('id', 'CURRENT_USER')}[authority]
+    current[0][key] = value
+    owner = earlier + current + [{'role': 'assistant', 'content': 'Cancelled',
+                                  'timestamp': 12, '_error': True}]
+    assert not models._selected_history_owns_live_partial(earlier, owner)
+    assert models._selected_history_owns_live_partial(current, owner)
+
+
+def test_clock_only_settled_answer_cannot_own_partial_without_earlier_display_rows():
+    owner = [{'role': 'user', 'content': 'QUESTION', 'timestamp': 10},
+             {'role': 'assistant', 'content': 'PARTIAL', 'timestamp': 11, '_partial': True},
+             {'role': 'assistant', 'content': 'Cancelled', 'timestamp': 12, '_error': True}]
+    selected = copy.deepcopy(owner[:2])
+    selected[1].pop('_partial')
+    assert not models._selected_history_owns_live_partial(selected, owner)
     assert models._selected_history_owns_live_partial(owner[:2], owner)

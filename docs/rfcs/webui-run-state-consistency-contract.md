@@ -151,7 +151,11 @@ The live-partial veto belongs to the selected history: a displayed Stop cannot
 suppress SQLite completion of an older deferred model-context snapshot.
 Selected context may omit the display-only terminal carrier. Its user and each
 ordered saved partial still require compatible content plus shared identity or
-an exact valid clock; an earlier common answer cannot supply that ownership.
+an exact valid clock. Clock-only user proof must have exactly one compatible
+claimant in the complete owner history; duplicate earlier users need a trusted
+ID or turn token. Clock-only partial proof must retain the partial state, so an
+ordinary settled answer cannot supply that ownership. Trusted current user
+identity still anchors its selected segment when earlier rows share its clocks.
 Known owner IDs with changed content/time cannot enter the later-only fallback.
 A content/time tuple shared by an earlier saved user cannot identify a missing
 or restamped cancelled owner without a shared durable identity or turn token.
