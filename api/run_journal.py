@@ -494,38 +494,49 @@ def journal_replay_visible(event) -> bool:
 def _read_validated_recovery_events(
     path: Path, session_id: str, run_id: str,
 ) -> tuple[list[dict], list[dict]]:
-    """Read one bounded, contiguous owner before granting recovery authority."""
+    """Validate a complete durable run, tolerating an uncommitted torn EOF tail."""
     events: list[dict] = []
     line_no = 0
     try:
-        for current_line, raw, _total_bytes in _iter_bounded_raw_jsonl_lines(
-            path, max_bytes=_SESSION_REPLAY_MAX_BYTES,
-        ):
-            line_no = current_line
-            if not raw.strip():
-                continue
-            event = json.loads(raw.decode("utf-8"))
-            expected_seq = len(events) + 1
-            if not isinstance(event, dict) or (
-                type(event.get("seq")) is not int
-                or event["seq"] != expected_seq
-                or event.get("event_id") != f"{run_id}:{expected_seq}"
-                or event.get("run_id") != run_id
-                or event.get("session_id") != session_id
-            ):
-                raise ValueError("recovery_identity_or_sequence")
-            name = event.get("event")
-            if not isinstance(name, str) or not name or event.get("type", name) != name:
-                raise ValueError("recovery_event_type")
-            terminal_state = _terminal_state_for_event(name, event.get("payload"))
-            if (event.get("terminal") is not bool(terminal_state)
-                    or event.get("terminal_state") != terminal_state):
-                raise ValueError("recovery_terminal_identity")
-            if expected_seq > _SESSION_REPLAY_MAX_ROWS:
-                raise ValueError("recovery_limit_rows")
-            events.append(event)
+        # Client replay caps are not durable-recovery limits. Read incrementally
+        # without splitting lines or dropping a valid run's terminal snapshot.
+        with path.open("rb") as lines:
+            for current_line, raw in enumerate(lines, start=1):
+                line_no = current_line
+                if not raw.strip():
+                    continue
+                try:
+                    event = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    torn_utf8 = (
+                        isinstance(exc, UnicodeDecodeError)
+                        and exc.reason == "unexpected end of data"
+                        and exc.end == len(raw)
+                    )
+                    if not raw.endswith(b"\n") and (isinstance(exc, json.JSONDecodeError) or torn_utf8):
+                        return events, [{"line": line_no, "reason": "recovery_torn_tail"}]
+                    raise ValueError("recovery_malformed_row") from exc
+                expected_seq = len(events) + 1
+                if not isinstance(event, dict) or (
+                    type(event.get("seq")) is not int
+                    or event["seq"] != expected_seq
+                    or event.get("event_id") != f"{run_id}:{expected_seq}"
+                    or event.get("run_id") != run_id
+                    or event.get("session_id") != session_id
+                ):
+                    raise ValueError("recovery_identity_or_sequence")
+                name = event.get("event")
+                if not isinstance(name, str) or not name or event.get("type", name) != name:
+                    raise ValueError("recovery_event_type")
+                terminal_state = _terminal_state_for_event(name, event.get("payload"))
+                if (event.get("terminal") is not bool(terminal_state)
+                        or event.get("terminal_state") != terminal_state):
+                    raise ValueError("recovery_terminal_identity")
+                events.append(event)
+    except FileNotFoundError:
+        return events, []
     except (UnicodeDecodeError, ValueError) as exc:
-        # Never materialize a valid prefix or suffix from a rejected window.
+        # Complete malformed rows and semantic violations invalidate the run.
         return [], [{"line": line_no, "reason": str(exc)}]
     return events, []
 

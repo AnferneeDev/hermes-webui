@@ -118,14 +118,24 @@ retain visible output but cannot feed empty-context next-send replay or manual
 compression. Display-only reasoning and tool anchors retain that flag.
 
 Session-sidecar run-journal recovery consumers, including same-process terminal admission,
-validate the complete bounded read before materializing any row: exact session,
+validate the complete durable run before materializing any row: exact session,
 run and event identity, strictly integer sequences starting at 1 without gaps or
-duplicates, and terminal metadata matching the actual event. A malformed,
-foreign, noncontiguous or over-limit window yields no recovered rows and no
-terminal authority. Recovery reuses the existing 4 MiB / 4,096-row replay limits;
-it does not silently truncate a larger window. The hook remains retryable within
-its existing lifetime. Ordinary journal inspection/replay API reads retain their
-existing behavior; recovery explicitly opts into this stricter boundary.
+duplicates, and terminal metadata matching the actual event. A foreign,
+noncontiguous, semantically invalid or newline-terminated malformed row anywhere
+in the run yields no recovered rows and no terminal authority. Only an
+unterminated, unparseable JSON fragment at EOF (including an incomplete trailing
+UTF-8 codepoint) may be discarded while retaining the validated contiguous
+prefix. A valid final JSON row without a newline still requires all identity and
+terminal checks; arbitrary invalid UTF-8 is not a torn-tail exemption. A torn
+terminal fragment grants no terminal authority: same-process Stop admission
+still requires a real validated terminal row in the prefix.
+
+Authoritative restart and Stop recovery read the durable journal incrementally
+without the client replay endpoint's 4 MiB / 4,096-row limits. Long answers and
+large terminal session snapshots must remain recoverable. Client
+`read_session_run_events` retains those limits and its existing rejection
+behavior. Ordinary journal inspection reads remain unchanged; recovery opts into
+identity validation without making client replay capacity a durability limit.
 
 Journal-recovered segments retain `_recovered_from_run_journal` provenance,
 without the live `_partial` snapshot marker: distinct equal-text segments and

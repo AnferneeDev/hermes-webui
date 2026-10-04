@@ -2348,5 +2348,195 @@ def test_cancel_recovery_journal_boundaries_are_explicit(limit, oversized, monke
         monkeypatch.setattr(run_journal, "_SESSION_REPLAY_MAX_BYTES", size - 1 if oversized else size)
     _simulate_restart()
     recovered = models.get_session(sid)
-    assert bool(_stream_output(recovered, stream)) is (not oversized)
-    assert (_pending_stream_hook(recovered, stream) is not None) is oversized
+    assert _stream_output(recovered, stream)
+    assert _pending_stream_hook(recovered, stream) is None
+    replay = run_journal.read_session_run_events(
+        sid, after_event_id=f"{stream}:1",
+        max_rows=run_journal._SESSION_REPLAY_MAX_ROWS,
+        max_bytes=run_journal._SESSION_REPLAY_MAX_BYTES,
+    )
+    assert replay["status"] == (f"replay_limit_{limit}" if oversized else "ok")
+
+
+def _persist_recovery_boundary_turn(sid, stream, lifecycle):
+    session = _start_cancelled_turn(sid, stream)
+    session.messages = [{"role": "user", "content": session.pending_user_message,
+                         "timestamp": session.pending_started_at}]
+    session.context_messages = copy.deepcopy(session.messages)
+    session.save()
+    if lifecycle == "stop":
+        assert cancel_stream(stream)
+    return session
+
+
+def _assert_boundary_output_recovered(sid, stream, answer, *, completed, lifecycle):
+    from api import run_journal
+    _simulate_restart()
+    for _ in range(3):
+        recovered = models.get_session(sid)
+        outputs = _stream_output(recovered, stream)
+        assert [row.get("content") for row in outputs] == [answer]
+        assert any(row.get("content") == answer for row in _next_send_history(recovered))
+        assert _pending_stream_hook(recovered, stream) is None
+        markers = [row for row in recovered.messages if row.get("type") == "interrupted"]
+        if lifecycle == "stop" or completed:
+            assert not markers
+        else:
+            # A real nonterminal crash still gets the existing partial-output
+            # notice. A reader repair must not conceal that genuine interruption.
+            assert len(markers) == 1
+            assert "partial output above was recovered" in markers[0]["content"]
+            assert "no agent output was recovered" not in markers[0]["content"]
+        assert models._run_journal_terminal_state(recovered, stream) == (
+            "completed" if completed else None
+        )
+        assert run_journal.read_run_events(sid, stream, validated_recovery=True)["events"]
+        models.SESSIONS.clear()
+
+
+@pytest.mark.parametrize("lifecycle", ["crash", "stop"])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("token_rows", [4095, 4096, 4097])
+def test_authoritative_recovery_keeps_long_journal(lifecycle, completed, token_rows):
+    from api import run_journal
+    sid = f"long-recovery-{lifecycle}-{completed}-{token_rows}"
+    stream = sid + "-run"
+    session = _persist_recovery_boundary_turn(sid, stream, lifecycle)
+    writer = RunJournalWriter(sid, stream)
+    for _ in range(token_rows):
+        writer.append_sse_event("token", {"text": "x"})
+    if completed:
+        writer.append_sse_event("done", {"session": public_session_projection(session.__dict__)})
+    rows = token_rows + int(completed)
+    replay = run_journal.read_session_run_events(sid, after_event_id=f"{stream}:1")
+    assert replay["status"] == ("replay_limit_rows" if rows > 4096 else "ok")
+    _assert_boundary_output_recovered(
+        sid, stream, "x" * token_rows, completed=completed, lifecycle=lifecycle,
+    )
+
+
+@pytest.mark.parametrize("lifecycle", ["crash", "stop"])
+@pytest.mark.parametrize("large_event", ["token", "done"])
+def test_authoritative_recovery_keeps_journal_over_four_mib(lifecycle, large_event):
+    from api import run_journal
+    sid = f"large-recovery-{lifecycle}-{large_event}"
+    stream = sid + "-run"
+    session = _persist_recovery_boundary_turn(sid, stream, lifecycle)
+    writer = RunJournalWriter(sid, stream)
+    answer = "Long answer end" if large_event == "done" else "x" * (4 * 1024 * 1024) + "END"
+    writer.append_sse_event("token", {"text": answer})
+    if large_event == "done":
+        payload = public_session_projection(session.__dict__)
+        payload["messages"].append({"role": "assistant", "content": "x" * (4 * 1024 * 1024)})
+        writer.append_sse_event("done", {"session": payload})
+    assert run_journal._run_path(sid, stream).stat().st_size > 4 * 1024 * 1024
+    assert run_journal.read_session_run_events(
+        sid, after_event_id=f"{stream}:1",
+    )["status"] == "replay_limit_bytes"
+    _assert_boundary_output_recovered(
+        sid, stream, answer, completed=large_event == "done", lifecycle=lifecycle,
+    )
+
+
+@pytest.mark.parametrize("lifecycle", ["crash", "stop"])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("tail", [b'{"seq":', b'{"payload":{"text":"\xe2\x82'])
+def test_authoritative_recovery_keeps_valid_prefix_before_torn_tail(lifecycle, completed, tail):
+    from api import run_journal
+    sid = f"torn-recovery-{lifecycle}-{completed}-{len(tail)}"
+    stream = sid + "-run"
+    session = _persist_recovery_boundary_turn(sid, stream, lifecycle)
+    writer = RunJournalWriter(sid, stream)
+    answer = "Durable prefix answer"
+    writer.append_sse_event("token", {"text": answer})
+    if completed:
+        writer.append_sse_event("done", {"session": public_session_projection(session.__dict__)})
+    with run_journal._run_path(sid, stream).open("ab") as fh:
+        fh.write(tail)
+    _assert_boundary_output_recovered(sid, stream, answer, completed=completed, lifecycle=lifecycle)
+
+
+@pytest.mark.parametrize("same_process", [False, True])
+@pytest.mark.parametrize("tail_kind", [
+    "torn-cancel", "torn-after-cancel", "valid-foreign", "valid-gap",
+    "forged-terminal", "malformed-newline", "malformed-middle", "invalid-utf8",
+    "complete-no-newline",
+])
+def test_torn_tail_cannot_bypass_identity_or_terminal_admission(same_process, tail_kind):
+    import json
+    from api import run_journal
+    sid = f"tail-admission-{same_process}-{tail_kind}"
+    stream = sid + "-run"
+    _persist_recovery_boundary_turn(sid, stream, "stop")
+    writer = RunJournalWriter(sid, stream)
+    writer.append_sse_event("token", {"text": "Verified prefix"})
+    path = run_journal._run_path(sid, stream)
+    if tail_kind == "torn-cancel":
+        with path.open("ab") as fh:
+            fh.write(b'{"event":"cancel","terminal":true')
+    else:
+        terminal = writer.append_sse_event("cancel", {"message": "Stopped"})
+        if tail_kind in {"valid-foreign", "valid-gap", "forged-terminal"}:
+            if tail_kind == "valid-foreign":
+                terminal["session_id"] = "foreign-session"
+            elif tail_kind == "valid-gap":
+                terminal.update(seq=77, event_id=f"{stream}:77")
+            else:
+                terminal["terminal_state"] = "completed"
+            path.write_bytes(path.read_bytes().splitlines(keepends=True)[0]
+                             + json.dumps(terminal).encode())
+        elif tail_kind == "complete-no-newline":
+            path.write_bytes(path.read_bytes().rstrip(b"\n"))
+        else:
+            tail = b'{"seq":'
+            if tail_kind in {"malformed-newline", "malformed-middle"}:
+                tail += b"\n"
+            elif tail_kind == "invalid-utf8":
+                tail = b'{"text":"\xff"}'
+            with path.open("ab") as fh:
+                fh.write(tail)
+                if tail_kind == "malformed-middle":
+                    fh.write(json.dumps(terminal).encode() + b"\n")
+    if same_process:
+        config.ACTIVE_RUNS.clear()
+        models.SESSIONS.clear()
+    else:
+        _simulate_restart()
+    allowed = tail_kind in {"torn-after-cancel", "complete-no-newline"} or (
+        tail_kind == "torn-cancel" and not same_process
+    )
+    for _ in range(2):
+        recovered = models.get_session(sid)
+        assert bool(_stream_output(recovered, stream)) is allowed
+        assert (_pending_stream_hook(recovered, stream) is None) is allowed
+        models.SESSIONS.clear()
+
+
+@pytest.mark.parametrize("corruption", ["foreign-session", "gap", "terminal", "malformed"])
+def test_long_recovery_still_validates_rows_outside_client_and_sequence_windows(corruption):
+    import json
+    from api import run_journal
+    sid = f"long-invalid-{corruption}"
+    stream = sid + "-run"
+    _persist_recovery_boundary_turn(sid, stream, "stop")
+    writer = RunJournalWriter(sid, stream)
+    for _ in range(4096):
+        writer.append_sse_event("token", {"text": "x"})
+    bad = writer.append_sse_event("cancel", {"message": "Stopped"})
+    if corruption == "foreign-session":
+        bad["session_id"] = "foreign-session"
+    elif corruption == "gap":
+        bad.update(seq=77, event_id=f"{stream}:77")
+    elif corruption == "terminal":
+        bad["terminal"] = False
+    path = run_journal._run_path(sid, stream)
+    rows = path.read_bytes().splitlines(keepends=True)
+    rows[-1] = b"{malformed\n" if corruption == "malformed" else json.dumps(bad).encode()
+    path.write_bytes(b"".join(rows))
+    filtered = run_journal.read_run_events(sid, stream, max_seq=1, validated_recovery=True)
+    assert filtered["events"] == []
+    assert filtered["malformed"]
+    _simulate_restart()
+    recovered = models.get_session(sid)
+    assert not _stream_output(recovered, stream)
+    assert _pending_stream_hook(recovered, stream) is not None
