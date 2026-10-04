@@ -1753,6 +1753,13 @@ class Session:
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}
         payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+        try:
+            payload.encode('utf-8')
+        except UnicodeEncodeError:
+            # Journal recovery may preserve a lone provider surrogate. Escape
+            # it losslessly before touching the atomic sidecar temp file, just
+            # as the journal writer does, so repeated cold loads can commit.
+            payload = json.dumps({**meta, **extra}, ensure_ascii=True, indent=2)
 
         # ── #1558 backup safeguard ──────────────────────────────────────
         # Before overwriting the session file, copy the previous version to

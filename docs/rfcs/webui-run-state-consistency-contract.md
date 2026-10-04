@@ -71,8 +71,41 @@ sequence numbers and write their rows under the same per-path lock.
 `RunJournalWriter` delegates both operations to `append_run_event`; it must not
 reserve a sequence and release the lock before the physical append. Otherwise
 individually valid rows can reach disk out of order and the session replay
-reader must reject them as noncontiguous. This does not change caller-supplied
-sequence semantics, cross-process ownership, or failed-write recovery.
+reader must reject them as noncontiguous.
+
+The durable run-journal file and its next-sequence cache are one append
+transaction under that lock. Encode the full JSON row before file mutation,
+using lossless JSON escapes for lone provider surrogates. Publish the next
+sequence only after all bytes and the configured fsync succeed. Positive short
+writes are completed; zero-progress writes and exceptions roll the same open
+file descriptor back to its pre-append length and evict the sequence and summary
+caches. If rollback itself fails, report failure and leave the sequence cache
+evicted: the next attempt must inspect the actual file rather than assume success.
+The existing terminal-only/eager fsync policy is unchanged; these exception
+checks do not certify physical power-loss behavior or recovery from a filesystem
+that cannot truncate a failed write.
+Authoritative recovery reads share the same path lock, so same-process cancel
+admission cannot observe a speculative terminal row before a failed fsync and
+rollback settle. Generic inspection and client replay keep their existing read
+policy.
+
+On the first append to a path in a new process (or after cache eviction), inspect
+the held file descriptor, validate the existing rows, and plan tail repair before
+encoding the new event. Discard only the same unparseable, unterminated EOF
+fragment that recovery can ignore; retain every validated prefix row. A valid
+unterminated final row gets a newline rather than being discarded. Complete
+malformed rows, foreign identities and conflicting terminal metadata prohibit
+an append without rewriting the evidence. Hot appends do not reparse the file.
+Explicit caller sequences retain their writer contract: cold writer seeding may
+continue strictly increasing positive sequence gaps without renumbering rows.
+This writer-only acceptance grants no recovery or terminal authority; recovery
+still requires contiguous sequences starting at 1. Already-written gaps are not
+migrated or made authoritative by this repair. Cross-process concurrent writers
+remain outside the per-process ownership contract.
+
+Session-sidecar atomic saves also use lossless JSON escapes when recovered
+provider surrogates cannot be encoded as UTF-8, so journal recovery survives
+subsequent cold loads rather than only appearing in the in-memory session.
 
 
 ## Cancelled journal-only restart recovery
