@@ -18892,7 +18892,13 @@ def _handle_session_export(handler, parsed):
                         palette = parsed_palette
             except Exception:
                 palette = None
-        payload = render_session_html(safe, theme=theme, palette=palette).encode(
+        html = render_session_html(safe, theme=theme, palette=palette)
+        # Join provider UTF-16 halves for presentation, while leaving durable
+        # session/journal text unchanged. Lone halves retain replacement output.
+        html = html.encode('utf-16-le', errors='surrogatepass').decode(
+            'utf-16-le', errors='replace'
+        )
+        payload = html.encode(
             "utf-8", errors="replace"
         )
         content_type = "text/html; charset=utf-8"

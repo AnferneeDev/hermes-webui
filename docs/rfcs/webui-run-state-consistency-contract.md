@@ -133,8 +133,8 @@ escape fallback before sending UTF-8 bytes. Ordinary Unicode, event IDs, payload
 shape and compact/pretty JSON formatting retain their existing behavior, so a
 persisted recovered answer is both reloadable and observable over HTTP. JSON
 exports and atomic share snapshots use the same lossless byte encoder. HTML
-exports replace unencodable surrogate code units at their UTF-8 presentation
-boundary. Exports prepare the complete body before sending headers, and use
+exports join paired UTF-16 surrogate halves and replace lone code units at
+their UTF-8 presentation boundary. Exports prepare the complete body before sending headers, and use
 those same bytes for Content-Length and the response body; journal and JSON
 transcript text remain lossless.
 Ordinary journal-recovered rows do not by themselves suppress newer state.db
@@ -147,6 +147,8 @@ store needs a user strictly newer than the terminal carrier. Missing, conflictin
 or ambiguous ownership grants no replay authority. Keep this cutoff after later
 rows persist, before display pagination or model-context delta selection; live
 partial, exact identity/deduplication, compression and truncation guards remain.
+The live-partial veto belongs to the selected history: a displayed Stop cannot
+suppress SQLite completion of an older deferred model-context snapshot.
 Known owner IDs with changed content/time cannot enter the later-only fallback.
 A content/time tuple shared by an earlier saved user cannot identify a missing
 or restamped cancelled owner without a shared durable identity or turn token.
@@ -162,6 +164,16 @@ Consume each saved successor only with shared valid message/positive row identit
 or an exact non-null timestamp, plus compatible provider content. Cancelled
 consumers opt into private SQLite row IDs so newly accepted successors retain
 that proof through sidecar persistence; ordinary reader projection is unchanged.
+Both streaming snapshot reads and session-ops preserve those IDs. Cancelled
+session-ops reads require the complete owner snapshot rather than a bounded tail.
+Historical IDs survive Agent sanitization through the proved pre-turn prefix.
+For Agents predating `persist_user_timestamp`, cancelled-session invocations
+observe the actual same-thread SQLite append return IDs during their indexed
+flush. A complete compatible batch binds those IDs to the exact written dicts;
+the old Agent's indexed current user retains the captured WebUI run token.
+Foreign-session/thread writes, incomplete/failed batches, invalid or conflicting
+IDs grant no mapping. The append method is restored on every exit. This creates
+new write provenance; it does not infer identity from legacy transcript text.
 Historical rows without that mapping remain distinct rather than losing a new
 turn. This can retain an ambiguous historical duplicate; do not claim universal
 deduplication of unidentifiable legacy/restamped histories.

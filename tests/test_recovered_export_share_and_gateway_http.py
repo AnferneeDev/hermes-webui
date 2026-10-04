@@ -196,3 +196,38 @@ def test_share_snapshot_surrogate_fault_keeps_previous_file_and_cleans_temp(tmp_
         shares._write_json_atomic(path, {'messages': [{'content': '\ud83d'}]})
     assert path.read_bytes() == original
     assert not list(tmp_path.glob('*.tmp'))
+
+
+def test_get_restamped_cancel_successors_uses_ids_and_complete_owner_read(tmp_path):
+    root, env, sid, stream, journal, raw = _seed(tmp_path, 'stop', TOKENS[3], 'before-restart')
+    prepare = r"""
+import sqlite3,sys
+from api import models
+session=models.get_session(sys.argv[1])
+session.messages=models.reconciled_state_db_messages_for_session(session)
+session.context_messages=models.reconciled_state_db_messages_for_session(session,prefer_context=True)
+assert all(row.get('_state_db_row_id',0)>0 for row in session.messages[-4:])
+session.save(touch_updated_at=False)
+with sqlite3.connect(models._active_state_db_path()) as db:
+    db.execute('UPDATE messages SET timestamp=timestamp+30 WHERE session_id=? AND id>3',(session.session_id,))
+    db.executemany('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',[
+        (session.session_id,'user','NEW_GATEWAY_REQUEST',60),
+        (session.session_id,'assistant','NEW_GATEWAY_ANSWER',61)])
+"""
+    result = subprocess.run([sys.executable, '-c', prepare, sid], cwd=root, env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    with _new_server(env, root, tmp_path/'identity-get-server.log') as base:
+        for limit in ['all', '30', '2']:
+            status, body, _ = _request(base, '/api/session?session_id='+sid+'&msg_limit='+limit)
+            assert status == 200
+            payload = json.loads(body)['session']
+            rows = payload['messages']
+            contents = [row.get('content') for row in rows]
+            assert contents[-2:] == ['NEW_GATEWAY_REQUEST', 'NEW_GATEWAY_ANSWER']
+            if limit != '2':
+                for text in ['LATER_GATEWAY_REQUEST','LATER_GATEWAY_ANSWER','SECOND_GATEWAY_REQUEST','SECOND_GATEWAY_ANSWER']:
+                    assert contents.count(text) == 1
+            assert not any('_state_db_row_id' in row for row in rows)
+            assert 'CANCELLED_RUN_REPLAY' not in contents and 'CANCELLED_TOOL_REPLAY' not in contents
+    assert journal.read_bytes() == raw

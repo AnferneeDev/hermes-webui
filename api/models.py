@@ -11774,6 +11774,8 @@ def _message_exact_timestamp_details(message: dict | None) -> tuple[float | None
     """Return ``(timestamp, valid)`` while distinguishing absent metadata."""
     if not isinstance(message, dict):
         return None, True
+    if any(isinstance(message.get(key), bool) for key in ("timestamp", "_ts")):
+        return None, False
     for key in ("timestamp", "_ts"):
         if key not in message or message.get(key) in (None, ""):
             continue
@@ -12500,6 +12502,8 @@ def _sidecar_has_terminal_partial_error(sidecar_messages: list, *, live_only: bo
         if str(messages[idx].get("role") or "").lower() == "user":
             segment_start = idx + 1
             break
+    if live_only and segment_start == 0:
+        return False  # A partial/error-only context does not own the user turn.
     for msg in messages[segment_start:latest_error_idx]:
         if str(msg.get("role") or "").lower() == "assistant" and (
             msg.get("_partial") or (not live_only and msg.get("_recovered_from_cancel_journal") is True)
@@ -13077,9 +13081,11 @@ def _merge_session_messages_append_only_impl(
     state_messages = list(state_messages or [])
     owner_messages = sidecar_messages if cancelled_journal_owner_messages is None else cancelled_journal_owner_messages
     post_cancel_state = False
-    if (_sidecar_has_terminal_partial_error(owner_messages, live_only=True)
+    if (_sidecar_has_terminal_partial_error(sidecar_messages, live_only=True)
             or (incoming_provenance != 'state_db' and _sidecar_has_terminal_partial_error(owner_messages))):
-        state_messages = []  # Retain the current live-partial guard, including model context.
+        # The selected history owns the veto. Deferred model context can still
+        # precede the displayed Stop; SQLite must fill that older snapshot.
+        state_messages = []
     elif incoming_provenance == 'state_db' and _cancelled_journal_turn_owner(owner_messages):
         source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
         proved_suffix = _state_db_after_cancelled_journal_turn(owner_messages, source_messages)

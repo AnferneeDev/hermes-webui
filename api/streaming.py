@@ -82,10 +82,12 @@ from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
     StateDBSessionMessagesSnapshot,
+    _cancelled_journal_turn_owner,
     _WEBUI_TRUSTED_AGENT_INPUT_FIELD,
     _is_empty_partial_activity_message,
     _message_exact_timestamp_details,
     _message_private_identity_compatible,
+    _state_db_row_identity_details,
     _validated_webui_pending_user_timestamp_identity,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
@@ -7564,6 +7566,12 @@ def _restore_reasoning_metadata_before_boundary(
             # with their display counterpart.
             if prev_msg.get('id') is not None and cur_msg.get('id') is None:
                 cur_msg['id'] = prev_msg['id']
+            # SQLite identity is private replay provenance, stripped before
+            # Agent input. Restore it only on this proved historical prefix,
+            # never onto the active turn even when the text is identical.
+            if (prev_msg.get('_state_db_row_id') is not None
+                    and cur_msg.get('_state_db_row_id') is None):
+                cur_msg['_state_db_row_id'] = prev_msg['_state_db_row_id']
             if (
                 prev_msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is True
                 and cur_msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is not True
@@ -10172,6 +10180,103 @@ def _register_pending_user_timestamp_identity(
         save(touch_updated_at=False, skip_index=True)
 
 
+def _preserve_legacy_agent_row_identity(callable_obj, identity):
+    """Keep IDs returned by an older Agent's actual SQLite append calls.
+
+    Pre-timestamp Agents discard these IDs and return unstamped message dicts.
+    Observe only this flush's calls on its own thread/DB instance, then attach
+    the returned IDs to those exact dicts. This is write provenance, not a
+    content-only guess about an independently read historical transcript.
+    """
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return
+    if 'persist_user_timestamp' in parameters:
+        return
+    agent = getattr(callable_obj, '__self__', None)
+    context = getattr(agent, '_webui_legacy_identity_context', None)
+    if not isinstance(identity, dict):
+        if isinstance(context, threading.local):
+            context.owner = None
+        return
+    flush = getattr(agent, '_flush_messages_to_session_db', None)
+    if not callable(flush):
+        return
+    if not isinstance(context, threading.local):
+        context = threading.local()
+        agent._webui_legacy_identity_context = context
+    context.owner = copy.deepcopy(identity)
+    if getattr(agent, '_webui_legacy_identity_adapter', False):
+        return
+
+    def flush_with_identity(messages, conversation_history=None):
+        owner = copy.deepcopy(getattr(context, 'owner', None))
+        if not isinstance(owner, dict):
+            return flush(messages, conversation_history)
+        db = getattr(agent, '_session_db', None)
+        append = getattr(db, 'append_message', None)
+        namespace = getattr(db, '__dict__', None)
+        if not callable(append) or not isinstance(namespace, dict):
+            return flush(messages, conversation_history)
+        lock = namespace.setdefault('_webui_legacy_identity_lock', threading.RLock())
+        with lock:
+            original_override = namespace.get('append_message')
+            had_override = 'append_message' in namespace
+            sid = getattr(agent, 'session_id', None)
+            start = max(len(conversation_history or []), getattr(agent, '_last_flushed_db_idx', 0))
+            rows = list(messages[start:])
+            observed = []
+            owner_thread = threading.get_ident()
+
+            def observed_append(*args, **kwargs):
+                row_id = append(*args, **kwargs)
+                if threading.get_ident() == owner_thread:
+                    observed.append((kwargs, row_id))
+                return row_id
+
+            db.append_message = observed_append
+            try:
+                result = flush(messages, conversation_history)
+            finally:
+                if namespace.get('append_message') is observed_append:
+                    if had_override:
+                        db.append_message = original_override
+                    else:
+                        del db.append_message
+            if (getattr(agent, '_session_db', None) is not db
+                    or getattr(agent, 'session_id', None) != sid
+                    or not rows or len(rows) != len(observed)):
+                return result
+            ids = [row_id for _, row_id in observed]
+            if not all(type(row_id) is int and row_id > 0 for row_id in ids) or len(set(ids)) != len(ids):
+                return result
+            for row, (written, row_id) in zip(rows, observed, strict=True):
+                known_id, valid = _state_db_row_identity_details(row)
+                if (not isinstance(row, dict) or written.get('session_id') != sid
+                        or written.get('role') != row.get('role')
+                        or written.get('content') != row.get('content')
+                        or not valid or known_id not in (None, str(row_id))):
+                    return result
+            for row, row_id in zip(rows, ids, strict=True):
+                row['_state_db_row_id'] = row_id
+            # The old Agent exports an index but no turn_id. Its own indexed
+            # dict plus this successful append proves the active user; retain
+            # WebUI's run token so shared settlement does not insert it again.
+            index = getattr(agent, '_persist_user_message_idx', None)
+            if (isinstance(owner, dict) and owner.get('session_id') == sid
+                    and getattr(context, 'owner', None) == owner
+                    and owner.get('token') and type(index) is int
+                    and start <= index < start + len(rows)
+                    and _active_turn_user_text_matches(messages[index], owner.get('text'))):
+                stamp_message_source(messages[index], owner.get('source') or 'webui',
+                                     active_turn_token=owner['token'])
+            return result
+
+    agent._flush_messages_to_session_db = flush_with_identity
+    agent._webui_legacy_identity_adapter = True
+
+
 def _build_run_conversation_kwargs(
     callable_obj,
     *,
@@ -10182,13 +10287,15 @@ def _build_run_conversation_kwargs(
     task_id,
     persist_user_message,
     persist_user_timestamp,
+    legacy_row_identity_owner=None,
 ):
-    """Build one rolling-compatible Agent invocation contract without mutation.
+    """Build one rolling-compatible Agent invocation contract.
 
     ``persist_user_timestamp`` is signature-gated (#6935): an older
     hermes-agent whose ``run_conversation()`` predates the kwarg must not
     receive it, or the call trips a TypeError before the turn starts.
     """
+    _preserve_legacy_agent_row_identity(callable_obj, legacy_row_identity_owner)
     kwargs = {
         "user_message": user_message,
         "system_message": system_message,
@@ -12723,6 +12830,8 @@ def _run_agent_streaming(
                 session_id,
                 profile=getattr(s, 'profile', None),
                 with_revision=True,
+                **({'include_row_identity': True}
+                   if _cancelled_journal_turn_owner(s.messages) else {}),
             )
 
             def _context_and_revision_from_state_snapshot(state_snapshot):
@@ -12750,6 +12859,8 @@ def _run_agent_streaming(
                     session_id,
                     profile=getattr(s, 'profile', None),
                     with_revision=True,
+                    **({'include_row_identity': True}
+                       if _cancelled_journal_turn_owner(s.messages) else {}),
                 )
                 return _context_and_revision_from_state_snapshot(fresh_state_snapshot)
 
@@ -12877,6 +12988,9 @@ def _run_agent_streaming(
                 task_id=session_id,
                 persist_user_message=msg_text,
                 persist_user_timestamp=_persist_user_timestamp,
+                legacy_row_identity_owner=(
+                    _active_turn_identity if _cancelled_journal_turn_owner(s.messages) else None
+                ),
             )
             # Only pass moa_config when a /moa override is actually active, so a
             # normal send never trips a TypeError on an older hermes-agent whose
@@ -13490,6 +13604,9 @@ def _run_agent_streaming(
                                     task_id=session_id,
                                     persist_user_message=msg_text,
                                     persist_user_timestamp=_heal_persist_user_timestamp,
+                                    legacy_row_identity_owner=(
+                                        _active_turn_identity if _cancelled_journal_turn_owner(s.messages) else None
+                                    ),
                                 )
                                 if moa_config is not None:
                                     _heal_kwargs["moa_config"] = moa_config
@@ -14875,6 +14992,9 @@ def _run_agent_streaming(
                             task_id=session_id,
                             persist_user_message=msg_text,
                             persist_user_timestamp=_heal_persist_user_timestamp,
+                            legacy_row_identity_owner=(
+                                _active_turn_identity if _cancelled_journal_turn_owner(s.messages) else None
+                            ),
                         )
                         if moa_config is not None:
                             _heal_kwargs2["moa_config"] = moa_config
