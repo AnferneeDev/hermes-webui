@@ -149,6 +149,9 @@ rows persist, before display pagination or model-context delta selection; live
 partial, exact identity/deduplication, compression and truncation guards remain.
 The live-partial veto belongs to the selected history: a displayed Stop cannot
 suppress SQLite completion of an older deferred model-context snapshot.
+Selected context may omit the display-only terminal carrier. Its user and each
+ordered saved partial still require compatible content plus shared identity or
+an exact valid clock; an earlier common answer cannot supply that ownership.
 Known owner IDs with changed content/time cannot enter the later-only fallback.
 A content/time tuple shared by an earlier saved user cannot identify a missing
 or restamped cancelled owner without a shared durable identity or turn token.

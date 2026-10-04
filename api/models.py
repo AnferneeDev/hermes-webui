@@ -12518,33 +12518,44 @@ def _selected_history_owns_live_partial(selected: list, owner_messages: list) ->
         return False
     owner_rows = [row for row in owner_messages if isinstance(row, dict)]
     error_index = max(i for i, row in enumerate(owner_rows)
-                      if row.get('role') == 'assistant' and row.get('_error'))
-    user_index = max(i for i, row in enumerate(owner_rows[:error_index]) if row.get('role') == 'user')
+                      if str(row.get('role') or '').lower() == 'assistant' and row.get('_error'))
+    user_index = max(i for i, row in enumerate(owner_rows[:error_index])
+                     if str(row.get('role') or '').lower() == 'user')
     user = owner_rows[user_index]
     partials = [row for row in owner_rows[user_index+1:error_index]
-                if row.get('role') == 'assistant' and row.get('_partial')]
+                if str(row.get('role') or '').lower() == 'assistant' and row.get('_partial')]
     selected = [row for row in selected if isinstance(row, dict)]
+
+    def same_saved_row(local, saved):
+        if (not _message_private_identity_compatible(local, saved)
+                or _session_message_visible_key(local) != _session_message_visible_key(saved)):
+            return False
+        token, saved_token = local.get('_active_turn_token'), saved.get('_active_turn_token')
+        if token and saved_token and token != saved_token:
+            return False
+        clock, valid = _message_exact_timestamp_details(local)
+        saved_clock, saved_valid = _message_exact_timestamp_details(saved)
+        row_id, _ = _state_db_row_identity_details(local)
+        saved_id, _ = _state_db_row_identity_details(saved)
+        stable, _ = _stable_message_identity_details(local)
+        saved_stable, _ = _stable_message_identity_details(saved)
+        return bool((valid and saved_valid and clock is not None and clock == saved_clock)
+                    or (row_id is not None and int(row_id) > 0 and row_id == saved_id)
+                    or (stable is not None and stable == saved_stable)
+                    or (token and token == saved_token))
+
     for index, row in enumerate(selected):
-        if row.get('role') != 'user' or not _message_private_identity_compatible(row, user):
+        if str(row.get('role') or '').lower() != 'user' or not same_saved_row(row, user):
             continue
-        if (row.get('_active_turn_token') and user.get('_active_turn_token')
-                and row['_active_turn_token'] != user['_active_turn_token']):
-            continue
-        clock, valid = _message_exact_timestamp_details(row)
-        owner_clock, owner_valid = _message_exact_timestamp_details(user)
-        row_id, _ = _state_db_row_identity_details(row)
-        owner_id, _ = _state_db_row_identity_details(user)
-        stable, _ = _stable_message_identity_details(row)
-        owner_stable, _ = _stable_message_identity_details(user)
-        if not ((valid and owner_valid and clock is not None and clock == owner_clock)
-                or (row_id is not None and int(row_id) > 0 and row_id == owner_id)
-                or (stable is not None and stable == owner_stable)
-                or (row.get('_active_turn_token') and row.get('_active_turn_token') == user.get('_active_turn_token'))):
-            continue
-        end = next((i for i in range(index+1, len(selected)) if selected[i].get('role') == 'user'), len(selected))
-        if all(any(_message_private_identity_compatible(local, partial)
-                   and _session_message_visible_key(local) == _session_message_visible_key(partial)
-                   for local in selected[index+1:end]) for partial in partials):
+        end = next((i for i in range(index+1, len(selected))
+                    if str(selected[i].get('role') or '').lower() == 'user'), len(selected))
+        cursor = index+1
+        for partial in partials:
+            matched = next((i for i in range(cursor, end) if same_saved_row(selected[i], partial)), None)
+            if matched is None:
+                break
+            cursor = matched+1
+        else:
             return True
     return False
 

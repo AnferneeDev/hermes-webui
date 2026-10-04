@@ -187,3 +187,30 @@ def test_partial_and_error_without_selected_user_cannot_veto_sqlite():
     state = [{'role': 'user', 'content': 'MISSING_SUBJECT', 'timestamp': 13}]
     result = models.merge_session_messages_append_only(selected, state, incoming_provenance='state_db')
     assert any(row.get('content') == 'MISSING_SUBJECT' for row in result)
+
+
+@pytest.mark.parametrize('same_question', [False, True])
+def test_earlier_clock_collision_does_not_own_current_partial(tmp_path, monkeypatch, same_question):
+    db = tmp_path/'state.db'
+    monkeypatch.setattr(models, '_active_state_db_path', lambda: db)
+    user = {'role': 'user', 'content': 'CURRENT_QUESTION', 'timestamp': 10}
+    partial = {'role': 'assistant', 'content': 'Working on it', 'timestamp': 11, '_partial': True}
+    older = [{'role': 'user', 'content': 'CURRENT_QUESTION' if same_question else 'OTHER_QUESTION', 'timestamp': 10},
+             {'role': 'assistant', 'content': 'Working on it', 'timestamp': 10}]
+    visible = copy.deepcopy(older)+[user, partial,
+        {'role': 'assistant', 'content': 'Cancelled', 'timestamp': 12, '_error': True}]
+    session = models.Session(session_id='clock-collision-'+str(same_question), messages=visible, context_messages=older)
+    _make_state_db(db, session.session_id, copy.deepcopy(older)+[user,
+        {'role': 'assistant', 'content': 'NEW_STOPPED_DB_CONTEXT', 'timestamp': 13}])
+    assert not models._selected_history_owns_live_partial(older, visible)
+    snapshot = models.get_state_db_session_messages(session.session_id, with_revision=True)
+    merged = models.reconciled_state_db_messages_for_session(session, prefer_context=True, state_messages=snapshot)
+    assert 'NEW_STOPPED_DB_CONTEXT' in [row.get('content') for row in merged]
+
+
+def test_live_selected_guard_preserves_existing_role_casing_contract():
+    owner = [{'role': 'USER', 'content': 'QUESTION', 'timestamp': 10},
+             {'role': 'ASSISTANT', 'content': 'PARTIAL', 'timestamp': 11, '_partial': True},
+             {'role': 'ASSISTANT', 'content': 'Cancelled', 'timestamp': 12, '_error': True}]
+    assert models._sidecar_has_terminal_partial_error(owner, live_only=True)
+    assert models._selected_history_owns_live_partial(owner[:2], owner)
