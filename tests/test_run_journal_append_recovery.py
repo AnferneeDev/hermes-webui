@@ -356,3 +356,12 @@ def test_cancel_repair_cannot_observe_terminal_before_failed_fsync_rolls_back(mo
     assert models._run_journal_terminal_state(recovered, stream) is None
     assert writer.append_sse_event("done", {})["seq"] == 2
     _assert_boundary_output_recovered(sid, stream, "PREFIX", completed=True, lifecycle="stop")
+
+
+def test_missing_recovery_journal_does_not_allocate_a_writer_lock(tmp_path):
+    sid, stream = "missing-reader-session", "missing-reader-run"
+    parent = str(tmp_path / run_journal.RUN_JOURNAL_DIR_NAME / sid)
+    result = run_journal.read_run_events(sid, stream, session_dir=tmp_path, validated_recovery=True)
+    assert result["events"] == []
+    assert run_journal.delete_run_journal(sid, session_dir=tmp_path) is False
+    assert not any(key[0] == parent for key in run_journal._WRITER_LOCKS)

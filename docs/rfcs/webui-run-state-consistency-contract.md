@@ -87,7 +87,8 @@ that cannot truncate a failed write.
 Authoritative recovery reads share the same path lock, so same-process cancel
 admission cannot observe a speculative terminal row before a failed fsync and
 rollback settle. Generic inspection and client replay keep their existing read
-policy.
+policy. Opening before lock allocation keeps missing-journal reads from retaining
+registry entries; existing-file reads still wait before scanning any bytes.
 
 On the first append to a path in a new process (or after cache eviction), inspect
 the held file descriptor, validate the existing rows, and plan tail repair before

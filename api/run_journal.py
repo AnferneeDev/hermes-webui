@@ -557,7 +557,10 @@ def _read_validated_recovery_events(
         # Recovery must not observe a complete terminal row between write and
         # a failed fsync/rollback in this process. Writer seeding calls the
         # scanner directly while holding this same lock, avoiding reentrancy.
-        with _lock_for(path), path.open("rb") as lines:
+        # Open first so an absent journal cannot retain a reader-only registry
+        # lock that deletion (no directory to remove) cannot evict. Do not read
+        # any bytes until the existing-file append transaction has settled.
+        with path.open("rb") as lines, _lock_for(path):
             events, malformed, _prefix_bytes = _scan_validated_journal(lines, session_id, run_id)
             return events, malformed
     except FileNotFoundError:
