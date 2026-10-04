@@ -248,11 +248,21 @@ if (-not $AgentDir) {
     #   * Selected root has no hermes_cli -> it is a bare source checkout, the
     #     one shape master's pass never accepted. Master would have gone on to
     #     some install further down its list, so this genuinely is a displaced
-    #     install. When the selected root DOES have hermes_cli (a pip-style
-    #     Agent, or an editable/`pip install -e` tree with run_agent.py plus
-    #     hermes_bootstrap.py) master's pass would have accepted that same root,
-    #     nothing was displaced, and the selected install stays authoritative
-    #     together with its interpreter.
+    #     install. When the selected root DOES have hermes_cli AND is not the
+    #     repo sibling (a pip-style Agent under HERMES_HOME / LOCALAPPDATA, or
+    #     an editable tree the server itself would also pick first), master's
+    #     pass would have accepted that same root, nothing was displaced, and
+    #     the selected install stays authoritative together with its
+    #     interpreter.
+    #
+    #   * The repo sibling is special: serverCandidates list it before the
+    #     LOCALAPPDATA install, while master's own order lists LOCALAPPDATA
+    #     before the sibling. A complete Agent checkout (run_agent.py +
+    #     hermes_cli/ + hermes_bootstrap.py together, no venv) therefore wins
+    #     the source-first pass here, then fails a hermes_cli-only "bare?"
+    #     guard and keeps the sibling — even though master would have kept the
+    #     installed Agent. Treat the sibling the same as a bare source for the
+    #     repair so that shape is covered too.
     #
     #   * Replacement is master's pick over master's own candidate order, not
     #     "any later root that happens to have a venv". Treating venv presence
@@ -268,9 +278,14 @@ if (-not $AgentDir) {
     # can take down startup on a machine whose install would have started fine.
     # $AgentDir and $Python are moved together so the exported
     # HERMES_WEBUI_AGENT_DIR and the interpreter stay the same install.
+    $selectedIsRepoSibling = $AgentDir -and (
+        $AgentDir -eq (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent'))
     if ($AgentDir -and
-        -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType Container) -and
-        -not (Test-Path (Join-Path $AgentDir 'venv\Scripts\python.exe'))) {
+        -not (Test-Path (Join-Path $AgentDir 'venv\Scripts\python.exe')) -and
+        (
+            -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType Container) -or
+            $selectedIsRepoSibling
+        )) {
         # Master's candidate order: %USERPROFILE%\.hermes, LOCALAPPDATA, then
         # Program Files, then the repo sibling. Built incrementally for the same
         # null-Path reason as $launcherOnlyCandidates above.

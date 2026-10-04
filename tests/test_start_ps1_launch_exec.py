@@ -94,7 +94,7 @@ def _write_env_probe_python(fixture: Path) -> Path:
 
 
 def _make_agent(root: Path, *, source: bool = False, venv: bool = False,
-                bootstrap: bool = False) -> Path:
+                bootstrap: bool = False, complete: bool = False) -> Path:
     """Build a hermes-agent-shaped directory.
 
     `source=True` means a bare source checkout: run_agent.py and no hermes_cli,
@@ -102,11 +102,20 @@ def _make_agent(root: Path, *, source: bool = False, venv: bool = False,
     the pip-style shape instead — hermes_cli and no run_agent.py — because that
     is what an installed Agent looks like, and keeping the two shapes disjoint
     is what lets the source-first pass be exercised at all.
+    `complete=True` is a full Agent source tree: run_agent.py + hermes_cli/ +
+    hermes_bootstrap.py together (the shape a real checkout has). That still
+    wins the source-first pass, but a hermes_cli-only "bare?" repair guard
+    would miss it — hence the dedicated complete-checkout regression below.
     `venv` adds the Windows venv path start.ps1 looks for; `bootstrap` adds the
     file managed_agent_startup.activate_managed_agent() imports to supply deps.
     """
     root.mkdir(parents=True, exist_ok=True)
-    if source:
+    if complete:
+        (root / "run_agent.py").write_text("", encoding="utf-8")
+        (root / "hermes_cli").mkdir(parents=True, exist_ok=True)
+        (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "hermes_bootstrap.py").write_text("", encoding="utf-8")
+    elif source:
         (root / "run_agent.py").write_text("", encoding="utf-8")
     else:
         (root / "hermes_cli").mkdir(parents=True, exist_ok=True)
@@ -115,7 +124,7 @@ def _make_agent(root: Path, *, source: bool = False, venv: bool = False,
         venv_python = root / "venv" / "Scripts" / "python.exe"
         venv_python.parent.mkdir(parents=True, exist_ok=True)
         venv_python.write_text("", encoding="utf-8")
-    if bootstrap:
+    if bootstrap and not complete:
         (root / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     return root
 
@@ -455,6 +464,48 @@ def test_sibling_bootstrap_exit_still_reaches_the_server(tmp_path, hermes_home_s
     assert "SERVER_BOUND" in output, (
         "activate_managed_agent() returned early because the installed Agent is "
         "pip-style, so the server reached its own code; got:\n" + output
+    )
+
+
+@pytest.mark.parametrize("hermes_home_set", [True, False])
+def test_complete_sibling_checkout_without_venv_still_reaches_the_server(
+    tmp_path, hermes_home_set
+):
+    """A complete sibling tree (run_agent + hermes_cli + bootstrap) is repaired.
+
+    Real Agent checkouts ship all three markers together. Source-first discovery
+    still prefers that sibling over a pip-style LOCALAPPDATA install, and a
+    repair keyed only on "no hermes_cli" then no-ops — leaving the launch on a
+    checkout whose hermes_bootstrap.py can SystemExit before the server binds.
+    The repair has to treat the repo sibling like a bare source for this shape.
+    """
+    fixture = tmp_path / "fx"
+    installed = _make_agent(fixture / "local" / "hermes" / "hermes-agent", venv=True)
+    venv_python = _make_venv_interpreter(installed)
+    sibling = _make_agent(fixture / "hermes-agent", complete=True)
+    (sibling / "hermes_bootstrap.py").write_text(
+        "raise SystemExit(7)\n", encoding="utf-8"
+    )
+
+    extra_env: dict[str, str | None] = {"HERMES_WEBUI_PYTHON": None}
+    if hermes_home_set:
+        (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+        extra_env["HERMES_HOME"] = str(fixture / "local" / "hermes")
+
+    code, output = _run_start_ps1(fixture, extra_env=extra_env, activate=True)
+
+    assert code == 0, (
+        "a complete sibling checkout's bootstrap exits 7 and must not decide "
+        "the launch; got:\n" + output
+    )
+    assert _agent_dir(output) == str(installed), (
+        "the installed Agent must win over a complete no-venv sibling; got:\n"
+        + output
+    )
+    assert _python(output) == str(venv_python), output
+    assert "SERVER_BOUND" in output, (
+        "activate_managed_agent() must reach the application marker; got:\n"
+        + output
     )
 
 

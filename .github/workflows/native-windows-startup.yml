@@ -401,9 +401,15 @@ jobs:
           $pf7 = Join-Path $root 'pf7'
           $selected7 = Join-Path (Join-Path $local7 'hermes') 'hermes-agent'
           $later7 = Join-Path $user7 'hermes-agent'
+          $laterVenv7 = Join-Path $later7 'venv\Scripts\python.exe'
           New-Item -ItemType Directory -Force -Path (Join-Path $selected7 'hermes_cli') | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $later7 'hermes_cli') | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $later7 'venv\Scripts') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $laterVenv7) | Out-Null
+          # Real file required: start.ps1 tests python.exe, not the Scripts dir.
+          Copy-Item -Force (Get-Command python).Source $laterVenv7
+          if (-not (Test-Path $laterVenv7 -PathType Leaf)) {
+            throw "pip-install-no-venv-keeps-root fixture: competing interpreter missing at $laterVenv7"
+          }
           New-Item -ItemType Directory -Force -Path $local7 | Out-Null
           New-Item -ItemType Directory -Force -Path $pf7 | Out-Null
           $out7 = Invoke-StartPs1Probe -Label 'pip-install-no-venv-keeps-root' -EnvMap @{
@@ -416,7 +422,6 @@ jobs:
           if ($out7 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$selected7")) {
             throw "pip-install-no-venv-keeps-root: a later venv displaced the selected install $selected7"
           }
-          $laterVenv7 = Join-Path $later7 'venv\Scripts\python.exe'
           if ($out7 -match [regex]::Escape("PROBE_PYTHON=$laterVenv7")) {
             throw "pip-install-no-venv-keeps-root: interpreter moved onto $laterVenv7, which belongs to a different Agent"
           }
@@ -435,8 +440,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path $selected8 | Out-Null
           Set-Content -Path (Join-Path $selected8 'run_agent.py') -Value '# source checkout'
           Set-Content -Path (Join-Path $selected8 'hermes_bootstrap.py') -Value 'pass'
+          $laterVenv8 = Join-Path $later8 'venv\Scripts\python.exe'
           New-Item -ItemType Directory -Force -Path (Join-Path $later8 'hermes_cli') | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $later8 'venv\Scripts') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $laterVenv8) | Out-Null
+          Copy-Item -Force (Get-Command python).Source $laterVenv8
+          if (-not (Test-Path $laterVenv8 -PathType Leaf)) {
+            throw "bootstrap-managed-no-venv-keeps-root fixture: competing interpreter missing at $laterVenv8"
+          }
           New-Item -ItemType Directory -Force -Path $local8 | Out-Null
           New-Item -ItemType Directory -Force -Path $pf8 | Out-Null
           $out8 = Invoke-StartPs1Probe -Label 'bootstrap-managed-no-venv-keeps-root' -EnvMap @{
@@ -449,7 +459,151 @@ jobs:
           if ($out8 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$selected8")) {
             throw "bootstrap-managed-no-venv-keeps-root: a later venv displaced the selected checkout $selected8"
           }
+          if ($out8 -match [regex]::Escape("PROBE_PYTHON=$laterVenv8")) {
+            throw "bootstrap-managed-no-venv-keeps-root: interpreter moved onto $laterVenv8"
+          }
           Write-Host "OK probe8: bootstrap-managed checkout without a venv keeps its root"
+
+
+      # Managed-activation probes. Selection probes above stub server.py so they
+      # never call activate_managed_agent(); these stage a disposable copy of the
+      # launcher plus the real helper and assert root/interpreter/exit/marker.
+      - name: Probe managed-activation layouts (pip vs sibling / pip no-venv)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'hermes-act'
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $pythonSrc = (Get-Command python).Source
+
+          function New-DisposableRepo {
+            param([string]$Name)
+            $repo = Join-Path $root $Name
+            New-Item -ItemType Directory -Force -Path $repo | Out-Null
+            Copy-Item -Force start.ps1 (Join-Path $repo 'start.ps1')
+            Copy-Item -Force managed_agent_startup.py (Join-Path $repo 'managed_agent_startup.py')
+            $server = @(
+              'from managed_agent_startup import activate_managed_agent'
+              ''
+              'activate_managed_agent()'
+              "print('SERVER_BOUND')"
+            ) -join "`n"
+            Set-Content -Path (Join-Path $repo 'server.py') -Value $server -Encoding UTF8
+            return $repo
+          }
+
+          function Invoke-ActivationProbe {
+            param(
+              [string]$Label,
+              [string]$Repo,
+              [hashtable]$EnvMap
+            )
+            $wrap = Join-Path $env:RUNNER_TEMP "start-ps1-act-$Label.ps1"
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('$ErrorActionPreference = ''Stop''')
+            [void]$sb.AppendLine('foreach ($k in @(''HERMES_WEBUI_AGENT_DIR'',''HERMES_HOME'',''HOME'',''HERMES_WEBUI_PYTHON'')) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }')
+            if (-not $EnvMap.ContainsKey('HERMES_WEBUI_STATE_DIR')) {
+              [void]$sb.AppendLine('Remove-Item -Path "Env:HERMES_WEBUI_STATE_DIR" -ErrorAction SilentlyContinue')
+            }
+            foreach ($k in $EnvMap.Keys) {
+              $v = [string]$EnvMap[$k]
+              $v = $v.Replace("'", "''")
+              [void]$sb.AppendLine(('[Environment]::SetEnvironmentVariable(''{0}'', ''{1}'', ''Process'')' -f $k, $v))
+            }
+            $repoEsc = $Repo.Replace("'", "''")
+            [void]$sb.AppendLine(('Set-Location -LiteralPath ''{0}''' -f $repoEsc))
+            [void]$sb.AppendLine('& .\start.ps1')
+            [void]$sb.AppendLine('exit $LASTEXITCODE')
+            Set-Content -Path $wrap -Value $sb.ToString() -Encoding UTF8
+            $out = & pwsh -NoProfile -File $wrap 2>&1 | Out-String
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+          }
+
+          # Activation A: pip-style LOCALAPPDATA install with a real venv vs a
+          # sibling complete checkout whose hermes_bootstrap.py exits.
+          $repoA = New-DisposableRepo 'repoA'
+          $localA = Join-Path $root 'localA'
+          $userA = Join-Path $root 'userA'
+          $pfA = Join-Path $root 'pfA'
+          $installedA = Join-Path (Join-Path $localA 'hermes') 'hermes-agent'
+          $siblingA = Join-Path (Split-Path -Parent $repoA) 'hermes-agent'
+          New-Item -ItemType Directory -Force -Path (Join-Path $installedA 'hermes_cli') | Out-Null
+          $venvA = Join-Path $installedA 'venv\Scripts\python.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $venvA) | Out-Null
+          # Real interpreter file so Test-Path and the launch both succeed.
+          Copy-Item -Force $pythonSrc $venvA
+          if (-not (Test-Path $venvA -PathType Leaf)) {
+            throw "activation-A fixture: installed venv interpreter missing"
+          }
+          New-Item -ItemType Directory -Force -Path $siblingA | Out-Null
+          Set-Content -Path (Join-Path $siblingA 'run_agent.py') -Value '# sibling source'
+          Set-Content -Path (Join-Path $siblingA 'hermes_bootstrap.py') -Value 'raise SystemExit(7)'
+          New-Item -ItemType Directory -Force -Path (Join-Path $siblingA 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path $userA | Out-Null
+          New-Item -ItemType Directory -Force -Path $pfA | Out-Null
+          $resA = Invoke-ActivationProbe -Label 'pip-vs-exiting-sibling' -Repo $repoA -EnvMap @{
+            LOCALAPPDATA = $localA
+            USERPROFILE = $userA
+            ProgramW6432 = $pfA
+            ProgramFiles = $pfA
+            'ProgramFiles(x86)' = $pfA
+          }
+          if ($resA.ExitCode -ne 0) {
+            throw "pip-vs-exiting-sibling: expected exit 0, got $($resA.ExitCode)`n$($resA.Output)"
+          }
+          if ($resA.Output -notmatch [regex]::Escape("Agent dir:  $installedA")) {
+            throw "pip-vs-exiting-sibling: expected installed Agent $installedA`n$($resA.Output)"
+          }
+          if ($resA.Output -notmatch [regex]::Escape("Python:     $venvA")) {
+            throw "pip-vs-exiting-sibling: expected installed venv $venvA`n$($resA.Output)"
+          }
+          if ($resA.Output -notmatch 'SERVER_BOUND') {
+            throw "pip-vs-exiting-sibling: activate_managed_agent did not reach the app marker`n$($resA.Output)"
+          }
+          Write-Host "OK activation-A: pip install beats exiting complete sibling; SERVER_BOUND"
+
+          # Activation B: selected pip install with no venv keeps root/interpreter
+          # against a later usable venv, through real managed activation.
+          $repoB = New-DisposableRepo 'repoB'
+          $localB = Join-Path $root 'localB'
+          $userB = Join-Path $root 'userB'
+          $pfB = Join-Path $root 'pfB'
+          $selectedB = Join-Path (Join-Path $localB 'hermes') 'hermes-agent'
+          $laterB = Join-Path $userB 'hermes-agent'
+          $laterVenvB = Join-Path $laterB 'venv\Scripts\python.exe'
+          New-Item -ItemType Directory -Force -Path (Join-Path $selectedB 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $laterB 'hermes_cli') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $laterVenvB) | Out-Null
+          Copy-Item -Force $pythonSrc $laterVenvB
+          if (-not (Test-Path $laterVenvB -PathType Leaf)) {
+            throw "activation-B fixture: competing interpreter missing"
+          }
+          New-Item -ItemType Directory -Force -Path $pfB | Out-Null
+          # start.ps1 Push-Locations into the disposable repo then runs
+          # `& $Python server.py`, so the system interpreter is enough —
+          # as long as we do not let a later Agent venv steal $Python.
+          $resB = Invoke-ActivationProbe -Label 'pip-no-venv-keeps-root-act' -Repo $repoB -EnvMap @{
+            LOCALAPPDATA = $localB
+            USERPROFILE = $userB
+            ProgramW6432 = $pfB
+            ProgramFiles = $pfB
+            'ProgramFiles(x86)' = $pfB
+            HERMES_WEBUI_PYTHON = $pythonSrc
+          }
+          if ($resB.ExitCode -ne 0) {
+            throw "pip-no-venv-keeps-root-act: expected exit 0, got $($resB.ExitCode)`n$($resB.Output)"
+          }
+          if ($resB.Output -notmatch [regex]::Escape("Agent dir:  $selectedB")) {
+            throw "pip-no-venv-keeps-root-act: later venv displaced $selectedB`n$($resB.Output)"
+          }
+          if ($resB.Output -match [regex]::Escape("Python:     $laterVenvB")) {
+            throw "pip-no-venv-keeps-root-act: interpreter moved onto $laterVenvB`n$($resB.Output)"
+          }
+          if ($resB.Output -notmatch 'SERVER_BOUND') {
+            throw "pip-no-venv-keeps-root-act: missing SERVER_BOUND`n$($resB.Output)"
+          }
+          Write-Host "OK activation-B: pip no-venv keeps root through managed activation"
 
 
       - name: Restore server.py
