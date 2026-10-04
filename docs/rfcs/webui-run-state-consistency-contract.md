@@ -66,8 +66,15 @@ reacquire this non-reentrant lock from a branch that already owns it.
 
 ## Run-journal sequence publication
 
-Within one WebUI process, auto-numbered appends to the same journal allocate
-sequence numbers and write their rows under the same per-path lock.
+Auto-numbered appends to the same journal allocate sequence numbers and write
+rows under the same per-path thread lock and a cooperating-process file lock.
+POSIX locks the held journal inode; native Windows uses a companion byte lock,
+retained while the journal exists. Unsupported lock backends fail closed.
+The process lock covers seed/tail repair, write, configured fsync and rollback;
+recovery reads wait for the same settlement. Inode/size/mtime/ctime signatures
+invalidate cached next sequences after a peer changes the held file, while
+unchanged hot appends still avoid a scan. Concurrent deletion or arbitrary
+external inode replacement is not covered by this append protocol.
 `RunJournalWriter` delegates both operations to `append_run_event`; it must not
 reserve a sequence and release the lock before the physical append. Otherwise
 individually valid rows can reach disk out of order and the session replay
@@ -84,9 +91,9 @@ evicted: the next attempt must inspect the actual file rather than assume succes
 The existing terminal-only/eager fsync policy is unchanged; these exception
 checks do not certify physical power-loss behavior or recovery from a filesystem
 that cannot truncate a failed write.
-Authoritative recovery reads share the same path lock, so same-process cancel
-admission cannot observe a speculative terminal row before a failed fsync and
-rollback settle. Generic inspection and client replay keep their existing read
+Authoritative recovery reads share the thread and process locks, so cancel
+admission cannot observe a cooperating writer's speculative terminal row before
+failed fsync and rollback settle. Generic inspection and client replay keep their existing read
 policy. Opening before lock allocation keeps missing-journal reads from retaining
 registry entries; existing-file reads still wait before scanning any bytes.
 
@@ -97,12 +104,16 @@ fragment that recovery can ignore; retain every validated prefix row. A valid
 unterminated final row gets a newline rather than being discarded. Complete
 malformed rows, foreign identities and conflicting terminal metadata prohibit
 an append without rewriting the evidence. Hot appends do not reparse the file.
-Explicit caller sequences retain their writer contract: cold writer seeding may
-continue strictly increasing positive sequence gaps without renumbering rows.
-This writer-only acceptance grants no recovery or terminal authority; recovery
-still requires contiguous sequences starting at 1. Already-written gaps are not
-migrated or made authoritative by this repair. Cross-process concurrent writers
-remain outside the per-process ownership contract.
+Newly written rows declare version 2, whose recovery contract is contiguous
+positive sequences, starting at 1 for a new run. Legacy version 1 (or absent
+version) consumed numbers on failed writes: identity-valid, strictly increasing
+positive legacy sequences remain recoverable without changing event IDs. A new
+writer may extend that legacy prefix with version 2 at the next sequence; every
+subsequent row must stay version 2 and gapless. Unknown/boolean versions,
+downgrades, duplicate/decreasing sequences and foreign identities are rejected.
+Explicit caller sequences retain their writer-seeding compatibility, but a
+gapped version-2 run receives no recovery or terminal authority. No rows are
+renumbered or historical files rewritten merely to migrate protocol versions.
 
 Session-sidecar atomic saves also use lossless JSON escapes when recovered
 provider surrogates cannot be encoded as UTF-8, so journal recovery survives
@@ -115,6 +126,16 @@ Guarded backup restoration uses the same lossless encoding before opening its
 temp file, including raw-copy and orphan backups. Restore the exact snapshot
 that authorized recovery; clear and intentional-shrink checks, effective row
 counts, atomic replacement and error cleanup keep their existing authority.
+
+
+JSON responses and SSE frames apply the same UnicodeEncodeError-only lossless
+escape fallback before sending UTF-8 bytes. Ordinary Unicode, event IDs, payload
+shape and compact/pretty JSON formatting retain their existing behavior, so a
+persisted recovered answer is both reloadable and observable over HTTP.
+Ordinary journal-recovered rows do not by themselves suppress newer state.db
+turns. The interrupted partial display guard retains live partials and explicit
+cancel-journal recovery ownership; later Gateway rows after ordinary crash
+recovery continue through the existing SQLite reconciliation path.
 
 
 ## Cancelled journal-only restart recovery

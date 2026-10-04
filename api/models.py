@@ -12490,7 +12490,7 @@ def _sidecar_has_terminal_partial_error(sidecar_messages: list) -> bool:
             break
     for msg in messages[segment_start:latest_error_idx]:
         if str(msg.get("role") or "").lower() == "assistant" and (
-            msg.get("_partial") or msg.get("_recovered_from_run_journal")
+            msg.get("_partial") or msg.get("_recovered_from_cancel_journal") is True
         ):
             return True
     return False

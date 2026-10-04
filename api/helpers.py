@@ -607,9 +607,14 @@ def _json_response_body(payload, *, pretty: bool = True) -> bytes:
     the public helper default stable for existing tests/callers; hot paths can
     opt into compact JSON with ``pretty=False``.
     """
-    if pretty:
-        return _json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
-    return _json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    formatting = {'indent': 2} if pretty else {'separators': (',', ':')}
+    body = _json.dumps(payload, ensure_ascii=False, **formatting)
+    try:
+        return body.encode('utf-8')
+    except UnicodeEncodeError:
+        # Recovery preserves provider surrogate halves losslessly. Keep the
+        # same payload/format while making its JSON safe for UTF-8 transport.
+        return _json.dumps(payload, ensure_ascii=True, **formatting).encode('utf-8')
 
 
 def j(handler, payload, status: int=200, extra_headers: dict=None, *, pretty: bool = True) -> None:

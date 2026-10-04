@@ -12,8 +12,19 @@ import threading
 import time
 from copy import deepcopy
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
+
+try:  # Native Windows uses its byte-range lock instead.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - native Windows
+    _fcntl = None
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    _msvcrt = None
+
 
 RUN_JOURNAL_DIR_NAME = "_run_journal"
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -24,6 +35,7 @@ _WRITER_LOCKS_GUARD = threading.Lock()
 # hot writers avoid rereading the growing file. The shared dict mutex also
 # protects structural access against cross-path deletion/eviction.
 _SEQ_CACHE: dict[str, int] = {}
+_SEQ_CACHE_SIGNATURES: dict[str, tuple[int, int, int, int, int]] = {}
 _SEQ_CACHE_LOCK = threading.Lock()
 # Summary callers only need terminal state and the latest cursor. Re-parsing a
 # completed journal's full payload (which can include multi-megabyte tool or
@@ -91,6 +103,42 @@ def _lock_for(path: Path) -> threading.Lock:
             lock = threading.Lock()
             _WRITER_LOCKS[key] = lock
         return lock
+
+
+@contextmanager
+def _journal_process_lock(fd: int, path: Path, *, shared: bool = False):
+    """Settle cooperating processes before seed/read/write/rollback.
+
+    POSIX locks the held journal inode. Native Windows uses a companion byte
+    lock; keep that file in place while this journal exists so waiters share it.
+    Unsupported lock backends fail closed before journal mutation.
+    """
+    if _fcntl is not None:
+        _fcntl.flock(fd, _fcntl.LOCK_SH if shared else _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        return
+    if _msvcrt is not None:
+        lock_fd = os.open(str(path) + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(lock_fd, 'r+b', buffering=0) as lock_file:
+            if os.fstat(lock_fd).st_size == 0:
+                lock_file.write(b'\0')
+            lock_file.seek(0)
+            _msvcrt.locking(lock_fd, _msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _msvcrt.locking(lock_fd, _msvcrt.LK_UNLCK, 1)
+        return
+    raise OSError('cross-process run journal locking is unavailable')
+
+
+def _held_journal_signature(fd: int) -> tuple[int, int, int, int, int]:
+    stat = os.fstat(fd)
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 def _summary_cache_signature(path: Path) -> tuple[int, int, int, int, int] | None:
@@ -365,65 +413,72 @@ def append_run_event(
         created_file = not path.exists()
         fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_RDWR, 0o600)
         try:
-            # Inspect the same inode that will receive the write. Only a cold
-            # cache seeds/repairs from disk; ordinary appends stay O(1).
-            size = os.fstat(fd).st_size
-            if cached_next is None:
-                with os.fdopen(os.dup(fd), "rb") as fh:
-                    fh.seek(0)
-                    next_seq, repair_size, add_newline = _prepare_journal_append(
-                        fh, str(session_id), str(run_id), size,
-                    )
-            else:
-                next_seq, repair_size, add_newline = cached_next, size, False
-            assigned_seq = int(seq) if seq is not None else next_seq
-            terminal_state = _terminal_state_for_event(event_name, payload)
-            event = {
-                "version": 1,
-                "event_id": f"{run_id}:{assigned_seq}",
-                "seq": assigned_seq,
-                "run_id": str(run_id),
-                "session_id": str(session_id),
-                "event": event_name,
-                "type": event_name,
-                "created_at": float(created_at if created_at is not None else time.time()),
-                "terminal": bool(terminal_state),
-                "terminal_state": terminal_state,
-                "payload": payload,
-            }
-            # Encode before mutating the file or publishing a sequence. JSON's
-            # ASCII escapes preserve lone provider surrogates without losing a
-            # row or replacing content; normal Unicode stays readable on disk.
-            line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-            try:
-                encoded = line.encode("utf-8")
-            except UnicodeEncodeError:
-                encoded = (json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
-            if add_newline:
-                encoded = b"\n" + encoded
-            try:
-                if repair_size != size:
-                    os.ftruncate(fd, repair_size)
-                remaining = memoryview(encoded)
-                while remaining:
-                    written = os.write(fd, remaining)
-                    if written <= 0:
-                        raise OSError("run journal write made no progress")
-                    remaining = remaining[written:]
-                if _should_fsync_event(terminal_state):
-                    os.fsync(fd)
-            except BaseException:
-                # No buffered close can flush a partial row after this rollback.
-                # Even if rollback itself fails, evict the cache so a later
-                # append must inspect/repair the actual file before proceeding.
+            with _journal_process_lock(fd, path):
+                # Inspect the same inode that will receive the write. Only a cold
+                # cache seeds/repairs from disk; ordinary appends stay O(1).
+                signature = _held_journal_signature(fd)
+                size = signature[2]
                 with _SEQ_CACHE_LOCK:
-                    _SEQ_CACHE.pop(key, None)
+                    if _SEQ_CACHE_SIGNATURES.get(key) != signature:
+                        cached_next = None
+                if cached_next is None:
+                    with os.fdopen(os.dup(fd), "rb") as fh:
+                        fh.seek(0)
+                        next_seq, repair_size, add_newline = _prepare_journal_append(
+                            fh, str(session_id), str(run_id), size,
+                        )
+                else:
+                    next_seq, repair_size, add_newline = cached_next, size, False
+                assigned_seq = int(seq) if seq is not None else next_seq
+                terminal_state = _terminal_state_for_event(event_name, payload)
+                event = {
+                    "version": 2,
+                    "event_id": f"{run_id}:{assigned_seq}",
+                    "seq": assigned_seq,
+                    "run_id": str(run_id),
+                    "session_id": str(session_id),
+                    "event": event_name,
+                    "type": event_name,
+                    "created_at": float(created_at if created_at is not None else time.time()),
+                    "terminal": bool(terminal_state),
+                    "terminal_state": terminal_state,
+                    "payload": payload,
+                }
+                # Encode before mutating the file or publishing a sequence. JSON's
+                # ASCII escapes preserve lone provider surrogates without losing a
+                # row or replacing content; normal Unicode stays readable on disk.
+                line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+                try:
+                    encoded = line.encode("utf-8")
+                except UnicodeEncodeError:
+                    encoded = (json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
+                if add_newline:
+                    encoded = b"\n" + encoded
+                try:
+                    if repair_size != size:
+                        os.ftruncate(fd, repair_size)
+                    remaining = memoryview(encoded)
+                    while remaining:
+                        written = os.write(fd, remaining)
+                        if written <= 0:
+                            raise OSError("run journal write made no progress")
+                        remaining = remaining[written:]
+                    if _should_fsync_event(terminal_state):
+                        os.fsync(fd)
+                except BaseException:
+                    # No buffered close can flush a partial row after this rollback.
+                    # Even if rollback itself fails, evict the cache so a later
+                    # append must inspect/repair the actual file before proceeding.
+                    with _SEQ_CACHE_LOCK:
+                        _SEQ_CACHE.pop(key, None)
+                        _SEQ_CACHE_SIGNATURES.pop(key, None)
+                    _discard_cached_summary(path)
+                    os.ftruncate(fd, repair_size)
+                    raise
+                with _SEQ_CACHE_LOCK:
+                    _SEQ_CACHE[key] = max(next_seq, assigned_seq + 1)
+                    _SEQ_CACHE_SIGNATURES[key] = _held_journal_signature(fd)
                 _discard_cached_summary(path)
-                os.ftruncate(fd, repair_size)
-                raise
-            with _SEQ_CACHE_LOCK:
-                _SEQ_CACHE[key] = max(next_seq, assigned_seq + 1)
-            _discard_cached_summary(path)
         finally:
             os.close(fd)
         if created_file:
@@ -485,6 +540,7 @@ def _scan_validated_journal(
     line_no = 0
     prefix_bytes = 0
     last_seq = 0
+    gapless_started = False
     try:
         for current_line, raw in enumerate(lines, start=1):
             line_no = current_line
@@ -503,11 +559,16 @@ def _scan_validated_journal(
                     return events, [{"line": line_no, "reason": "recovery_torn_tail"}], prefix_bytes
                 raise ValueError("recovery_malformed_row") from exc
             seq = event.get("seq") if isinstance(event, dict) else None
-            # Explicit caller sequences have an existing writer contract. A
-            # cold writer may continue increasing gaps, but recovery NEVER
-            # treats that writer-only acceptance as contiguous authority.
-            sequence_valid = (type(seq) is int and (
-                seq > last_seq if writer_seed else seq == len(events) + 1
+            # Version1 (or absent version) was written by the legacy producer,
+            # which consumed sequences on failed writes. Preserve increasing
+            # legacy cursor IDs; version2 declares gapless publication. Once
+            # upgraded, a run cannot downgrade its validation contract.
+            version = event.get('version', 1) if isinstance(event, dict) else None
+            if type(version) is not int or version not in (1, 2) or (gapless_started and version != 2):
+                raise ValueError('recovery_protocol_version')
+            gapless_started = gapless_started or version == 2
+            sequence_valid = (type(seq) is int and seq > last_seq and (
+                writer_seed or version == 1 or seq == last_seq + 1
             ))
             if not isinstance(event, dict) or (
                 not sequence_valid
@@ -561,8 +622,9 @@ def _read_validated_recovery_events(
         # lock that deletion (no directory to remove) cannot evict. Do not read
         # any bytes until the existing-file append transaction has settled.
         with path.open("rb") as lines, _lock_for(path):
-            events, malformed, _prefix_bytes = _scan_validated_journal(lines, session_id, run_id)
-            return events, malformed
+            with _journal_process_lock(lines.fileno(), path, shared=True):
+                events, malformed, _prefix_bytes = _scan_validated_journal(lines, session_id, run_id)
+                return events, malformed
     except FileNotFoundError:
         return [], []
 
@@ -911,8 +973,9 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         # so a concurrent append on another path
         # cannot mutate the dict mid-iteration (``dictionary changed size``).
         with _SEQ_CACHE_LOCK:
-            for cache_key in [entry for entry in _SEQ_CACHE if str(Path(entry).parent) == dir_key]:
-                del _SEQ_CACHE[cache_key]
+            for cache in (_SEQ_CACHE, _SEQ_CACHE_SIGNATURES):
+                for cache_key in [entry for entry in cache if str(Path(entry).parent) == dir_key]:
+                    del cache[cache_key]
         with _SUMMARY_CACHE_LOCK:
             for cache_key in [entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key]:
                 del _SUMMARY_CACHE[cache_key]

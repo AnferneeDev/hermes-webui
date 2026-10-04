@@ -9559,7 +9559,12 @@ def _sse_keepalive(handler) -> None:
 def _sse(handler, event, data):
     """Write one SSE event to the response stream."""
     payload = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-    _sse_write(handler, payload.encode('utf-8'))
+    try:
+        encoded = payload.encode('utf-8')
+    except UnicodeEncodeError:
+        payload = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
+        encoded = payload.encode('utf-8')
+    _sse_write(handler, encoded)
 
 
 # ── SSE write deadline (Defect A: per-connection thread exhaustion) ─────────
