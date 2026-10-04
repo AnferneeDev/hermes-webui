@@ -10997,13 +10997,19 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     default_model,
                 )
             else:
-                all_ids_norm = {
+                # Model IDs are provider-scoped: an OpenAI API entry cannot
+                # satisfy a configured Codex default with the same bare ID.
+                # Keep the global fallback only when no active group exists.
+                active_groups = [
+                    g for g in groups if g.get("provider_id") == active_provider
+                ] if active_provider else []
+                existing_ids_norm = {
                     _norm_model_id(m["id"])
-                    for g in groups
+                    for g in (active_groups or groups)
                     for bucket_name in ("models", "extra_models")
                     for m in g.get(bucket_name, [])
                 }
-                if _norm_model_id(default_model) not in all_ids_norm:
+                if _norm_model_id(default_model) not in existing_ids_norm:
                     label = _get_label_for_model(default_model, groups)
                     target_display = (
                         _PROVIDER_DISPLAY.get(active_provider, active_provider or "").lower()

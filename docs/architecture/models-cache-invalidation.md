@@ -40,6 +40,12 @@ The over-budget stale fallback (`_load_stale_models_cache_from_disk`) tolerates 
 
 ## Codex catalog and routing
 
+The configured default is checked against the active provider's own group
+(including its overflow entries), not against matching bare IDs in other
+providers' groups. An OpenAI API entry therefore cannot suppress insertion of a
+configured Codex default. The normal provider-qualified deduplication still
+keeps the resulting picker options distinct.
+
 The static `openai-codex` model list is a degraded fallback, not an account
 entitlement list. Account-aware live discovery and visible entries in the local
 Codex catalog can add models absent from that fallback. Generic Agent-core

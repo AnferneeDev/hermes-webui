@@ -1613,6 +1613,39 @@ def test_default_model_lands_under_active_provider_group(monkeypatch):
     )
 
 
+@pytest.mark.parametrize('default_model', ['gpt-5.4', 'openai/gpt-5.4'])
+def test_default_model_is_not_suppressed_by_another_provider_catalog(monkeypatch, default_model):
+    """An OpenAI API catalog must not hide the configured Codex default.
+
+    The full-suite predecessor in test_issue603_provider_categories leaves an
+    OpenAI API credential behind. Reproduce that extra provider deterministically
+    through config, without relying on test order or leaking credentials.
+    """
+    monkeypatch.setitem(config.cfg, 'providers', {
+        'openai-api': {'api': 'openai-completions'},
+    })
+    import sys, types
+    fake_mod = types.ModuleType('hermes_cli.models')
+    fake_mod.list_available_providers = lambda: [
+        {'id': 'anthropic', 'authenticated': True},
+        {'id': 'openai-codex', 'authenticated': True},
+    ]
+    fake_auth = types.ModuleType('hermes_cli.auth')
+    fake_auth.get_auth_status = lambda pid: {'key_source': 'env'}
+    monkeypatch.setitem(sys.modules, 'hermes_cli.models', fake_mod)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.auth', fake_auth)
+    monkeypatch.setattr(config, '_read_live_provider_model_ids', lambda pid: [])
+    monkeypatch.setattr(config, '_read_visible_codex_cache_model_ids', lambda: [])
+    result = _available_models_with_full_cfg('openai-codex', default_model, '')
+    groups = {g['provider_id']: g['models'] for g in result['groups']}
+    norm = lambda mid: mid.split(':', 1)[-1].split('/', 1)[-1]
+    for pid in ('openai-codex', 'openai-api'):
+        assert sum(norm(m['id']) == 'gpt-5.4' for m in groups[pid]) == 1
+    assert all(norm(m['id']) != 'gpt-5.4' for m in groups['anthropic'])
+    ids = [m['id'] for g in result['groups'] for m in g['models']]
+    assert len(ids) == len(set(ids))
+
+
 def test_unknown_providers_do_not_inherit_default_model(monkeypatch):
     """Detected providers without their own model catalog must not be filled
     with the global default_model placeholder.
