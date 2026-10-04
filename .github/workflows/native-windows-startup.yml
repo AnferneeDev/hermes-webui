@@ -478,8 +478,9 @@ jobs:
           $pythonSrc = (Get-Command python).Source
 
           function New-DisposableRepo {
-            param([string]$Name)
-            $repo = Join-Path $root $Name
+            param([string]$Root, [string]$Name)
+            New-Item -ItemType Directory -Force -Path $Root | Out-Null
+            $repo = Join-Path $Root $Name
             New-Item -ItemType Directory -Force -Path $repo | Out-Null
             Copy-Item -Force start.ps1 (Join-Path $repo 'start.ps1')
             Copy-Item -Force managed_agent_startup.py (Join-Path $repo 'managed_agent_startup.py')
@@ -522,10 +523,16 @@ jobs:
 
           # Activation A: pip-style LOCALAPPDATA install with a real venv vs a
           # sibling complete checkout whose hermes_bootstrap.py exits.
-          $repoA = New-DisposableRepo 'repoA'
-          $localA = Join-Path $root 'localA'
-          $userA = Join-Path $root 'userA'
-          $pfA = Join-Path $root 'pfA'
+          # Each probe gets its own fixture root. start.ps1 derives the sibling
+          # candidate as <repo>\..\hermes-agent, so a shared root would make A's
+          # exiting sibling also B's sibling: source-first discovery would select
+          # it for B (run_agent.py present), and B's bootstrap would exit 7 and
+          # fail the run for a reason unrelated to the layout B is asserting.
+          $repoA = New-DisposableRepo -Root (Join-Path $root 'a') -Name 'repoA'
+          $rootA = Split-Path -Parent $repoA
+          $localA = Join-Path $rootA 'localA'
+          $userA = Join-Path $rootA 'userA'
+          $pfA = Join-Path $rootA 'pfA'
           $installedA = Join-Path (Join-Path $localA 'hermes') 'hermes-agent'
           $siblingA = Join-Path (Split-Path -Parent $repoA) 'hermes-agent'
           New-Item -ItemType Directory -Force -Path (Join-Path $installedA 'hermes_cli') | Out-Null
@@ -565,10 +572,11 @@ jobs:
 
           # Activation B: selected pip install with no venv keeps root/interpreter
           # against a later usable venv, through real managed activation.
-          $repoB = New-DisposableRepo 'repoB'
-          $localB = Join-Path $root 'localB'
-          $userB = Join-Path $root 'userB'
-          $pfB = Join-Path $root 'pfB'
+          $repoB = New-DisposableRepo -Root (Join-Path $root 'b') -Name 'repoB'
+          $rootB = Split-Path -Parent $repoB
+          $localB = Join-Path $rootB 'localB'
+          $userB = Join-Path $rootB 'userB'
+          $pfB = Join-Path $rootB 'pfB'
           $selectedB = Join-Path (Join-Path $localB 'hermes') 'hermes-agent'
           $laterB = Join-Path $userB 'hermes-agent'
           $laterVenvB = Join-Path $laterB 'venv\Scripts\python.exe'
