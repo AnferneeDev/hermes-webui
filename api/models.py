@@ -12773,7 +12773,7 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
         if len(local_indices) == len(candidates) == 1:
             anchors.append((local_indices[0], candidates[0]))
     anchors.sort()
-    if any(right[1] <= left[1] for left, right in zip(anchors, anchors[1:])):
+    if any(right[1] <= left[1] for left, right in zip(anchors, anchors[1:], strict=False)):
         return selected
     if not anchors and not verified_start:
         return selected
