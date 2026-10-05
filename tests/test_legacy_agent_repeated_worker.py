@@ -85,6 +85,9 @@ def test_old_persistence_shapes_keep_each_turn_in_actual_worker(tmp_path, monkey
             return self.local_provider(user_message, conversation_history, persist_user_message, persist_user_timestamp)
         Agent.run_conversation = timestamp_run
     monkeypatch.setattr(streaming, '_get_ai_agent', lambda: Agent)
+    # This producer owns its local SQLite writer. The optional native search
+    # DB is a separate service; do not replace that writer on cached turns.
+    monkeypatch.setattr(streaming, '_build_session_db_for_stream', lambda _: None)
     monkeypatch.setattr(streaming, 'resolve_model_provider', lambda *a, **k: ('test-model', None, None))
     monkeypatch.setattr(streaming, 'get_config', lambda: {})
     monkeypatch.setattr(config, 'get_config', lambda: {})
