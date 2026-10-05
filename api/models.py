@@ -12588,7 +12588,9 @@ def _selected_history_owns_live_partial(selected: list, owner_messages: list) ->
     return False
 
 
-def _cancelled_journal_turn_owner(sidecar_messages: list) -> tuple[dict, dict] | None:
+def _cancelled_journal_turn_owner(
+    sidecar_messages: list, *, include_live_partial: bool = False,
+) -> tuple[dict, dict] | None:
     """Find the latest cancelled journal segment, including historical ones."""
     messages = [row for row in sidecar_messages if isinstance(row, dict)]
     for error_idx in range(len(messages) - 1, -1, -1):
@@ -12600,15 +12602,16 @@ def _cancelled_journal_turn_owner(sidecar_messages: list) -> tuple[dict, dict] |
         if owner_idx is None:
             continue
         segment = messages[owner_idx + 1:error_idx]
-        if any(row.get('_partial') for row in segment):
+        has_partial = any(row.get('_partial') for row in segment)
+        if has_partial and not include_live_partial:
             continue
-        if any(row.get('_recovered_from_cancel_journal') is True for row in segment):
+        if (has_partial or any(row.get('_recovered_from_cancel_journal') is True for row in segment)):
             return messages[owner_idx], carrier
     return None
 
 
 def _state_db_cancelled_journal_turn_bounds(
-    sidecar_messages: list, state_messages: list,
+    sidecar_messages: list, state_messages: list, *, turn_owner=None,
 ) -> tuple[int | None, int | None]:
     """Prove the cancelled owner and its next user in SQLite's row order.
 
@@ -12616,7 +12619,8 @@ def _state_db_cancelled_journal_turn_bounds(
     in SQLite's ordered transcript proves its next user is a successor even
     when that successor predates the recovered sidecar's terminal carrier.
     """
-    turn_owner = _cancelled_journal_turn_owner(sidecar_messages)
+    if turn_owner is None:
+        turn_owner = _cancelled_journal_turn_owner(sidecar_messages)
     if turn_owner is None:
         return None, None
     owner, carrier = turn_owner
@@ -13290,11 +13294,13 @@ def _merge_session_messages_append_only_impl(
                 if not carrier.get('_error'):
                     continue
                 earlier = owner_messages[:carrier_index + 1]
-                earlier_turn = _cancelled_journal_turn_owner(earlier)
+                earlier_turn = _cancelled_journal_turn_owner(earlier, include_live_partial=True)
                 if (not earlier_turn or earlier_turn[1] is not carrier
                         or earlier_turn[0] is _cancelled_journal_turn_owner(owner_messages)[0]):
                     continue
-                earlier_owner, earlier_successor = _state_db_cancelled_journal_turn_bounds(earlier, source_messages)
+                earlier_owner, earlier_successor = _state_db_cancelled_journal_turn_bounds(
+                    earlier, source_messages, turn_owner=earlier_turn,
+                )
                 if earlier_owner is None:
                     prefix = []
                     break

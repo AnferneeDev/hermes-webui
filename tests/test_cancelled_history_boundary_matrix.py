@@ -319,3 +319,111 @@ def test_conflicting_prefix_occurrences_cannot_be_spliced_beside_saved_rows(shap
         )
         == local + owner
     )
+
+
+@pytest.mark.requires_agent_modules
+@pytest.mark.parametrize("old_kind", ["journal", "live-partial"])
+def test_actual_two_stops_do_not_promote_older_cancelled_raw_prefix(
+    tmp_path, monkeypatch, old_kind
+):
+    from api import config, streaming
+    from api.run_journal import RunJournalWriter
+    from tests.test_cancel_restart_journal_recovery import (
+        _start_cancelled_turn,
+        _simulate_restart,
+    )
+
+    sid = "r21-multistop-" + old_kind
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    prior = [
+        {"role": "user", "content": "PRIOR_Q", "timestamp": 1},
+        {"role": "assistant", "content": "PRIOR_A", "timestamp": 2},
+    ]
+    oldstream = sid + "-old"
+    s = _start_cancelled_turn(sid, oldstream)
+    s.pending_started_at = 3.0
+    s.pending_user_message = "OLD_STOP"
+    s.messages = copy.deepcopy(prior)
+    s.context_messages = copy.deepcopy(prior)
+    s.save()
+    if old_kind == "live-partial":
+        config.STREAM_PARTIAL_TEXT[oldstream] = "OLD_SAVED_OUTPUT"
+    assert streaming.cancel_stream(oldstream)
+    if old_kind == "journal":
+        RunJournalWriter(sid, oldstream).append_sse_event(
+            "token", {"text": "OLD_SAVED_OUTPUT"}
+        )
+    _simulate_restart()
+    older = models.get_session(sid)
+    old_messages = copy.deepcopy(older.messages)
+    old_context = [
+        copy.deepcopy(row) for row in older.messages if not row.get("_error")
+    ]
+    old_owner = next(row for row in reversed(old_messages) if row.get("role") == "user")
+    newstream = sid + "-new"
+    s = _start_cancelled_turn(sid, newstream)
+    s.pending_started_at = 10.0
+    s.pending_user_message = "NEW_STOP"
+    s.messages = old_messages
+    s.context_messages = old_context
+    s.save()
+    assert streaming.cancel_stream(newstream)
+    RunJournalWriter(sid, newstream).append_sse_event(
+        "token", {"text": "NEW_SAVED_OUTPUT"}
+    )
+    _simulate_restart()
+    s = models.get_session(sid)
+    new_owner = next(row for row in reversed(s.messages) if row.get("role") == "user")
+    _make_state_db(
+        db,
+        sid,
+        [
+            *prior,
+            {
+                "role": "user",
+                "content": "OLD_STOP",
+                "timestamp": old_owner["timestamp"],
+            },
+            {"role": "assistant", "content": "OLD_CANCELLED_RAW", "timestamp": 4},
+            {
+                "role": "tool",
+                "content": "OLD_CANCELLED_TOOL_RAW",
+                "timestamp": 5,
+                "tool_call_id": "old-raw-id",
+            },
+            {"role": "user", "content": "BETWEEN_STOPS_GATEWAY_Q", "timestamp": 6},
+            {"role": "assistant", "content": "BETWEEN_STOPS_GATEWAY_A", "timestamp": 7},
+            {
+                "role": "user",
+                "content": "NEW_STOP",
+                "timestamp": new_owner["timestamp"],
+            },
+            {"role": "assistant", "content": "NEW_CANCELLED_RAW", "timestamp": 11},
+        ],
+    )
+    display = models.reconciled_state_db_messages_for_session(s)
+    context = models.reconciled_state_db_messages_for_session(s, prefer_context=True)
+    captured = []
+    _worker(monkeypatch, tmp_path, s, "NEXT", captured)
+    history = captured[0]
+    for name, rows in [
+        ("display", display),
+        ("context", context),
+        ("provider", history),
+    ]:
+        text = [row.get("content") for row in rows]
+        assert not {
+            "OLD_CANCELLED_RAW",
+            "OLD_CANCELLED_TOOL_RAW",
+            "NEW_CANCELLED_RAW",
+        } & set(text), (name, text)
+        assert text.count("OLD_SAVED_OUTPUT") == text.count("NEW_SAVED_OUTPUT") == 1, (
+            name,
+            text,
+        )
+        assert (
+            text.count("BETWEEN_STOPS_GATEWAY_Q")
+            == text.count("BETWEEN_STOPS_GATEWAY_A")
+            == 1
+        ), (name, text)

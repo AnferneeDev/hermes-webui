@@ -148,7 +148,8 @@ clock cannot replace its execution identity. Completed SQLite-only turns before
 that owner are restored after a unique retained, ordered exact-clock/content
 anchor, including gaps between retained pairs. Preserve saved row objects and
 native tool-call/result blocks, reject conflicting or duplicated private
-identities, and exclude every proved earlier cancelled execution block as well.
+identities, and exclude every proved earlier cancelled execution block as well, including
+older live-partial Stops before a journal-recovered Stop.
 An explicit verified compression anchor admits only its already sliced tail;
 without one, the leading discarded prefix stays excluded. Persisted truncation
 continues to veto restoration. A later-only
