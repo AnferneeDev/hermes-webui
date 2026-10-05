@@ -7044,11 +7044,14 @@ def _compact_session_image_parts_for_persistence(session) -> int:
 
 
 def _is_non_replayable_history_row(msg) -> bool:
-    """Return True for a persisted row that is never model-facing history.
+    """Return True for an error marker or an empty partial: rows that are
+    never model-facing history.
 
     One predicate for the legacy path (``_sanitize_messages_for_api``) and the
-    Gateway runs-API history builder, so both backends project a session's
-    history the same way (#8034).
+    Gateway runs-API history builder, so both drop these two kinds of row
+    alike (#8034). It is not the whole of the legacy projection: the sanitizer
+    also drops reasoning-only assistant rows and ``_recovered`` user rows,
+    which the Gateway builder still sends.
     """
     if not isinstance(msg, dict):
         return False

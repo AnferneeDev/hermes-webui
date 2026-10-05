@@ -177,9 +177,11 @@ def test_ordinary_rows_are_sent_as_before():
     ]
 
 
-def test_the_gateway_keeps_the_rows_the_legacy_path_keeps():
-    """One session history, two backends: the user and assistant turns that
-    reach the model are the same whichever one runs it."""
+def test_error_rows_and_partials_fare_the_same_on_both_backends():
+    """One history of ordinary rows, error markers and partials: the user and
+    assistant turns the Gateway is sent are the ones the legacy sanitizer
+    keeps. Parity for these rows only; reasoning-only and ``_recovered`` rows,
+    which the sanitizer also drops, are not in it."""
     from api.streaming import _sanitize_messages_for_api
 
     rows = [
