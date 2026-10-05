@@ -120,6 +120,10 @@ def test_old_persistence_shapes_keep_each_turn_in_actual_worker(tmp_path, monkey
                 actual = [text for text in transcript_values(rows) if text in set(expected)]
                 assert actual == expected
                 assert 'CANCELLED_REPLAY' not in [row.get('content') for row in rows]
+                # Historical provider-prefix metadata must survive sanitizing,
+                # settlement and cold load, not just the newest flush batch.
+                assert all(row.get('_state_db_row_id', 0) > 0 for row in rows
+                           if row.get('content') in {'ANSWER_'+str(i) for i in range(1, number)})
             # The next invocation receives each prior completed exchange once.
             if number > 2:
                 prior = expected[:-2]

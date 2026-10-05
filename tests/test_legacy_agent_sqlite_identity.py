@@ -109,7 +109,10 @@ def test_legacy_append_observer_never_invents_identity(kind):
 
     def flush(messages, conversation_history=None):
         if kind == 'other-thread':
-            thread = threading.Thread(target=lambda: db.append_message(session_id='owned', role='user', content='same'))
+            def foreign_worker():
+                db.append_message(session_id='owned', role='user', content='same')
+                db.append_message(session_id='owned', role='assistant', content='same')
+            thread = threading.Thread(target=foreign_worker)
             thread.start()
             thread.join()
             return
