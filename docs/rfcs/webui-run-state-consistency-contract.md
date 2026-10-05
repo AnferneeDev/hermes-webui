@@ -142,7 +142,16 @@ turns. The interrupted partial display guard retains live partials and explicit
 cancel-journal recovery ownership. A unique compatible cancelled user in the
 ordered SQLite transcript proves the next user boundary: suppress only that
 cancelled run's assistant/tool replay and merge the successor suffix in durable
-order, even when it predates recovery-time sidecar timestamps. A later-only
+order, even when it predates recovery-time sidecar timestamps. Stop synthesis
+preserves the finite positive pending owner's fractional timestamp; a recovery
+clock cannot replace its execution identity. Completed SQLite-only turns before
+that owner are restored after a unique retained, ordered exact-clock/content
+anchor, including gaps between retained pairs. Preserve saved row objects and
+native tool-call/result blocks, reject conflicting or duplicated private
+identities, and exclude every proved earlier cancelled execution block as well.
+An explicit verified compression anchor admits only its already sliced tail;
+without one, the leading discarded prefix stays excluded. Persisted truncation
+continues to veto restoration. A later-only
 store needs a user strictly newer than the terminal carrier. Missing, conflicting
 or ambiguous ownership grants no replay authority. Keep this cutoff after later
 rows persist, before display pagination or model-context delta selection; live
@@ -153,7 +162,11 @@ Selected context may omit the display-only terminal carrier. Its user and each
 ordered saved partial still require compatible content plus shared identity or
 an exact valid clock. Clock-only user proof must have exactly one compatible
 claimant in the complete owner history; duplicate earlier users need a trusted
-ID or turn token. Clock-only partial proof must retain the partial state, so an
+ID or turn token for a shorter selected view. Exact saved row references or a
+complete ordered copy of the saved history also prove which occurrence owns the
+partial, allowing display-only error carriers to be omitted. Copied rows retain
+compatible identities, exact valid clocks, and the saved partial flag; an older,
+incomplete or reordered clock-only view grants no ownership. Clock-only partial proof must retain the partial state, so an
 ordinary settled answer cannot supply that ownership. Trusted current user
 identity still anchors its selected segment when earlier rows share its clocks.
 Known owner IDs with changed content/time cannot enter the later-only fallback.

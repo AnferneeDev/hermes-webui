@@ -12527,13 +12527,17 @@ def _selected_history_owns_live_partial(selected: list, owner_messages: list) ->
                 if str(row.get('role') or '').lower() == 'assistant' and row.get('_partial')]
     selected = [row for row in selected if isinstance(row, dict)]
 
-    def same_saved_row(local, saved):
+    def same_saved_row(local, saved, *, ordered_copy=False):
         if (not _message_private_identity_compatible(local, saved)
                 or _session_message_visible_key(local) != _session_message_visible_key(saved)):
             return False
         token, saved_token = local.get('_active_turn_token'), saved.get('_active_turn_token')
         if token and saved_token and token != saved_token:
             return False
+        if saved.get('_partial') and not local.get('_partial'):
+            return False  # An ordinary settled answer is not a live partial.
+        if local is saved:
+            return True
         clock, valid = _message_exact_timestamp_details(local)
         saved_clock, saved_valid = _message_exact_timestamp_details(saved)
         row_id, _ = _state_db_row_identity_details(local)
@@ -12546,9 +12550,7 @@ def _selected_history_owns_live_partial(selected: list, owner_messages: list) ->
             return True
         if not (valid and saved_valid and clock is not None and clock == saved_clock):
             return False
-        if saved.get('_partial') and not local.get('_partial'):
-            return False  # An ordinary settled answer is not a live partial.
-        if _message_sidecar_role(saved) == 'user':
+        if _message_sidecar_role(saved) == 'user' and not ordered_copy:
             # Clock-only authority cannot choose between an earlier identical
             # user and the current Stop owner. A trusted ID/token above can.
             candidates = [row for row in owner_rows
@@ -12557,6 +12559,17 @@ def _selected_history_owns_live_partial(selected: list, owner_messages: list) ->
                           and _message_private_identity_compatible(local, row)]
             if len(candidates) != 1:
                 return False
+        return True
+
+    # Ordinal correspondence in the complete saved history proves which of
+    # several legacy equal-clock users owns this partial. A shorter, older view
+    # still requires the existing unique clock or explicit identity below.
+    selected_history = [row for row in selected if not row.get('_error')]
+    saved_history = [row for row in owner_rows if not row.get('_error')]
+    if len(selected_history) == len(saved_history) and all(
+        same_saved_row(local, saved, ordered_copy=True)
+        for local, saved in zip(selected_history, saved_history, strict=True)
+    ):
         return True
 
     for index, row in enumerate(selected):
@@ -12594,8 +12607,10 @@ def _cancelled_journal_turn_owner(sidecar_messages: list) -> tuple[dict, dict] |
     return None
 
 
-def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_messages: list) -> list:
-    """Exclude the cancelled owner's replay, retaining only a proved next turn.
+def _state_db_cancelled_journal_turn_bounds(
+    sidecar_messages: list, state_messages: list,
+) -> tuple[int | None, int | None]:
+    """Prove the cancelled owner and its next user in SQLite's row order.
 
     Recovery timestamps are not execution timestamps. An exact, unique owner
     in SQLite's ordered transcript proves its next user is a successor even
@@ -12603,7 +12618,7 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
     """
     turn_owner = _cancelled_journal_turn_owner(sidecar_messages)
     if turn_owner is None:
-        return []
+        return None, None
     owner, carrier = turn_owner
 
     def timestamp(row):
@@ -12615,7 +12630,7 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
     owner_stable, stable_valid = _stable_message_identity_details(owner)
     owner_row, row_valid = _state_db_row_identity_details(owner)
     if not stable_valid or not row_valid:
-        return []
+        return None, None
     known_claims = []
     for i, row in enumerate(state_messages):
         if not isinstance(row, dict) or row.get('role') != 'user':
@@ -12623,7 +12638,7 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
         stable, stable_valid = _stable_message_identity_details(row)
         row_id, row_valid = _state_db_row_identity_details(row)
         if not stable_valid or not row_valid:
-            return []
+            return None, None
         if ((owner_stable is not None and stable == owner_stable)
                 or (owner_row is not None and row_id == owner_row)):
             known_claims.append(i)
@@ -12635,16 +12650,16 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
     # A row claiming the cancelled owner's known ID is never a later-only
     # successor merely because its content or timestamp changed.
     if known_claims and (len(known_claims) != 1 or known_claims[0] not in matches):
-        return []
+        return None, None
     if matches:
         if len(matches) != 1:
-            return []
+            return None, None
         matched = state_messages[matches[0]]
         if not _message_private_identity_compatible(owner, matched):
-            return []
+            return None, None
         owner_token, matched_token = owner.get('_active_turn_token'), matched.get('_active_turn_token')
         if owner_token and matched_token and owner_token != matched_token:
-            return []
+            return None, None
         # A unique SQLite tuple can still be an earlier visible occurrence.
         # Plaintext SQLite rows have no durable row identity in this projection;
         # do not mistake an old repeated prompt for the absent/restamped owner.
@@ -12657,7 +12672,7 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
                    == _session_message_content_key(owner, normalize_workspace_prefix=False)
                    and _message_private_identity_compatible(row, matched)
                    for row in sidecar_messages[:owner_index]):
-                return []
+                return None, None
         start = next((i for i in range(matches[0] + 1, len(state_messages))
                       if isinstance(state_messages[i], dict) and state_messages[i].get('role') == 'user'), None)
     else:
@@ -12668,7 +12683,118 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
                       if isinstance(row, dict) and row.get('role') == 'user'
                       and terminal_time is not None and timestamp(row) is not None
                       and timestamp(row) > terminal_time), None)
+    return (matches[0] if matches else None), start
+
+
+def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_messages: list) -> list:
+    """Return only the proved successor, excluding the cancelled execution."""
+    _, start = _state_db_cancelled_journal_turn_bounds(sidecar_messages, state_messages)
     return list(state_messages[start:]) if start is not None else []
+
+
+def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verified_start=False):
+    """Fill ordered gaps after a unique retained anchor, before the Stop owner.
+
+    SQLite row order, rather than recovery clocks, bounds these completed turns.
+    Never infer permission to restore a discarded leading prefix from text alone.
+    A verified compression anchor separately authorizes its already sliced tail.
+    """
+    owner, _ = _cancelled_journal_turn_owner(owner_messages)
+
+    def matches(local, saved):
+        if not _message_private_identity_compatible(local, saved):
+            return False
+        left_token, right_token = local.get('_active_turn_token'), saved.get('_active_turn_token')
+        if left_token and right_token and left_token != right_token:
+            return False
+        left_time, left_valid = _message_exact_timestamp_details(local)
+        right_time, right_valid = _message_exact_timestamp_details(saved)
+        return (left_valid and right_valid and left_time is not None and left_time == right_time
+                and _session_message_visible_key(local, normalize_workspace_prefix=False)
+                == _session_message_visible_key(saved, normalize_workspace_prefix=True))
+
+    owner_indices = [i for i, row in enumerate(selected) if row is owner or matches(owner, row)]
+    if len(owner_indices) > 1:
+        return selected
+    stop_index = owner_indices[0] if owner_indices else len(selected)
+    local_prefix = selected[:stop_index]
+    # Duplicate private IDs cannot establish ownership or order of a gap.
+    for rows in (prefix, local_prefix):
+        for identity in (_state_db_row_identity_details, _stable_message_identity_details):
+            ids = [identity(row) for row in rows]
+            if any(not valid for _, valid in ids):
+                return selected
+            known = [value for value, _ in ids if value is not None]
+            if len(set(known)) != len(known):
+                return selected
+    for identity in (_state_db_row_identity_details, _stable_message_identity_details):
+        local_by_id = {identity(row)[0]: row for row in local_prefix if identity(row)[0] is not None}
+        for row in prefix:
+            row_id = identity(row)[0]
+            if row_id in local_by_id and not matches(local_by_id[row_id], row):
+                return selected
+    # Equal-clock native calls with differing tool payloads cannot be an
+    # anchor, or a new gap beside the saved call's authoritative result block.
+    local_call_clocks = collections.defaultdict(set)
+    for row in local_prefix:
+        if row.get('tool_calls'):
+            local_call_clocks[_message_exact_timestamp_details(row)].add(_session_message_visible_key(row))
+    for row in prefix:
+        key = _message_exact_timestamp_details(row)
+        if row.get('tool_calls') and key in local_call_clocks:
+            if _session_message_visible_key(row, normalize_workspace_prefix=True) not in local_call_clocks[key]:
+                return selected
+    def anchor_key(row, *, source=False):
+        clock, valid = _message_exact_timestamp_details(row)
+        if not valid or clock is None:
+            return None
+        return clock, _session_message_visible_key(row, normalize_workspace_prefix=source)
+
+    source_keys, local_keys = collections.defaultdict(list), collections.defaultdict(list)
+    for index, row in enumerate(prefix):
+        source_keys[anchor_key(row, source=True)].append(index)
+    for index, row in enumerate(local_prefix):
+        local_keys[anchor_key(row)].append(index)
+    anchors = []
+    for key, local_indices in local_keys.items():
+        if key is None:
+            continue
+        candidates = source_keys.get(key, [])
+        # A clock/content mirror with contradictory private/provider identity
+        # is quarantined, never inserted as a second authoritative occurrence.
+        if any(not matches(local_prefix[i], prefix[j]) for i in local_indices for j in candidates):
+            return selected
+        if candidates and (len(local_indices) != 1 or len(candidates) != 1):
+            return selected
+        if len(local_indices) == len(candidates) == 1:
+            anchors.append((local_indices[0], candidates[0]))
+    anchors.sort()
+    if any(right[1] <= left[1] for left, right in zip(anchors, anchors[1:])):
+        return selected
+    if not anchors and not verified_start:
+        return selected
+    result = []
+    local_cursor = 0
+    source_cursor = 0 if verified_start else anchors[0][1]
+    for local_idx, saved_idx in anchors:
+        result.extend(local_prefix[local_cursor:local_idx])
+        if saved_idx >= source_cursor:
+            gap = prefix[source_cursor:saved_idx]
+            if gap and local_idx and local_prefix[local_idx].get('role') == 'tool':
+                # A saved tool result cannot be separated from its assistant's
+                # native tool-call block by a newly recovered user/answer.
+                block_start = local_idx - 1
+                while block_start >= 0 and local_prefix[block_start].get('role') == 'tool':
+                    block_start -= 1
+                if block_start >= 0 and local_prefix[block_start].get('tool_calls'):
+                    return selected
+            result.extend(gap)
+        result.append(local_prefix[local_idx])
+        local_cursor, source_cursor = local_idx + 1, saved_idx + 1
+    result.extend(local_prefix[local_cursor:])
+    result.extend(prefix[source_cursor:])
+    result.extend(selected[stop_index:])
+    return result
 
 
 def _state_db_after_saved_cancel_successors(
@@ -13018,6 +13144,7 @@ def merge_session_messages_append_only(
     incoming_provenance: Literal["unverified", "state_db"] = "unverified",
     cancelled_journal_owner_messages: list | None = None,
     cancelled_journal_source_messages: list | None = None,
+    cancelled_journal_prefix_start_verified: bool = False,
 ) -> list:
     """Merge sidecar/context and state.db messages without deleting local rows.
 
@@ -13034,6 +13161,7 @@ def merge_session_messages_append_only(
             incoming_provenance=incoming_provenance,
             cancelled_journal_owner_messages=cancelled_journal_owner_messages,
             cancelled_journal_source_messages=cancelled_journal_source_messages,
+            cancelled_journal_prefix_start_verified=cancelled_journal_prefix_start_verified,
         )
     finally:
         _STRUCTURED_IDENTITY_MEMO.reset(token)
@@ -13131,6 +13259,7 @@ def _merge_session_messages_append_only_impl(
     incoming_provenance=None,
     cancelled_journal_owner_messages=None,
     cancelled_journal_source_messages=None,
+    cancelled_journal_prefix_start_verified=False,
 ) -> list:
     """Merge sidecar/context and state.db messages without deleting local rows.
 
@@ -13151,7 +13280,33 @@ def _merge_session_messages_append_only_impl(
         state_messages = []
     elif incoming_provenance == 'state_db' and _cancelled_journal_turn_owner(owner_messages):
         source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
-        proved_suffix = _state_db_after_cancelled_journal_turn(owner_messages, source_messages)
+        owner_index, successor_index = _state_db_cancelled_journal_turn_bounds(owner_messages, source_messages)
+        if owner_index is not None and truncation_watermark is None:
+            allowed_rows = {id(row) for row in state_messages}
+            prefix = [row for row in source_messages[:owner_index] if id(row) in allowed_rows]
+            # Earlier saved Stops own their raw execution blocks as well. A
+            # later cancellation must not turn those blocks into prefix gaps.
+            for carrier_index, carrier in enumerate(owner_messages):
+                if not carrier.get('_error'):
+                    continue
+                earlier = owner_messages[:carrier_index + 1]
+                earlier_turn = _cancelled_journal_turn_owner(earlier)
+                if (not earlier_turn or earlier_turn[1] is not carrier
+                        or earlier_turn[0] is _cancelled_journal_turn_owner(owner_messages)[0]):
+                    continue
+                earlier_owner, earlier_successor = _state_db_cancelled_journal_turn_bounds(earlier, source_messages)
+                if earlier_owner is None:
+                    prefix = []
+                    break
+                end = earlier_successor if earlier_successor is not None else len(source_messages)
+                excluded = {id(row) for row in source_messages[earlier_owner + 1:end]}
+                prefix = [row for row in prefix if id(row) not in excluded]
+            _reconcile_api_content_sidecars(sidecar_messages, prefix)
+            sidecar_messages = _restore_cancelled_journal_prefix(
+                sidecar_messages, prefix, owner_messages,
+                verified_start=cancelled_journal_prefix_start_verified,
+            )
+        proved_suffix = list(source_messages[successor_index:]) if successor_index is not None else []
         proved_suffix = _state_db_after_saved_cancel_successors(owner_messages, proved_suffix, sidecar_messages)
         if cancelled_journal_source_messages is None:
             state_messages = proved_suffix
@@ -13971,6 +14126,7 @@ def reconciled_state_db_messages_for_session(
         suppress_pending_turn=not prefer_context,
     )
     cancelled_journal_source_messages = state_messages
+    cancelled_journal_prefix_start_verified = False
     if prefer_context and local_messages:
         if using_context_messages:
             sidecar_messages = getattr(session, 'messages', None) or []
@@ -14014,6 +14170,7 @@ def reconciled_state_db_messages_for_session(
                             with_revision=with_revision,
                         )
                     state_messages = list(state_messages or [])[anchor_index + 1 :]
+                    cancelled_journal_prefix_start_verified = True
         if not (_sidecar_has_terminal_partial_error(getattr(session, 'messages', None) or [])
                 or _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [])):
             state_messages = state_db_delta_after_context(local_messages, state_messages)
@@ -14025,6 +14182,7 @@ def reconciled_state_db_messages_for_session(
         incoming_provenance="state_db",
         cancelled_journal_owner_messages=(getattr(session, 'messages', None) or []) if prefer_context else None,
         cancelled_journal_source_messages=cancelled_journal_source_messages if prefer_context else None,
+        cancelled_journal_prefix_start_verified=cancelled_journal_prefix_start_verified,
     )
     if not prefer_context:
         reconciled_messages = _project_native_image_payload_conflicts_for_display(

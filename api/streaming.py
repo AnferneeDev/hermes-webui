@@ -87,6 +87,7 @@ from api.models import (
     _is_empty_partial_activity_message,
     _message_exact_timestamp_details,
     _message_private_identity_compatible,
+    _recovered_pending_timestamp,
     _state_db_row_identity_details,
     _validated_webui_pending_user_timestamp_identity,
     _evict_sessions_over_cap,
@@ -15925,9 +15926,7 @@ def cancel_stream(stream_id: str) -> bool:
                         if _already_persisted:
                             _cancel_turn_start = _last_user_idx
                         else:
-                            _recovered_ts = int(time.time())
-                            if isinstance(_pending_started, (int, float)) and _pending_started > 0:
-                                _recovered_ts = int(_pending_started)
+                            _recovered_ts = _recovered_pending_timestamp(_pending_started)
                             _user_turn: dict = {
                                 'role': 'user',
                                 'content': _pending_user,
