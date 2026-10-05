@@ -212,3 +212,20 @@ def test_timestamp_accepting_agent_with_missing_ids_preserves_owner_clock(tmp_pa
     agent._flush_messages_to_session_db(rows)
     assert [row['_state_db_row_id'] for row in rows] == [1, 2]
     assert rows[0]['timestamp'] == expected
+
+
+@pytest.mark.parametrize('changed_prefix', [False, True])
+def test_historical_row_identity_restores_only_on_unchanged_pre_turn_prefix(changed_prefix):
+    previous = [{'role': 'user', 'content': 'continue', '_state_db_row_id': 17},
+                {'role': 'assistant', 'content': 'saved answer', '_state_db_row_id': 18},
+                {'role': 'user', 'content': 'continue', '_state_db_row_id': 19}]
+    result = [{'role': 'user', 'content': 'continue'},
+              {'role': 'assistant', 'content': 'different answer' if changed_prefix else 'saved answer'},
+              {'role': 'user', 'content': 'continue'}]
+    restored = streaming._restore_reasoning_metadata_before_boundary(previous, result, current_turn_boundary=2)
+    assert restored[0]['_state_db_row_id'] == 17
+    if changed_prefix:
+        assert '_state_db_row_id' not in restored[1]
+    else:
+        assert restored[1]['_state_db_row_id'] == 18
+    assert '_state_db_row_id' not in restored[2]
