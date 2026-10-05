@@ -10716,7 +10716,8 @@ function _formatUpdateTargetStatus(label,info){
 }
 function _formatManualUpdateInstruction(info){
   if(!(info&&info.no_git&&info.manual_update&&info.behind>0)) return null;
-  return t('settings_update_manual_docker','docker pull ghcr.io/nesquena/hermes-webui:latest');
+  const tag=info.channel==='experimental'?'experimental':'latest';
+  return t('settings_update_manual_docker',`docker pull ghcr.io/nesquena/hermes-webui:${tag}`);
 }
 function _formatUpdateCheckError(label,info){
   if(!info||!info.error) return null;

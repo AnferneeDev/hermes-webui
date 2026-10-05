@@ -70,6 +70,7 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'ssl certificate problem',
 )
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
+_EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9][0-9A-Za-z.+-]*$')
 # Phrases git emits when its own short-lived index/refs lock files block a
 # subsequent operation. Tuned to match only the true "lock file already exists"
 # semantics that warrant a lock-conflict response -- v2 deliberately drops the
@@ -850,7 +851,9 @@ def _count_channel_tags_ahead(path, channel=DEFAULT_UPDATE_CHANNEL):
 def _release_tag_sort_key(tag):
     """Return a version-sort key that keeps release tags newest-first."""
     raw = str(tag or '').strip()
-    if raw.startswith('v'):
+    if raw.startswith('exp-v'):
+        raw = raw[5:]
+    elif raw.startswith('v'):
         raw = raw[1:]
     parts = []
     for chunk in re.split(r'(\d+)', raw):
@@ -860,14 +863,36 @@ def _release_tag_sort_key(tag):
     return tuple(parts)
 
 
-def _is_stable_release_tag(tag):
-    """Return True for stable release tags and False for prerelease tags."""
+def _is_release_tag_for_channel(tag, channel=DEFAULT_UPDATE_CHANNEL):
+    """Return True when ``tag`` belongs to the selected release channel."""
     raw = str(tag or '').strip()
+    channel = _normalize_channel(channel)
+    if channel == 'experimental':
+        return bool(_EXPERIMENTAL_RELEASE_TAG_RE.fullmatch(raw))
     return bool(_RELEASE_TAG_RE.fullmatch(raw) and '-' not in raw[1:])
 
 
-def _github_release_tags(url='https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100', *, timeout=3.0):
-    """Return GitHub release tags newest-first, including commit SHAs when available."""
+def _is_stable_release_tag(tag):
+    """Return True for stable release tags and False for prerelease tags."""
+    return _is_release_tag_for_channel(tag, DEFAULT_UPDATE_CHANNEL)
+
+
+def _github_release_tags(
+    url='https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100',
+    *,
+    timeout=3.0,
+    channel=DEFAULT_UPDATE_CHANNEL,
+):
+    """Return GitHub tags for the selected channel, newest-first, with SHAs."""
+    channel = _normalize_channel(channel)
+    use_matching_refs = channel == 'experimental' and url == (
+        'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
+    )
+    if use_matching_refs:
+        url = (
+            'https://api.github.com/repos/nesquena/hermes-webui/'
+            'git/matching-refs/tags/exp-v'
+        )
     request = urllib.request.Request(
         url,
         headers={
@@ -884,13 +909,18 @@ def _github_release_tags(url='https://api.github.com/repos/nesquena/hermes-webui
         if not isinstance(item, dict):
             continue
         name = item.get('name')
+        if use_matching_refs:
+            ref = item.get('ref')
+            if not isinstance(ref, str) or not ref.startswith('refs/tags/'):
+                continue
+            name = ref[len('refs/tags/'):]
         if not isinstance(name, str):
             continue
         name = name.strip()
-        if not _is_stable_release_tag(name):
+        if not _is_release_tag_for_channel(name, channel):
             continue
         commit = item.get('commit')
-        sha = None
+        sha = name if use_matching_refs else None
         if isinstance(commit, dict):
             commit_sha = commit.get('sha')
             if isinstance(commit_sha, str):
@@ -901,13 +931,14 @@ def _github_release_tags(url='https://api.github.com/repos/nesquena/hermes-webui
     return sorted(tags, key=lambda item: _release_tag_sort_key(item['name']), reverse=True)
 
 
-def _check_webui_published_release_update():
-    """Return a manual-update payload when the baked WebUI version trails GitHub tags."""
+def _check_webui_published_release_update(channel=DEFAULT_UPDATE_CHANNEL):
+    """Return a manual-update payload when the baked WebUI trails its channel."""
+    channel = _normalize_channel(channel)
     current_version = str(WEBUI_VERSION or '').strip()
-    if not _RELEASE_TAG_RE.fullmatch(current_version):
+    if not _is_release_tag_for_channel(current_version, channel):
         return None
     try:
-        tags = _github_release_tags()
+        tags = _github_release_tags(channel=channel)
     except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return None
     if not tags:
@@ -939,6 +970,7 @@ def _check_webui_published_release_update():
         'latest_version': latest_version,
         'compare_url': _build_compare_url(repo_url, current_ref, latest_ref),
         'manual_update': True,
+        'channel': channel,
     }
 
 
@@ -1268,7 +1300,7 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     channel = _normalize_channel(channel)
     if path is None or not (path / '.git').exists():
         if name == 'webui':
-            release_info = _check_webui_published_release_update()
+            release_info = _check_webui_published_release_update(channel)
             if release_info is not None:
                 release_info = dict(release_info)
                 release_info['no_git'] = True
