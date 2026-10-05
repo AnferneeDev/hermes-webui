@@ -112,9 +112,15 @@ profile pools; provider invalidation removes the original and canonical provider
 keys for the active profile. Both retain disk-commit → catalog lock order.
 
 A custom-endpoint timeout below the full endpoint cap is a truncated attempt,
-not evidence of unreachability. A partial catalog can be returned but is not
-published to either cache. The existing worker retries truncated targets at the
-full cap and publishes only through the generation/source/ownership fences.
+not evidence of unreachability. A partial catalog with groups can be returned but
+is not published to either cache; an empty partial uses the existing stale-disk
+or static fallback instead. The existing worker checks generation revocation
+under the catalog condition after the foreground handoff, then retries truncated
+targets at the full cap and publishes only through the generation/source/ownership
+fences. Unrelated live provider lookups (including empty results and exceptions)
+are memoized only for that rebuild, not shared with a successor or another profile.
+Malformed LM Studio responses whose `data` is not a list are ignored, preserving
+the degraded catalog behavior for both models and onboarding callers.
 
 ## Change protocol
 

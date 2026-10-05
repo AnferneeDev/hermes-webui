@@ -9430,6 +9430,20 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     # attempts are removed before rebuilding the catalog on the same worker.
     _custom_endpoint_probe_memo: dict[tuple[str, str], tuple[str, object]] = {}
     _truncated_probes: set[tuple[str, str]] = set()
+    # A full-cap custom retry must not repeat unrelated provider discovery.
+    # Empty/failure fallbacks are retained too, but only for this invocation.
+    _live_provider_memo: dict[str, tuple[bool, object]] = {}
+
+    def _memoized_live_lookup(key, lookup):
+        if key not in _live_provider_memo:
+            try:
+                _live_provider_memo[key] = (True, lookup())
+            except Exception as exc:
+                _live_provider_memo[key] = (False, exc)
+        succeeded, value = _live_provider_memo[key]
+        if not succeeded:
+            raise value
+        return copy.deepcopy(value)
 
     def _build_available_models_uncached() -> dict:
         active_provider = None
@@ -10540,7 +10554,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         from hermes_cli.models import (
                             fetch_openrouter_models as _fetch_or_models,
                         )
-                        live_curated = _fetch_or_models() or []
+                        live_curated = _memoized_live_lookup("openrouter-curated", _fetch_or_models) or []
                         for mid, _desc in live_curated:
                             if mid and mid not in seen_ids:
                                 seen_ids.add(mid)
@@ -10565,8 +10579,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         )
                         free_tier_models = []
                         selected_free_tier_model = None
-                        with _urlreq.urlopen(_req, timeout=8.0) as _resp:
-                            _payload = json.loads(_resp.read().decode())
+                        def _fetch_free_tier(req=_req):
+                            with _urlreq.urlopen(req, timeout=8.0) as _resp:
+                                return json.loads(_resp.read().decode())
+
+                        _payload = _memoized_live_lookup("openrouter-free", _fetch_free_tier)
                         for _item in _payload.get("data", []) or []:
                             if not isinstance(_item, dict):
                                 continue
@@ -10640,7 +10657,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
                         raw_models = [
                             {"id": mid, "label": _format_ollama_label(mid)}
-                            for mid in (_provider_model_ids("ollama-cloud") or [])
+                            for mid in (_memoized_live_lookup(pid, lambda pid=pid: _provider_model_ids(pid)) or [])
                         ]
                     except Exception:
                         logger.warning("Failed to load Ollama Cloud models from hermes_cli")
@@ -10657,7 +10674,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     try:
                         from hermes_cli.models import provider_model_ids as _provider_model_ids
 
-                        codex_ids = [mid for mid in (_provider_model_ids("openai-codex") or []) if mid]
+                        codex_ids = [mid for mid in (_memoized_live_lookup(pid, lambda pid=pid: _provider_model_ids(pid)) or []) if mid]
                     except Exception:
                         logger.warning("Failed to load OpenAI Codex models from hermes_cli")
 
@@ -10695,7 +10712,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     try:
                         from hermes_cli.models import provider_model_ids as _provider_model_ids
 
-                        live_ids = _provider_model_ids("nous") or []
+                        live_ids = _memoized_live_lookup(pid, lambda pid=pid: _provider_model_ids(pid)) or []
                     except Exception:
                         logger.warning("Failed to load Nous Portal models from hermes_cli")
                         live_ids = []
@@ -10755,7 +10772,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     lm_ids: list[str] = []
                     try:
                         from hermes_cli.models import provider_model_ids as _provider_model_ids
-                        lm_ids = _provider_model_ids("lmstudio") or []
+                        lm_ids = _memoized_live_lookup(pid, lambda pid=pid: _provider_model_ids(pid)) or []
                     except Exception:
                         logger.debug("hermes_cli LM Studio lookup unavailable; using urlopen fallback")
 
@@ -10828,8 +10845,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                         else:
                                             _custom_endpoint_probe_memo[_lm_probe_key] = ("error", None)
                                     logger.debug("LM Studio /models fetch failed at %s", endpoint)
-                            if isinstance(lm_data, dict):
-                                for m in (lm_data.get("data") or []):
+                            if isinstance(lm_data, dict) and isinstance(lm_data.get("data"), list):
+                                for m in lm_data["data"]:
                                     if isinstance(m, dict):
                                         mid = str(m.get("id") or "").strip()
                                         if mid and {"id": mid, "label": mid} not in raw_models:
@@ -10887,7 +10904,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         else:
                             raw_models = _models_from_live_provider_ids(
                                 pid,
-                                _read_live_provider_model_ids(pid),
+                                _memoized_live_lookup(pid, lambda pid=pid: _read_live_provider_model_ids(pid)),
                             )
                             if (
                                 not raw_models
@@ -11534,6 +11551,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         box["partial"] = box["result"]
                         build_done.set()
                         _models_rebuild_abandoned.wait()
+                        with _cache_build_cv:
+                            if _models_rebuild_superseded(rebuild_seq):
+                                return
                         for key in _truncated_probes:
                             _custom_endpoint_probe_memo.pop(key, None)
                         _truncated_probes.clear()
@@ -11578,11 +11598,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             if _models_rebuild_deadline is not None
             else float(_LIVE_REBUILD_BUDGET_SECONDS)
         )
-        if build_done.wait(timeout=timeout_remaining):
-            if "partial" in box:
-                budget_exceeded.set()
-                _models_rebuild_abandoned.set()
-                return copy.deepcopy(box["partial"])
+        if build_done.wait(timeout=timeout_remaining) and "partial" not in box:
             # Build finished within budget — foreground publishes
             # synchronously, exactly like the legacy path.
             if "error" in box:
@@ -11610,8 +11626,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         _models_rebuild_abandoned.set()
         if build_done.is_set() and "error" not in box:
             if "partial" in box:
-                return copy.deepcopy(box["partial"])
-            if "result" in box and _claim_publish():
+                if box["partial"].get("groups"):
+                    return copy.deepcopy(box["partial"])
+                # An all-truncated pass has no picker options. Use the same
+                # stale/static fallback as a still-running first pass below.
+            elif "result" in box and _claim_publish():
                 _publish_models_result(
                     box["result"],
                     rebuild_seq=rebuild_seq,
@@ -11621,7 +11640,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     # commit as the within-budget path above (#7481 review).
                     defer_durable=True,
                 )
-            return copy.deepcopy(box["result"])
+            if "partial" not in box:
+                return copy.deepcopy(box["result"])
 
         # Genuinely slow/hung probe: serve the best fallback now; the worker
         # keeps going and refreshes the cache for the next caller.

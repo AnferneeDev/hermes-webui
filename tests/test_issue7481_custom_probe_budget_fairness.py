@@ -843,8 +843,11 @@ def test_probe_schedule_spends_the_callers_window_not_a_fresh_one(
     cap = 0.3
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", budget, raising=False)
     monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", cap, raising=False)
+    clock = _FakeClock()
+    monkeypatch.setattr(cfg, "time", clock)
     observed = _install_urlopen(
-        monkeypatch, dead_hosts=["lan-dead.example"], live_hosts=["gw-live.example"]
+        monkeypatch, dead_hosts=["lan-dead.example"], live_hosts=["gw-live.example"],
+        clock=clock,
     )
 
     seen: dict = {}
@@ -855,16 +858,49 @@ def test_probe_schedule_spends_the_callers_window_not_a_fresh_one(
             # Stands in for the pre-custom discovery work: by the time the chain
             # is built, part of the caller's window is already spent. The old
             # construction-time deadline would start counting HERE.
-            time.sleep(discovery_delay)
+            clock.now += discovery_delay
             super().__init__(
                 endpoint_count, out_of_band=out_of_band, deadline=deadline
             )
 
     monkeypatch.setattr(cfg, "_CustomProbeSchedule", _DelayedRecordingSchedule)
+    built = threading.Event()
 
-    started_at = time.monotonic()
+    def invoke(builder):
+        try:
+            return builder()
+        finally:
+            built.set()
+
+    class StartedAfterDiscovery(threading.Thread):
+        def start(self):
+            super().start()
+            assert built.wait(5)
+
+    class RecordingEvents:
+        Thread = StartedAfterDiscovery
+        Lock = threading.Lock
+
+        def __init__(self):
+            self.count = 0
+
+        def Event(self):
+            self.count += 1
+            event = threading.Event()
+            if self.count == 2:  # build_done, after abandoned
+                wait = event.wait
+
+                def record_wait(timeout=None):
+                    seen["wait_deadline"] = clock.monotonic() + timeout
+                    return wait(5)
+
+                event.wait = record_wait
+            return event
+
+    monkeypatch.setattr(cfg, "threading", RecordingEvents())
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", invoke)
+    started_at = clock.monotonic()
     cfg.get_available_models()
-    stopped_waiting = time.monotonic()
 
     assert seen.get("constructed"), "the custom-probe chain was never scheduled"
     deadline = seen["deadline"]
@@ -874,13 +910,9 @@ def test_probe_schedule_spends_the_callers_window_not_a_fresh_one(
     )
 
     # One window, not two: the discovery delay is NOT added to it.
-    assert deadline - started_at <= budget + 0.25, (
-        deadline - started_at,
-        budget,
-        discovery_delay,
-    )
-    # ... and it is the very instant the caller stopped waiting on.
-    assert stopped_waiting - deadline <= 0.25, (stopped_waiting - deadline)
+    assert deadline == pytest.approx(started_at + budget)
+    # Thread launch/discovery time is spent, not re-granted to Event.wait.
+    assert seen["wait_deadline"] == pytest.approx(deadline)
 
     # The probes drew from that same window: every one of them was bounded
     # (positive, never above the per-endpoint cap).
