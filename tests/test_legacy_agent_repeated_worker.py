@@ -37,12 +37,19 @@ def test_old_persistence_shapes_keep_each_turn_in_actual_worker(tmp_path, monkey
             histories.append(copy.deepcopy(history))
             self._persist_user_message_idx = len(history)
             self._persist_user_message_override = clean
-            result = list(history)+[{'role': 'user', 'content': prompt},
-                                    {'role': 'assistant', 'content': 'ANSWER_'+str(len(histories))}]
+            result = list(history)+[{'role': 'user', 'content': prompt}]
             # Historical _persist_session retains the live list before flush.
             self._session_messages = result
             if shape != 'timestamp-markers':
                 result[len(history)]['content'] = clean
+            # Timestamp-era Agents also persist the user before the provider
+            # call. Marker flushes write the clean override only to SQLite.
+            if shape.startswith('timestamp-'):
+                self._flush_messages_to_session_db(result, history)
+                assert result[-1].get('_state_db_row_id', 0) > 0
+            result.append({'role': 'assistant', 'content': 'ANSWER_'+str(len(histories))})
+            # Their finalizer cleans the live user before its final persist.
+            result[len(history)]['content'] = clean
             self._flush_messages_to_session_db(result, history)
             writes.append(copy.deepcopy(result[-2:]))
             return {'completed': True, 'final_response': result[-1]['content'],
