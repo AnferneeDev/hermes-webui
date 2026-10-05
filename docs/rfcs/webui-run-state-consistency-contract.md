@@ -150,6 +150,8 @@ anchor, including gaps between retained pairs. Preserve saved row objects and
 native tool-call/result blocks. When both stores have unmatched turns inside
 one proved gap, merge complete user-led turns by their valid, strictly ordered
 user timestamps; equal or invalid clocks grant no relative-order authority.
+Matched assistant/tool anchors must not have contradictory preceding user
+owners; matching reply bytes alone cannot reassign a reply to a different turn.
 Keep leading assistant/tool fragments with the preceding anchor, even when
 their recovery clocks are newer than subsequent users. Competing unanchored
 leading fragments are ambiguous and cannot authorize restoration. Reject

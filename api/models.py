@@ -12776,6 +12776,23 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
     anchors.sort()
     if any(right[1] <= left[1] for left, right in zip(anchors, anchors[1:], strict=False)):
         return selected
+    def row_owners(rows):
+        owners = []
+        current = None
+        for row in rows:
+            if row.get('role') == 'user':
+                current = row
+            owners.append(current)
+        return owners
+
+    local_owners, source_owners = row_owners(local_prefix), row_owners(prefix)
+    for local_idx, saved_idx in anchors:
+        local_owner, saved_owner = local_owners[local_idx], source_owners[saved_idx]
+        # Matching assistant/tool bytes can occur in different executions.
+        # Such a row cannot align gaps belonging to contradictory user owners.
+        if (local_owner is not None and saved_owner is not None
+                and not matches(local_owner, saved_owner)):
+            return selected
     if not anchors and not verified_start:
         return selected
 

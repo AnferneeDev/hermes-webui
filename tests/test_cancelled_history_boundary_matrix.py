@@ -567,3 +567,37 @@ def test_ambiguous_pre_stop_user_clocks_do_not_authorize_interleaving(
         assert text.count("LOCAL_ONLY_Q") == 1
         assert "SQLITE_ONLY_Q" not in text
         assert "CANCELLED_RAW" not in text
+
+
+@pytest.mark.requires_agent_modules
+def test_shared_assistant_anchor_cannot_reparent_distinct_user_turns(
+    tmp_path, monkeypatch
+):
+    sid = "author-prestop-conflicting-anchor-owner"
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    prior = [
+        {"role": "user", "content": "SHARED_Q", "timestamp": 1},
+        {"role": "assistant", "content": "SHARED_A", "timestamp": 2},
+    ]
+    answer = {"role": "assistant", "content": "SAME_ANSWER", "timestamp": 6}
+    local = [{"role": "user", "content": "LOCAL_ONLY_Q", "timestamp": 5}, answer]
+    session, owner = _recover(sid, prior + local)
+    _make_state_db(db, sid, [
+        *prior,
+        {"role": "user", "content": "SQLITE_ONLY_Q", "timestamp": 3},
+        answer,
+        owner,
+        {"role": "assistant", "content": "CANCELLED_RAW", "timestamp": 11},
+    ])
+    projections = [models.reconciled_state_db_messages_for_session(
+        session, prefer_context=prefer_context
+    ) for prefer_context in (False, True)]
+    captured = []
+    _worker(monkeypatch, tmp_path, session, "NEXT_REQUEST", captured)
+    for rows in [*projections, captured[0]]:
+        text = _contents(rows)
+        assert "SQLITE_ONLY_Q" not in text
+        assert text.count("SAME_ANSWER") == 1
+        assert text.index("LOCAL_ONLY_Q") + 1 == text.index("SAME_ANSWER")
+        assert "CANCELLED_RAW" not in text
