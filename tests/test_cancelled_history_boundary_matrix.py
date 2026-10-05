@@ -323,8 +323,9 @@ def test_conflicting_prefix_occurrences_cannot_be_spliced_beside_saved_rows(shap
 
 @pytest.mark.requires_agent_modules
 @pytest.mark.parametrize("old_kind", ["journal", "live-partial"])
+@pytest.mark.parametrize("interleaved", [False, True])
 def test_actual_two_stops_do_not_promote_older_cancelled_raw_prefix(
-    tmp_path, monkeypatch, old_kind
+    tmp_path, monkeypatch, old_kind, interleaved
 ):
     from api import config, streaming
     from api.run_journal import RunJournalWriter
@@ -333,7 +334,7 @@ def test_actual_two_stops_do_not_promote_older_cancelled_raw_prefix(
         _simulate_restart,
     )
 
-    sid = "r21-multistop-" + old_kind
+    sid = "author-multistop-" + old_kind + str(interleaved)
     db = tmp_path / "state.db"
     monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
     prior = [
@@ -361,6 +362,16 @@ def test_actual_two_stops_do_not_promote_older_cancelled_raw_prefix(
         copy.deepcopy(row) for row in older.messages if not row.get("_error")
     ]
     old_owner = next(row for row in reversed(old_messages) if row.get("role") == "user")
+    local_only = (
+        [
+            {"role": "user", "content": "LOCAL_AFTER_OLD_Q", "timestamp": 8},
+            {"role": "assistant", "content": "LOCAL_AFTER_OLD_A", "timestamp": 9},
+        ]
+        if interleaved
+        else []
+    )
+    old_messages.extend(copy.deepcopy(local_only))
+    old_context.extend(copy.deepcopy(local_only))
     newstream = sid + "-new"
     s = _start_cancelled_turn(sid, newstream)
     s.pending_started_at = 10.0
@@ -427,3 +438,132 @@ def test_actual_two_stops_do_not_promote_older_cancelled_raw_prefix(
             == text.count("BETWEEN_STOPS_GATEWAY_A")
             == 1
         ), (name, text)
+        assert text.index("OLD_STOP") < text.index("OLD_SAVED_OUTPUT") < text.index(
+            "BETWEEN_STOPS_GATEWAY_Q"
+        ), (name, text)
+        if interleaved:
+            assert (
+                text.index("BETWEEN_STOPS_GATEWAY_A")
+                < text.index("LOCAL_AFTER_OLD_Q")
+                < text.index("LOCAL_AFTER_OLD_A")
+                < text.index("NEW_STOP")
+            ), (name, text)
+
+
+@pytest.mark.requires_agent_modules
+@pytest.mark.parametrize("placement", ["tail", "between-anchors"])
+@pytest.mark.parametrize("shape", ["earlier", "later", "native-tool", "late-output", "multiple"])
+def test_partially_mirrored_pre_stop_turns_keep_execution_order_in_real_worker(
+    tmp_path, monkeypatch, placement, shape
+):
+    sid = "author-prestop-interleaved-" + placement + "-" + shape
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    prior = [
+        {"role": "user", "content": "SHARED_Q", "timestamp": 1},
+        {"role": "assistant", "content": "SHARED_A", "timestamp": 2},
+    ]
+    sqlite_only = [
+        {"role": "user", "content": "SQLITE_ONLY_Q", "timestamp": 3},
+        {"role": "assistant", "content": "SQLITE_ONLY_A", "timestamp": 4},
+    ]
+    local_only = [
+        {"role": "user", "content": "SIDECAR_ONLY_Q", "timestamp": 5},
+        {"role": "assistant", "content": "SIDECAR_ONLY_A", "timestamp": 6},
+    ]
+    if shape == "later":
+        sqlite_only[0]["timestamp"], sqlite_only[1]["timestamp"] = 5, 6
+        local_only[0]["timestamp"], local_only[1]["timestamp"] = 3, 4
+    if shape == "native-tool":
+        local_only[1:1] = [
+            {
+                "role": "assistant", "content": "LOCAL_CALL", "timestamp": 5.1,
+                "tool_calls": [{"id": "local-call", "type": "function", "function": {
+                    "name": "read", "arguments": "{}",
+                }}],
+            },
+            {
+                "role": "tool", "content": "LOCAL_RESULT", "timestamp": 5.2,
+                "tool_call_id": "local-call",
+            },
+        ]
+    if shape == "late-output":
+        prior.append({"role": "assistant", "content": "PRIOR_LATE_OUTPUT", "timestamp": 99})
+    second = (
+        [
+            {"role": "user", "content": "SQLITE_SECOND_Q", "timestamp": 6.1},
+            {"role": "assistant", "content": "SQLITE_SECOND_A", "timestamp": 6.2},
+        ]
+        if shape == "multiple"
+        else []
+    )
+    later = (
+        [
+            {"role": "user", "content": "LATER_Q", "timestamp": 7},
+            {"role": "assistant", "content": "LATER_A", "timestamp": 8},
+        ]
+        if placement == "between-anchors"
+        else []
+    )
+    session, owner = _recover(sid, prior + local_only + later)
+    _make_state_db(
+        db,
+        sid,
+        prior
+        + sqlite_only
+        + second
+        + later
+        + [owner, {"role": "assistant", "content": "CANCELLED_RAW", "timestamp": 11}],
+    )
+    ordered = local_only + sqlite_only if shape == "later" else sqlite_only + local_only
+    expected = _contents(prior + ordered + second + later)
+    projections = [
+        models.reconciled_state_db_messages_for_session(
+            session, prefer_context=prefer_context
+        )
+        for prefer_context in (False, True)
+    ]
+    captured = []
+    _worker(monkeypatch, tmp_path, session, "NEXT_REQUEST", captured)
+    for merged in [*projections, captured[0]]:
+        assert _contents(merged)[: len(expected)] == expected
+        assert "CANCELLED_RAW" not in _contents(merged)
+    if shape == "native-tool":
+        call_index = _contents(captured[0]).index("LOCAL_CALL")
+        assert captured[0][call_index + 1]["tool_call_id"] == "local-call"
+
+
+@pytest.mark.requires_agent_modules
+@pytest.mark.parametrize("clock", [3, False, None])
+def test_ambiguous_pre_stop_user_clocks_do_not_authorize_interleaving(
+    tmp_path, monkeypatch, clock
+):
+    sid = "author-prestop-ambiguous-" + str(clock)
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    prior = [
+        {"role": "user", "content": "SHARED_Q", "timestamp": 1},
+        {"role": "assistant", "content": "SHARED_A", "timestamp": 2},
+    ]
+    local = [
+        {"role": "user", "content": "LOCAL_ONLY_Q", "timestamp": clock},
+        {"role": "assistant", "content": "LOCAL_ONLY_A", "timestamp": 6},
+    ]
+    session, owner = _recover(sid, prior + local)
+    _make_state_db(db, sid, [
+        *prior,
+        {"role": "user", "content": "SQLITE_ONLY_Q", "timestamp": 3},
+        {"role": "assistant", "content": "SQLITE_ONLY_A", "timestamp": 4},
+        owner,
+        {"role": "assistant", "content": "CANCELLED_RAW", "timestamp": 11},
+    ])
+    projections = [models.reconciled_state_db_messages_for_session(
+        session, prefer_context=prefer_context
+    ) for prefer_context in (False, True)]
+    captured = []
+    _worker(monkeypatch, tmp_path, session, "NEXT_REQUEST", captured)
+    for rows in [*projections, captured[0]]:
+        text = _contents(rows)
+        assert text.count("LOCAL_ONLY_Q") == 1
+        assert "SQLITE_ONLY_Q" not in text
+        assert "CANCELLED_RAW" not in text

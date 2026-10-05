@@ -147,8 +147,14 @@ preserves the finite positive pending owner's fractional timestamp; a recovery
 clock cannot replace its execution identity. Completed SQLite-only turns before
 that owner are restored after a unique retained, ordered exact-clock/content
 anchor, including gaps between retained pairs. Preserve saved row objects and
-native tool-call/result blocks, reject conflicting or duplicated private
-identities, and exclude every proved earlier cancelled execution block as well, including
+native tool-call/result blocks. When both stores have unmatched turns inside
+one proved gap, merge complete user-led turns by their valid, strictly ordered
+user timestamps; equal or invalid clocks grant no relative-order authority.
+Keep leading assistant/tool fragments with the preceding anchor, even when
+their recovery clocks are newer than subsequent users. Competing unanchored
+leading fragments are ambiguous and cannot authorize restoration. Reject
+conflicting or duplicated private identities, and exclude every proved earlier
+cancelled execution block as well, including
 older live-partial Stops before a journal-recovered Stop.
 An explicit verified compression anchor admits only its already sliced tail;
 without one, the leading discarded prefix stays excluded. Persisted truncation

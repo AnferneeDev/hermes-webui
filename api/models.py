@@ -12699,7 +12699,8 @@ def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_message
 def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verified_start=False):
     """Fill ordered gaps after a unique retained anchor, before the Stop owner.
 
-    SQLite row order, rather than recovery clocks, bounds these completed turns.
+    Matched row order bounds gaps; user clocks order whole unmatched turns.
+    Assistant/tool rows stay with their owner regardless of recovery clocks.
     Never infer permission to restore a discarded leading prefix from text alone.
     A verified compression anchor separately authorizes its already sliced tail.
     """
@@ -12777,11 +12778,59 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
         return selected
     if not anchors and not verified_start:
         return selected
+
+    def merge_gap(local, saved):
+        if not local or not saved:
+            return list(local or saved)
+
+        def turn_blocks(rows):
+            leading, turns = [], []
+            previous_clock = None
+            for row in rows:
+                if row.get('role') == 'user':
+                    clock, valid = _message_exact_timestamp_details(row)
+                    if (not valid or clock is None
+                            or (previous_clock is not None and clock <= previous_clock)):
+                        return None
+                    turns.append((clock, [row]))
+                    previous_clock = clock
+                elif turns:
+                    turns[-1][1].append(row)
+                else:
+                    leading.append(row)
+            return leading, turns
+
+        local_blocks, saved_blocks = turn_blocks(local), turn_blocks(saved)
+        if local_blocks is None or saved_blocks is None:
+            return None
+        local_leading, local_turns = local_blocks
+        saved_leading, saved_turns = saved_blocks
+        # Both leading fragments belong to the preceding anchor's execution.
+        # Without another shared row their relative order cannot be proved.
+        if local_leading and saved_leading:
+            return None
+        merged = local_leading + saved_leading
+        local_index = saved_index = 0
+        while local_index < len(local_turns) and saved_index < len(saved_turns):
+            local_clock, local_rows = local_turns[local_index]
+            saved_clock, saved_rows = saved_turns[saved_index]
+            if local_clock == saved_clock:
+                return None
+            if local_clock < saved_clock:
+                merged.extend(local_rows)
+                local_index += 1
+            else:
+                merged.extend(saved_rows)
+                saved_index += 1
+        for _, rows in local_turns[local_index:] + saved_turns[saved_index:]:
+            merged.extend(rows)
+        return merged
+
     result = []
     local_cursor = 0
     source_cursor = 0 if verified_start else anchors[0][1]
     for local_idx, saved_idx in anchors:
-        result.extend(local_prefix[local_cursor:local_idx])
+        gap = []
         if saved_idx >= source_cursor:
             gap = prefix[source_cursor:saved_idx]
             if gap and local_idx and local_prefix[local_idx].get('role') == 'tool':
@@ -12792,11 +12841,16 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
                     block_start -= 1
                 if block_start >= 0 and local_prefix[block_start].get('tool_calls'):
                     return selected
-            result.extend(gap)
+        merged_gap = merge_gap(local_prefix[local_cursor:local_idx], gap)
+        if merged_gap is None:
+            return selected
+        result.extend(merged_gap)
         result.append(local_prefix[local_idx])
         local_cursor, source_cursor = local_idx + 1, saved_idx + 1
-    result.extend(local_prefix[local_cursor:])
-    result.extend(prefix[source_cursor:])
+    merged_gap = merge_gap(local_prefix[local_cursor:], prefix[source_cursor:])
+    if merged_gap is None:
+        return selected
+    result.extend(merged_gap)
     result.extend(selected[stop_index:])
     return result
 
