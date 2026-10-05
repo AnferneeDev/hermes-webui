@@ -8663,7 +8663,10 @@ function renderSessionListFromCache(){
   const _mergeStoredCollapsed=()=>{
     const fresh=_readStoredCollapsed();
     if(fresh===null) return; // unavailable/malformed: keep fallback + pending
-    for(const k in fresh){ if(!_pending.has(k)) _groupCollapsed[k]=fresh[k]; }
+    // Copy only boolean values: a same-origin write of
+    // {"__proto__":{"Older":true}} must not replace this map's prototype
+    // through _groupCollapsed[k]=fresh[k] (gate Oct 4, Opus nit).
+    for(const k in fresh){ if(!_pending.has(k)&&typeof fresh[k]==='boolean') _groupCollapsed[k]=fresh[k]; }
     // A valid snapshot (even an empty/cleared one) also removes non-pending
     // keys it no longer contains; a merge that only adds/updates would keep
     // stale collapses visible.
