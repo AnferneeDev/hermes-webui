@@ -4159,9 +4159,10 @@ def _rehome_cancel_journal_rows(session, marker_idx: int, stream_id: str) -> Non
     _reindex_tool_owners_after_message_reorder(session, before)
 
 
-def _reindex_tool_owners_after_message_reorder(session, before) -> None:
-    """Preserve each tool's exact display row through reorder or removal."""
-    new_index_by_row = {id(row): index for index, row in enumerate(session.messages)}
+def _reindex_tool_owners_after_message_reorder(session, before, *, after_messages=None) -> None:
+    """Preserve exact row ownership, including a projection before deepcopy."""
+    after = session.messages if after_messages is None else after_messages
+    new_index_by_row = {id(row): index for index, row in enumerate(after)}
     for tool_call in getattr(session, 'tool_calls', None) or []:
         if not isinstance(tool_call, dict):
             continue

@@ -195,6 +195,10 @@ Branch/fork and duplicate reconcile display and provider context from one full
 private SQLite snapshot before slicing or copying. Branch keep-count remains in
 the GET display coordinate space; cancelled raw replay stays excluded, successor
 IDs remain private in saved copies, and public projections strip those IDs.
+Duplicate rebases saved tool-card owner indexes against that reconciled display
+using exact source-row identity before deepcopy. Inserting a SQLite-only row
+must not move a card to another assistant, including equal-prose assistants;
+the source tool metadata and journal remain unchanged.
 
 
 ## Cancelled journal-only restart recovery

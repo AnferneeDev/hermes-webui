@@ -11075,6 +11075,7 @@ from api.models import (
     merge_session_messages_append_only,
     reconciled_state_db_messages_for_session,
     _cancelled_journal_turn_owner,
+    _reindex_tool_owners_after_message_reorder,
     _project_native_image_payload_conflicts_for_display,
     _suppress_native_image_display_mirrors,
     _reconcile_api_content_sidecars,
@@ -16423,6 +16424,13 @@ def handle_post(handler, parsed) -> bool:
                 context_engine_state=copy.deepcopy(getattr(session, "context_engine_state", None) or {}),
                 created_at=time.time(),
                 updated_at=time.time(),
+            )
+
+            # Reconciliation can insert SQLite rows before a saved tool owner.
+            # Map the original row objects before deepcopy, but update only the
+            # copy's tool dictionaries. Equal assistant prose is not ownership.
+            _reindex_tool_owners_after_message_reorder(
+                copied_session, session.messages, after_messages=copy_messages,
             )
 
             with LOCK:
