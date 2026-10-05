@@ -8671,7 +8671,7 @@ function renderSessionListFromCache(){
     // keys it no longer contains; a merge that only adds/updates would keep
     // stale collapses visible.
     for(const k in _groupCollapsed){
-      if(!(k in fresh) && !_pending.has(k)) delete _groupCollapsed[k];
+      if(typeof fresh[k]!=='boolean' && !_pending.has(k)) delete _groupCollapsed[k];
     }
   };
   _mergeStoredCollapsed();

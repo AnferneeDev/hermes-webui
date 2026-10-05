@@ -679,3 +679,26 @@ def test_stored_proto_payload_cannot_change_collapse_prototype(page):
     assert not errors, "the real header click must not throw after a __proto__ payload"
     stored = page.evaluate("() => localStorage.getItem('hermes-date-groups-collapsed')")
     assert json.loads(stored) == {"Today": True}
+
+
+def test_stored_non_boolean_value_expands_a_previously_collapsed_group(page):
+    """Release-stage maintainer fix for #8028 (Greptile P2, reproduced by the senior review):
+    the deletion pass must use the same boolean-only rule as the copy pass. If Today is
+    collapsed and storage later says {"Today": null}, the merge must drop the stale key
+    (Today expands, as on master) instead of keeping it collapsed and writing
+    `Today: true` back on the next unrelated toggle."""
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.evaluate("() => window.__seedGroupsFixture()")
+    page.evaluate("() => window.__buildGroups()")
+    page.click(".session-date-header")  # collapse Today through the real handler
+    assert json.loads(page.evaluate("() => localStorage.getItem('hermes-date-groups-collapsed')")) == {"Today": True}
+    page.evaluate("() => localStorage.setItem('hermes-date-groups-collapsed', '{\"Today\":null}')")
+    page.evaluate("() => window.__buildGroups()")
+    assert not errors, "a non-boolean stored value must not throw in the real render"
+    assert page.evaluate(REAL_PATH_COUNTS_JS) == {"headers": 3, "rows": 6, "visibleBodies": 3}, (
+        "Today must expand once storage no longer holds a boolean for it"
+    )
+    page.click(".session-date-header >> nth=1")  # an unrelated toggle saves the snapshot
+    stored = json.loads(page.evaluate("() => localStorage.getItem('hermes-date-groups-collapsed')"))
+    assert stored.get("Today") is not True, "the stale collapse must not be written back"
