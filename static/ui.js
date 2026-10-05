@@ -6838,7 +6838,12 @@ if(typeof window!=='undefined'){
       const now=performance.now();
       // Nested-pane focus (tool output, code block) consumes scroll keys —
       // such a keydown must not mint transcript re-pin authority (#7494).
-      if(_isTranscriptScrollTarget(a||t,el)) _captureMessageScrollInputTail(el);
+      // Resolve the key target first: when focus is on <body> but the pointer
+      // hovers the transcript, walking `a` starts outside `el` and never
+      // reaches it, so the gate would return false and a queued live-render
+      // restore would undo this scroll (#7494 re-gate).
+      const keyTarget = el.contains(a) ? a : el;
+      if(_isTranscriptScrollTarget(keyTarget,el)) _captureMessageScrollInputTail(el);
       _lastMessageKeyScrollIntentMs=now;
       const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
       if(bottomDistance>120) _lastMessageScrollIntentMs=now;

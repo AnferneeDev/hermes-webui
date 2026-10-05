@@ -518,6 +518,84 @@ console.log(JSON.stringify({afterSpace, afterPageUp}));
     assert state["afterPageUp"] == 1234
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_keyboard_scroll_body_focus_hover_transcript_captures_tail():
+    # #7494 re-gate must-fix: with focus on <body> but the pointer hovering the
+    # transcript (el.matches(':hover')), the branch admits the keydown, but the
+    # old gate called _isTranscriptScrollTarget(a||t, el) with a=<body>. The
+    # ancestor walk starts outside el and never reaches it, so the function
+    # returned n===el → false, _captureMessageScrollInputTail was skipped, the
+    # input generation did not advance, and a queued delayed live-render restore
+    # put the old scrollTop back (Codex: 18104 → 18702 → 18104 native PageDown).
+    # The fix resolves the key target before the gate: el.contains(a) ? a : el.
+    start = UI_JS.index("const _MESSAGE_SCROLL_KEYS=new Set")
+    end = UI_JS.index("  let _scrollRaf=0;", start)
+    region = UI_JS[start:end]
+    # Behavioral oracle: the capture function must be invoked for the hover case.
+    script = (
+        "const region = " + json.dumps(region) + ";\n"
+        + r"""
+let _lastMessageKeyScrollIntentMs = -Infinity;
+const performance = { now: () => 1234 };
+const el = {
+  contains(node){ return !!(node && node.inMessages); },
+  matches(sel){ return sel === ':hover'; },
+};
+const document = {
+  activeElement: null,
+  _handler: null,
+  addEventListener(type, fn){ if(type === 'keydown') this._handler = fn; },
+};
+// The targeting helper is provided by ui.js; emulate the real walk here: a
+// node inside el (inMessages) reaches el via parentElement and returns true;
+// <body> (inMessages falsy) walks off the top and returns false.
+const getComputedStyle = () => ({ overflowY: 'visible' });
+function _isTranscriptScrollTarget(node, pane){
+  if(!node) return false;
+  let n=node;
+  while(n && n!==pane){ n=n.parentElement; }
+  return n===pane;
+}
+let captured = 0;
+const _captureMessageScrollInputTail = () => { captured += 1; };
+const _cancelBottomSettle = () => {};
+const body = { tagName:'BODY', inMessages:false, isContentEditable:false, parentElement:null, closest(){ return null; } };
+const inside = { tagName:'DIV', inMessages:true, isContentEditable:false, parentElement:el, closest(){ return null; } };
+const env = Function('el','document','performance','_isTranscriptScrollTarget','_captureMessageScrollInputTail', `let _lastMessageKeyScrollIntentMs=-Infinity; ${region}
+return {handler:document._handler, setActive:(n)=>{document.activeElement=n;}};`)(el, document, performance, _isTranscriptScrollTarget, _captureMessageScrollInputTail);
+// Focus on <body>, pointer hovering the transcript: capture MUST still fire.
+env.setActive(body);
+env.handler({key:'PageDown', target:body});
+const afterBodyHover = captured;
+// Focus inside the transcript: capture fires (unchanged behavior).
+env.setActive(inside);
+env.handler({key:'PageDown', target:inside});
+const afterInside = captured;
+// Focus on <body>, pointer NOT over the transcript: no admission, no capture.
+el.matches = () => false;
+env.setActive(body);
+env.handler({key:'PageDown', target:body});
+const afterBodyNoHover = captured;
+console.log(JSON.stringify({afterBodyHover, afterInside, afterBodyNoHover}));
+"""
+    )
+    result = subprocess.run(
+        [NODE, "-e", script], check=True, capture_output=True, text=True, timeout=30
+    )
+    state = json.loads(result.stdout.strip())
+    assert state["afterBodyHover"] == 1, (
+        "focus on <body> with the pointer over the transcript must resolve the "
+        "key target to the transcript and capture the scroll-input tail, or a "
+        "delayed live-render restore undoes the keyboard scroll (#7494 re-gate)."
+    )
+    assert state["afterInside"] == 2, (
+        "focus inside the transcript must still capture (behavior unchanged)."
+    )
+    assert state["afterBodyNoHover"] == 2, (
+        "focus on <body> without hover must not capture (no re-pin authority)."
+    )
+
+
 def test_streaming_tick_calls_fix_before_dom_writes():
     # The streaming render tick in messages.js must call _fixMobileScrollJank()
     # before _lastRenderMs=performance.now() so anchor suppression covers every
