@@ -16353,6 +16353,19 @@ def handle_post(handler, parsed) -> bool:
                 # 404, not 400 — missing resource, not a malformed request.
                 return bad(handler, "Session not found", status=404)
 
+            copy_messages = session.messages
+            copy_context = getattr(session, "context_messages", None) or []
+            if _cancelled_journal_turn_owner(session.messages):
+                # Read one complete private snapshot for both persisted layers.
+                # A recovered sidecar can predate later Gateway exchanges.
+                copy_state = get_state_db_session_messages(
+                    sid, profile=getattr(session, "profile", None), include_row_identity=True,
+                )
+                copy_messages = reconciled_state_db_messages_for_session(session, state_messages=copy_state)
+                copy_context = reconciled_state_db_messages_for_session(
+                    session, prefer_context=True, state_messages=copy_state,
+                )
+
             # Deep-copy mutable lists so the duplicate is *actually* independent.
             # `Session.__init__` does `self.messages = messages or []` — plain
             # assignment, no copy. Without deepcopy, both sessions share the same
@@ -16367,7 +16380,7 @@ def handle_post(handler, parsed) -> bool:
                 workspace=session.workspace,
                 model=session.model,
                 model_provider=session.model_provider,
-                messages=copy.deepcopy(session.messages),
+                messages=copy.deepcopy(copy_messages),
                 tool_calls=copy.deepcopy(session.tool_calls),
                 # Reset ephemeral / per-session-instance flags. Duplicating an
                 # archived conversation should produce a visible (un-archived)
@@ -16394,7 +16407,7 @@ def handle_post(handler, parsed) -> bool:
                 # context_messages is the authoritative model-facing prefix — must be
                 # deepcopied so the duplicate has its own independent context that won't
                 # be mutated when the original session's context changes (#2914).
-                context_messages=copy.deepcopy(getattr(session, "context_messages", None) or []),
+                context_messages=copy.deepcopy(copy_context),
                 # Gateway routing — if the user customized routing for this session,
                 # the duplicate should behave identically.
                 gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
@@ -17214,6 +17227,7 @@ def handle_post(handler, parsed) -> bool:
         cli_meta = _lookup_cli_session_metadata(source.session_id) if _session_requires_cli_metadata_lookup(source) else {}
         is_messaging_session = _is_messaging_session_record(source) or _is_messaging_session_record(cli_meta)
         cli_messages = get_cli_session_messages(source.session_id) if is_messaging_session else []
+        source_context = getattr(source, "context_messages", None)
         if is_messaging_session:
             if cli_messages:
                 source_messages = _merged_session_messages_for_display(source, cli_messages)
@@ -17239,19 +17253,26 @@ def handle_post(handler, parsed) -> bool:
             _state_db_reader_kwargs = {
                 "profile": getattr(source, "profile", None) or None,
             }
+            cancelled_owner = _cancelled_journal_turn_owner(source.messages)
+            if cancelled_owner:
+                _state_db_reader_kwargs["include_row_identity"] = True
             _backstop = _state_db_backstop_limit_for_display(source, None)
             if _backstop is not None:
                 _state_db_reader_kwargs["limit"] = _backstop
+            source_state = get_state_db_session_messages(source.session_id, **_state_db_reader_kwargs)
             source_messages = merge_session_messages_append_only(
                 _webui_sidecar_lineage_messages_for_display(source),
-                get_state_db_session_messages(
-                    source.session_id,
-                    **_state_db_reader_kwargs,
-                ),
+                source_state,
                 truncation_watermark=getattr(source, "truncation_watermark", None),
                 truncation_boundary=getattr(source, "truncation_boundary", None),
+                **({"incoming_provenance": "state_db", "cancelled_journal_owner_messages": source.messages}
+                   if cancelled_owner else {}),
             )
             source_messages = _merged_webui_lineage_messages_for_display(source, source_messages)
+            if cancelled_owner:
+                source_context = reconciled_state_db_messages_for_session(
+                    source, prefer_context=True, state_messages=source_state,
+                )
         if keep_count is not None:
             forked_messages = source_messages[:keep_count]
         else:
@@ -17270,7 +17291,7 @@ def handle_post(handler, parsed) -> bool:
         fork_keep = keep_count if keep_count is not None else len(source_messages)
         forked_context = copy.deepcopy(
             truncate_context_for_display_keep(
-                getattr(source, "context_messages", None),
+                source_context,
                 source_messages,
                 fork_keep,
             )

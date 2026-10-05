@@ -10183,17 +10183,11 @@ def _register_pending_user_timestamp_identity(
 def _preserve_legacy_agent_row_identity(callable_obj, identity):
     """Keep IDs returned by an older Agent's actual SQLite append calls.
 
-    Pre-timestamp Agents discard these IDs and return unstamped message dicts.
+    Some Agents accept user timestamps but still discard returned row IDs.
     Observe only this flush's calls on its own thread/DB instance, then attach
     the returned IDs to those exact dicts. This is write provenance, not a
     content-only guess about an independently read historical transcript.
     """
-    try:
-        parameters = inspect.signature(callable_obj).parameters
-    except (TypeError, ValueError):
-        return
-    if 'persist_user_timestamp' in parameters:
-        return
     agent = getattr(callable_obj, '__self__', None)
     context = getattr(agent, '_webui_legacy_identity_context', None)
     if not isinstance(identity, dict):
@@ -10251,19 +10245,35 @@ def _preserve_legacy_agent_row_identity(callable_obj, identity):
             ids = [row_id for _, row_id in observed]
             if not all(type(row_id) is int and row_id > 0 for row_id in ids) or len(set(ids)) != len(ids):
                 return result
-            for row, (written, row_id) in zip(rows, observed, strict=True):
+            index = getattr(agent, '_persist_user_message_idx', None)
+            for offset, (row, (written, row_id)) in enumerate(zip(rows, observed, strict=True)):
                 known_id, valid = _state_db_row_identity_details(row)
+                # Later legacy flushes apply the clean user override only to
+                # SQLite, leaving the workspace prefix in the live dict.
+                current_user_override = (
+                    type(index) is int and index == start + offset
+                    and owner.get('session_id') == sid and owner.get('token')
+                    and getattr(context, 'owner', None) == owner
+                    and written.get('role') == 'user'
+                    and written.get('content') == getattr(agent, '_persist_user_message_override', None)
+                    and written.get('content') == owner.get('text')
+                    and _active_turn_user_text_matches(row, owner.get('text'))
+                )
                 if (not isinstance(row, dict) or written.get('session_id') != sid
                         or written.get('role') != row.get('role')
-                        or written.get('content') != row.get('content')
+                        or (written.get('content') != row.get('content') and not current_user_override)
                         or not valid or known_id not in (None, str(row_id))):
                     return result
+            # Native producers retain their own provenance and clock contract.
+            # The run signature alone does not establish that capability.
+            if all(_state_db_row_identity_details(row)[0] == str(row_id)
+                   for row, row_id in zip(rows, ids, strict=True)):
+                return result
             for row, row_id in zip(rows, ids, strict=True):
                 row['_state_db_row_id'] = row_id
             # The old Agent exports an index but no turn_id. Its own indexed
             # dict plus this successful append proves the active user; retain
             # WebUI's run token so shared settlement does not insert it again.
-            index = getattr(agent, '_persist_user_message_idx', None)
             if (isinstance(owner, dict) and owner.get('session_id') == sid
                     and getattr(context, 'owner', None) == owner
                     and owner.get('token') and type(index) is int
@@ -10271,6 +10281,11 @@ def _preserve_legacy_agent_row_identity(callable_obj, identity):
                     and _active_turn_user_text_matches(messages[index], owner.get('text'))):
                 stamp_message_source(messages[index], owner.get('source') or 'webui',
                                      active_turn_token=owner['token'])
+                row_timestamp, row_clock_valid = _message_exact_timestamp_details(messages[index])
+                owner_timestamp, owner_clock_valid = _message_exact_timestamp_details(
+                    {'timestamp': owner.get('timestamp')})
+                if row_clock_valid and row_timestamp is None and owner_clock_valid and owner_timestamp is not None:
+                    messages[index]['timestamp'] = owner_timestamp
             return result
 
     agent._flush_messages_to_session_db = flush_with_identity

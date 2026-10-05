@@ -94,7 +94,7 @@ def test_old_agent_new_turns_keep_real_row_identity_through_settlement(tmp_path,
     assert 'append_message' not in agent._session_db.__dict__
 
 
-@pytest.mark.parametrize('kind', ['invalid-id', 'conflicting-id', 'partial-failure', 'foreign-session', 'other-thread'])
+@pytest.mark.parametrize('kind', ['invalid-id', 'conflicting-id', 'partial-failure', 'foreign-session', 'other-thread', 'wrong-role', 'wrong-content'])
 def test_legacy_append_observer_never_invents_identity(kind):
     class Store:
         count = 41
@@ -116,7 +116,8 @@ def test_legacy_append_observer_never_invents_identity(kind):
         db.append_message(session_id='foreign' if kind == 'foreign-session' else 'owned', role='user', content='same')
         if kind == 'partial-failure':
             raise OSError('injected append failure')
-        db.append_message(session_id='owned', role='assistant', content='same')
+        db.append_message(session_id='owned', role='user' if kind == 'wrong-role' else 'assistant',
+                          content='different' if kind == 'wrong-content' else 'same')
     agent._flush_messages_to_session_db = flush
     _kwargs(agent, [], 'same')
     if kind == 'partial-failure':
@@ -155,7 +156,7 @@ def test_matching_existing_append_id_and_instance_override_are_preserved(tmp_pat
     agent = LegacyAgent('owned', store)
     _kwargs(agent, [], 'one')
     rows = [{'role': 'user', 'content': 'one', '_state_db_row_id': 1},
-            {'role': 'assistant', 'content': 'answer', '_state_db_row_id': 2}]
+            {'role': 'assistant', 'content': 'answer'}]
     agent._persist_user_message_idx = 0
     agent._flush_messages_to_session_db(rows)
     assert rows[0]['_active_turn_token'] == 'test:100'
@@ -175,10 +176,36 @@ def test_another_worker_builder_cannot_replace_captured_run_owner(tmp_path):
     assert result[0]['_active_turn_token'] == 'older:100'
 
 
-def test_current_agent_timestamp_contract_never_installs_legacy_adapter():
+def test_native_ids_and_clocks_are_preserved_without_adapter_metadata(tmp_path):
     class CurrentAgent(LegacyAgent):
         def run_conversation(self, persist_user_timestamp=None, **kwargs):
             pass
-    agent = CurrentAgent('owned', None)
+    db = tmp_path/'state.db'
+    _make_state_db(db, 'owned', [])
+    agent = CurrentAgent('owned', SQLiteStore(db))
     _kwargs(agent, [], 'same')
-    assert not getattr(agent, '_webui_legacy_identity_adapter', False)
+    rows = [{'role': 'user', 'content': 'same', '_row_id': 1, 'timestamp': 42},
+            {'role': 'assistant', 'content': 'answer', '_row_id': 2}]
+    before = copy.deepcopy(rows)
+    agent._persist_user_message_idx = 0
+    agent._flush_messages_to_session_db(rows)
+    assert rows == before
+    assert 'append_message' not in agent._session_db.__dict__
+
+
+@pytest.mark.parametrize('clock,expected', [(None, 100), (42, 42), (True, True), ('bad', 'bad')])
+def test_timestamp_accepting_agent_with_missing_ids_preserves_owner_clock(tmp_path, clock, expected):
+    class IntermediateAgent(LegacyAgent):
+        def run_conversation(self, persist_user_timestamp=None, **kwargs):
+            pass
+    db = tmp_path/'state.db'
+    _make_state_db(db, 'owned', [])
+    agent = IntermediateAgent('owned', SQLiteStore(db))
+    _kwargs(agent, [], 'same', {'session_id': 'owned', 'token': 'test:100', 'text': 'same', 'timestamp': 100})
+    rows = [{'role': 'user', 'content': 'same'}, {'role': 'assistant', 'content': 'answer'}]
+    if clock is not None:
+        rows[0]['timestamp'] = clock
+    agent._persist_user_message_idx = 0
+    agent._flush_messages_to_session_db(rows)
+    assert [row['_state_db_row_id'] for row in rows] == [1, 2]
+    assert rows[0]['timestamp'] == expected

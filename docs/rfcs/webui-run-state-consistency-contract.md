@@ -174,10 +174,14 @@ that proof through sidecar persistence; ordinary reader projection is unchanged.
 Both streaming snapshot reads and session-ops preserve those IDs. Cancelled
 session-ops reads require the complete owner snapshot rather than a bounded tail.
 Historical IDs survive Agent sanitization through the proved pre-turn prefix.
-For Agents predating `persist_user_timestamp`, cancelled-session invocations
+For Agents that discard returned row IDs (including some versions accepting
+`persist_user_timestamp`), cancelled-session invocations
 observe the actual same-thread SQLite append return IDs during their indexed
 flush. A complete compatible batch binds those IDs to the exact written dicts;
-the old Agent's indexed current user retains the captured WebUI run token.
+the old Agent's indexed current user retains the captured WebUI run token and
+valid owner timestamp when its clock is absent. Existing clocks are preserved.
+Fully native matching row identities retain their original metadata unchanged;
+the run signature alone does not prove native row identity support.
 Foreign-session/thread writes, incomplete/failed batches, invalid or conflicting
 IDs grant no mapping. The append method is restored on every exit. This creates
 new write provenance; it does not infer identity from legacy transcript text.
@@ -187,6 +191,10 @@ deduplication of unidentifiable legacy/restamped histories.
 Context compression intersects its accepted tail with the proved successor
 suffix of the full SQLite read, retaining both owner proof and anchor authority.
 Session reads, exports, shares and next-send context use the same proved suffix.
+Branch/fork and duplicate reconcile display and provider context from one full
+private SQLite snapshot before slicing or copying. Branch keep-count remains in
+the GET display coordinate space; cancelled raw replay stays excluded, successor
+IDs remain private in saved copies, and public projections strip those IDs.
 
 
 ## Cancelled journal-only restart recovery
