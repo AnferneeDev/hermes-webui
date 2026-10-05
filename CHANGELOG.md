@@ -105,6 +105,8 @@
 
 ### Fixed
 
+- **The sidebar resize handle keeps the drag with the pointer that started it.** A second pointer (a pen or a second mouse) pressing the handle mid-drag used to take over the resize, so the panel jumped to follow it and the original pointer's moves and release were ignored. The original pointer now owns the drag until it releases, and the stored group-collapse snapshot accepts only true/false values, so a malformed or hand-edited value can't keep a group collapsed or change the collapse map's prototype. Thanks @someaka. (#8028 by @someaka)
+
 - **Chat no longer reports a stale Agent runtime just because Git is slow.** Under load, one of the Agent revision
   check's three Git reads could exceed its 2-second limit, so chat start failed with `agent_runtime_stale` even though
   the Agent was current. The check now gets one 10-second budget across all three reads (each read is given only the
