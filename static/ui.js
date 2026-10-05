@@ -16248,6 +16248,12 @@ function _syncExtensionMessageActionSlots(root){
   const runtime=window.HermesExtensionSettings;
   if(!runtime||typeof runtime._messageActionsForContext!=='function') return;
   const scope=root&&typeof root.querySelectorAll==='function'?root:document;
+  // No extension has registered an action (the common case): skip per-row context
+  // resolution and only empty slots still holding buttons from a retired registration.
+  if(typeof runtime._hasMessageActions==='function'&&!runtime._hasMessageActions()){
+    for(const slot of scope.querySelectorAll('[data-extension-message-actions]:not(:empty)')) slot.innerHTML='';
+    return;
+  }
   for(const slot of scope.querySelectorAll('[data-extension-message-actions]')){
     const context=_extensionMessageActionContext(slot,false);
     const actions=context?runtime._messageActionsForContext(context):[];
@@ -16308,8 +16314,14 @@ window._bindHermesExtensionMessageActions=function(){
   if(_extensionMessageActionChangeUnsubscribe) return;
   const runtime=window.HermesExtensionSettings;
   if(!runtime||typeof runtime._onMessageActionChange!=='function') return;
-  _extensionMessageActionChangeUnsubscribe=runtime._onMessageActionChange(()=>{
-    clearMessageRenderCache();
+  _extensionMessageActionChangeUnsubscribe=runtime._onMessageActionChange((change)=>{
+    // Only cached transcript HTML can hold stale action buttons. A pending flip is
+    // reconciled in place below (the opener stays connected), so it drops nothing;
+    // other changes drop just the per-session HTML, not the markdown/height caches.
+    if(!change||change.reason!=='pending'){
+      _sessionHtmlCache.clear();
+      _sessionHtmlCacheSid=null;
+    }
     _syncExtensionMessageActionSlots(document.getElementById('msgInner'));
   });
   _syncExtensionMessageActionSlots(document.getElementById('msgInner'));

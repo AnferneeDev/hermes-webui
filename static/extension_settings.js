@@ -894,6 +894,7 @@
     _invokeConfigure:invokeConfigure,
     _onConfigureChange:onConfigureChange,
     _messageActionsForContext:messageActionsForContext,
+    _hasMessageActions(){return messageActionRegistrations.size>0;},
     _invokeMessageAction:invokeMessageAction,
     _onMessageActionChange:onMessageActionChange,
     resetSettingsForExtension(id){return settingsForExtension(id).reset();},
