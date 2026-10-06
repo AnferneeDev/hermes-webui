@@ -7069,6 +7069,19 @@ def _is_non_replayable_history_row(msg) -> bool:
     return False
 
 
+def _recovered_user_row_is_kept(prev_role, next_role) -> bool:
+    """Return True when a ``_recovered`` user row must stay in replayed history.
+
+    It stays only where it separates two assistant turns of the sequence that
+    is actually kept: ``prev_role`` is the previously kept row's role and
+    ``next_role`` the next surviving row's. Anywhere else it is dropped: after
+    a user turn it would sit beside it, and before a user turn (or at the end)
+    it is a stale prompt nobody answered (#4283). One rule for the two legacy
+    projections and the Gateway runs-API history builder (#8038).
+    """
+    return prev_role == 'assistant' and next_role == 'assistant'
+
+
 def _sanitize_messages_for_api(
     messages,
     *,
@@ -7231,7 +7244,7 @@ def _sanitize_messages_for_api(
                 next_role = filtered_clean[j].get('role')
                 break
             # Keep only if this recovered user actually separates two assistants.
-            if not (prev_role == 'assistant' and next_role == 'assistant'):
+            if not _recovered_user_row_is_kept(prev_role, next_role):
                 continue  # drop — fusing the neighbours is clean, or it's a stale prompt
             # Keep but strip the temporary marker
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
@@ -7285,9 +7298,7 @@ def _api_safe_message_positions(messages):
             continue
         if _is_reasoning_only_assistant_message(msg):
             continue
-        if msg.get('_error'):
-            continue
-        if msg.get('_partial') and not str(msg.get('content') or '').strip():
+        if _is_non_replayable_history_row(msg):
             continue
         # Note: _recovered user messages are NOT skipped here — deferred to
         # a final pass after orphaned tool_calls stripping (#4283).
@@ -7348,7 +7359,7 @@ def _api_safe_message_positions(messages):
             for j in range(i + 1, len(filtered_out)):
                 next_role = filtered_out[j][1].get('role')
                 break
-            if not (prev_role == 'assistant' and next_role == 'assistant'):
+            if not _recovered_user_row_is_kept(prev_role, next_role):
                 continue
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
         final_out.append((idx, msg))
