@@ -141,7 +141,7 @@ python -m venv venv
 
 如果机器上同时存在多个 hermes-agent（例如仓库旁边还有一个源码检出），
 `start.ps1` 只会在少数“被挤掉的布局”里改选已安装的 Agent：裸源码检出、仓库旁
-sibling、仓库父目录上的完整检出，或 `%USERPROFILE%\hermes-agent`，且该选中项没
+sibling、仓库父目录上的 Agent 根（源码或 pip 形态），或 `%USERPROFILE%\hermes-agent`，且该选中项没
 有自己的 `venv\Scripts\python.exe`。布局回退场景下，即使安装项没有 venv（依赖
 已可由当前解释器导入）也可能改选；其它情况仍要求安装项带 venv。源码检出自带
 venv 时仍然优先，符合 `api/config.py` 的源码优先顺序。想完全指定位置就设

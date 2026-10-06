@@ -234,8 +234,8 @@ if (-not $AgentDir) {
     # the server binds.
     if (-not $AgentDir) {
         foreach ($c in $launcherOnlyCandidates) {
-            if ((Test-Path (Join-Path $c 'hermes_cli') -PathType Container) -or
-                (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf)) {
+            if ((Test-Path (Join-Path $c 'hermes_cli') -PathType Container -ErrorAction SilentlyContinue) -or
+                (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue)) {
                 $AgentDir = $c
                 break
             }
@@ -284,11 +284,13 @@ if (-not $AgentDir) {
     $selectedIsRepoSibling = $AgentDir -and (
         $AgentDir -eq (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent'))
     # Layout fallbacks that can displace a working install the same way the
-    # repo sibling does: a complete source tree at the repo parent itself, or
-    # at %USERPROFILE%\hermes-agent (server candidate 7 / Path.home()).
+    # repo sibling does: an Agent root at the repo parent itself, or at
+    # %USERPROFILE%\hermes-agent (server candidate 7 / Path.home()). Both source
+    # (run_agent.py) and pip-style (hermes_cli only) roots count: discovery can
+    # select either shape there, and a no-venv pip-style root at those paths
+    # cannot supply the Agent's dependencies any better than a source tree.
     $selectedIsLayoutFallback = $selectedIsRepoSibling -or (
         $AgentDir -and
-        (Test-Path (Join-Path $AgentDir 'run_agent.py') -PathType Leaf) -and
         ($AgentDir -eq $repoParent -or
          $AgentDir -eq (Join-Path $env:USERPROFILE 'hermes-agent')))
     if ($AgentDir -and
@@ -309,7 +311,7 @@ if (-not $AgentDir) {
         $masterCandidates = $masterCandidates | Select-Object -Unique
         $masterPick = $null
         foreach ($c in $masterCandidates) {
-            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $masterPick = $c; break }
+            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container -ErrorAction SilentlyContinue) { $masterPick = $c; break }
         }
         # Layout-fallback selections may win over a pip install that has no
         # in-root venv of its own (deps already importable from the selected
@@ -381,7 +383,7 @@ if ($selectedIsBareSourceCheckout -and
     if ($candidates) {
         foreach ($c in $candidates) {
             $fallback = Join-Path $c 'venv\Scripts\python.exe'
-            if (Test-Path $fallback) {
+            if (Test-Path $fallback -ErrorAction SilentlyContinue) {
                 Write-Warning "Agent dir '$AgentDir' has no venv and no hermes_bootstrap.py; falling back to the venv at '$fallback' for the Agent dependencies."
                 $agentVenvPython = $fallback
                 break

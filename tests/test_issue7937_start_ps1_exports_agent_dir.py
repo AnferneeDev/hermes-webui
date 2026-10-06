@@ -386,7 +386,10 @@ def test_launcher_only_roots_are_ranked_by_path_not_by_kind():
     )
     # The two kinds must be tested in ONE condition, not as two separate loops.
     interleaved = launcher.index(
-        "if ((Test-Path (Join-Path $c 'hermes_cli') -PathType Container) -or"
+        "if ((Test-Path (Join-Path $c 'hermes_cli') -PathType Container"
+    )
+    assert launcher[interleaved:].split("\n", 1)[0].rstrip().endswith(") -or"), (
+        "hermes_cli and run_agent.py must be tested in one -or condition"
     )
     assert interleaved > pf_pos, (
         "the launcher-only pass must come after the roots are built"

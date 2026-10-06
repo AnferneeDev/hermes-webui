@@ -671,3 +671,91 @@ def test_complete_home_hermes_agent_checkout_yields_to_installed_venv(tmp_path):
     assert _agent_dir(output) == str(installed), output
     assert _python(output) == str(venv_python), output
     assert "SERVER_BOUND" in output, output
+
+
+def test_pip_style_home_agent_without_venv_yields_to_legacy_venv(tmp_path):
+    """A no-venv pip-style Agent at %USERPROFILE%\\hermes-agent is a layout fallback too.
+
+    Discovery picks it on the hermes_cli pass (server candidate 7), but the
+    layout-fallback guard used to require run_agent.py, so a pip-style root
+    there skipped the repair and Python started without the Agent's
+    dependencies even though master would have used the working legacy
+    %USERPROFILE%\\.hermes\\hermes-agent venv.
+    """
+    fixture = tmp_path / "fx"
+    legacy = _make_agent(fixture / "user" / ".hermes" / "hermes-agent", venv=True)
+    legacy_python = _make_venv_interpreter(legacy)
+    home_pip = _make_agent(fixture / "user" / "hermes-agent")
+    (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+
+    code, output = _run_start_ps1(
+        fixture,
+        extra_env={
+            "HERMES_HOME": str(fixture / "local" / "hermes"),
+            "HERMES_WEBUI_PYTHON": None,
+        },
+        activate=True,
+    )
+
+    assert _agent_dir(output) != str(home_pip), (
+        "a pip-style %USERPROFILE%\\hermes-agent with no venv must enter the "
+        "layout-fallback repair; got:\n" + output
+    )
+    assert _agent_dir(output) == str(legacy), output
+    assert _python(output) == str(legacy_python), output
+    assert "SERVER_BOUND" in output, output
+    assert code == 0, output
+
+
+def test_program_files_agent_with_unreadable_legacy_home_still_launches(tmp_path):
+    """The launcher-only run_agent.py probe must not throw on an unreadable .hermes.
+
+    `Test-Path <unreadable>\\x -PathType Leaf` raises UnauthorizedAccessException
+    under $ErrorActionPreference = 'Stop'. With a pip Agent only under Program
+    Files, master launches it; the probe has to fail quietly so this layout
+    does too.
+    """
+    fixture = tmp_path / "fx"
+    legacy = fixture / "user" / ".hermes"
+    legacy.mkdir(parents=True)
+    program_files = fixture / "pf"
+    agent = _make_agent(program_files / "hermes" / "hermes-agent")
+    (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+    legacy.chmod(0o000)
+
+    try:
+        code, output = _run_start_ps1(
+            fixture,
+            extra_env={
+                "HERMES_HOME": str(fixture / "local" / "hermes"),
+                "ProgramFiles": str(program_files),
+            },
+        )
+    finally:
+        legacy.chmod(0o755)
+
+    assert "UnauthorizedAccessException" not in output, output
+    assert "Access to the path" not in output, output
+    assert _agent_dir(output) == str(agent), output
+    assert code == 0, output
+
+
+def test_no_agent_with_unreadable_legacy_home_reports_not_found(tmp_path):
+    """With no Agent anywhere, an unreadable .hermes must not mask the clean error."""
+    fixture = tmp_path / "fx"
+    legacy = fixture / "user" / ".hermes"
+    legacy.mkdir(parents=True)
+    (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+    legacy.chmod(0o000)
+
+    try:
+        code, output = _run_start_ps1(
+            fixture,
+            extra_env={"HERMES_HOME": str(fixture / "local" / "hermes")},
+        )
+    finally:
+        legacy.chmod(0o755)
+
+    assert "UnauthorizedAccessException" not in output, output
+    assert "hermes-agent not found" in output, output
+    assert code != 0, output

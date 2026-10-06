@@ -131,8 +131,8 @@ change cross-profile credential handling.
 The native Windows launcher also decides *which* Agent root that bootstrap runs
 from, so the two have to agree. `start.ps1` normally keeps the source-first
 order from `api.config._discover_agent_dir`, but it repairs a few displaced
-layouts: a bare source checkout, the repo sibling, a complete checkout at the
-repo parent, or `%USERPROFILE%\hermes-agent`, when that selection has no in-root
+layouts: a bare source checkout, the repo sibling, an Agent root (source or
+pip-style) at the repo parent, or `%USERPROFILE%\hermes-agent`, when that selection has no in-root
 venv and a later master-order install exists. For the layout-fallback cases the
 install may win even without its own venv (deps already importable); otherwise
 the install needs a `venv\Scripts\python.exe`. A source checkout that has its
