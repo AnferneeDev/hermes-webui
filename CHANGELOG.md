@@ -114,6 +114,12 @@
 
 ### Fixed
 
+- **Auto-follow holds up during fast streams.** While an agent streams quickly, scrolling up to read no longer yanks
+  you back to the bottom, and scrolling down to catch up re-attaches to the tail even though it keeps moving. A
+  trackpad jiggle near the bottom no longer drops the follow, and on iOS/Android post-render scroll artifacts and
+  portrait reflows are no longer mistaken for your own scrolling. Keyboard scrolling inside a nested pane such as
+  terminal output chains to the transcript at the pane's edge. Thanks @CharlesMcquade. (#7494)
+
 - **Links next to Chinese/Japanese punctuation end in the right place, and internationalized domains stay whole.** A URL
   followed by full-width punctuation (`，`, `）`, `。`, opening brackets and quotes) now ends before it, so the prose after
   it is no longer pulled into the link, while hosts written with the full-width dots (`https://例子。中国`,
