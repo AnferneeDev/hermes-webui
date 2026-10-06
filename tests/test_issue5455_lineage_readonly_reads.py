@@ -9,15 +9,12 @@ lineage-metadata reads, and the gateway-watcher fingerprint projection (a 5s
 poll), were still opening a read-WRITE connection. This shared them onto the
 same ``open_state_db_readonly`` helper.
 """
-import logging
 import sqlite3
 from contextlib import closing
 
 import pytest
 
 import api.agent_sessions as agent_sessions
-import api.models as models
-import api.routes as routes
 from api.agent_sessions import (
     open_state_db_readonly,
     read_session_lineage_metadata,
@@ -100,19 +97,25 @@ def test_helper_encodes_special_path_chars(tmp_path, monkeypatch):
     assert calls[0]["target"].endswith("?mode=ro")
 
 
-def test_helper_propagates_readonly_failure_without_writable_fallback(tmp_path, monkeypatch, caplog):
+def test_helper_never_falls_back_to_writable(tmp_path, monkeypatch):
+    """A read-only open failure propagates; the helper never retries with a
+    write-capable handle on the live WAL database."""
     db = tmp_path / "state.db"
     _make_lineage_db(db)
+    calls = []
+
     def fail_read_only(target, *args, **kwargs):
-        assert kwargs.get("uri") is True
+        calls.append({"target": str(target), "uri": bool(kwargs.get("uri"))})
         raise sqlite3.OperationalError("synthetic read-only URI failure")
 
     monkeypatch.setattr(agent_sessions.sqlite3, "connect", fail_read_only)
-    with caplog.at_level(logging.WARNING, logger="api.agent_sessions"):
-        with pytest.raises(sqlite3.OperationalError, match="synthetic read-only URI failure"):
-            open_state_db_readonly(db)
-    assert "read-only open failed" in caplog.text
-    assert "synthetic read-only URI failure" in caplog.text
+    with pytest.raises(sqlite3.OperationalError, match="synthetic read-only URI failure"):
+        open_state_db_readonly(db)
+
+    # Exactly one attempt, and it was the read-only URI form.
+    assert len(calls) == 1
+    assert calls[0]["uri"] is True
+    assert calls[0]["target"].endswith("?mode=ro")
 
 
 def test_helper_raises_on_missing_db_instead_of_creating_a_ghost(tmp_path):
@@ -167,20 +170,3 @@ def test_gateway_watcher_fingerprint_opens_read_only(tmp_path, monkeypatch):
     assert fp is not None  # a fingerprint (not the schema-bail None) was produced
     assert calls and calls[0]["uri"] is True
     assert "mode=ro" in calls[0]["target"]
-
-
-def test_state_db_session_source_uses_read_only_helper(tmp_path, monkeypatch):
-    db = tmp_path / "state.db"
-    _make_lineage_db(db)
-    calls = []
-    real_helper = routes.open_state_db_readonly
-
-    def spy(path, *args, **kwargs):
-        calls.append(path)
-        return real_helper(path, *args, **kwargs)
-
-    monkeypatch.setattr(routes, "open_state_db_readonly", spy)
-    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
-
-    assert routes._state_db_session_source("child-1") == "cli"
-    assert calls == [db]

@@ -925,6 +925,9 @@ eval(extractFunc('_sessionLineageKey'));
 eval(extractFunc('_sidebarLineageKeyForRow'));
 eval(extractFunc('_collapseSessionLineageForSidebar'));
 eval(extractFunc('_attachChildSessionsToSidebarRows'));
+eval(extractFunc('_isDelegatedSubagentRow'));
+eval(extractFunc('_sidebarProjectResolver'));
+eval(extractFunc('_sidebarRowsById'));
 eval(extractFunc('_scopedSidebarReferenceRows'));
 eval(extractFunc('_renderSidebarRowsFromRawSessions'));
 const child = {{session_id:'child', title:'Subagent', parent_session_id:'parent', relationship_type:'child_session', updated_at:20, last_message_at:20, source:'webui'}};
@@ -973,6 +976,9 @@ eval(extractFunc('_sessionLineageKey'));
 eval(extractFunc('_sidebarLineageKeyForRow'));
 eval(extractFunc('_collapseSessionLineageForSidebar'));
 eval(extractFunc('_attachChildSessionsToSidebarRows'));
+eval(extractFunc('_isDelegatedSubagentRow'));
+eval(extractFunc('_sidebarProjectResolver'));
+eval(extractFunc('_sidebarRowsById'));
 eval(extractFunc('_scopedSidebarReferenceRows'));
 eval(extractFunc('_renderSidebarRowsFromRawSessions'));
 const child = {{session_id:'child', title:'Fork in projA', parent_session_id:'parent', relationship_type:'child_session', project_id:'projA', message_count:3, updated_at:20, last_message_at:20, source:'webui'}};
@@ -2262,7 +2268,8 @@ def test_sidebar_search_and_rows_use_read_only_display_title():
     assert "const rawTitle=_sessionDisplayTitle(s);" in js
     assert "const tags=_sessionTitleTags(rawTitle);" in js
     assert "const segTitle=_sessionDisplayTitle(seg)||t('session_lineage_segment_untitled');" in js
-    assert "const childTitle=_sessionDisplayTitle(child)||'Untitled child session';" in js
+    assert "const childTitle=_nestedChildTitle(child)||'Untitled child session';" in js
+    assert "  const title=_sessionDisplayTitle(s);\n  return _isDelegatedSubagentRow(s)?" in js
 
 
 def test_child_session_parent_segment_note_uses_display_title():

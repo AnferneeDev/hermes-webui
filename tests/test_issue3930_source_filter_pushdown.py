@@ -242,7 +242,7 @@ def test_load_cli_sessions_uncached_pushes_specific_source_into_state_db_scan(mo
     monkeypatch.setattr(models, "get_claude_code_sessions", lambda: claude_calls.append(True) or [])
     monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
     monkeypatch.setattr(models, "get_last_workspace", lambda profile=None: tmp_path)
-    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda *_a, **_kw: False)
     monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
     monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
 
@@ -255,7 +255,6 @@ def test_load_cli_sessions_uncached_pushes_specific_source_into_state_db_scan(mo
             "log": models.logger,
             "exclude_sources": None,
             "include_sources": ("tui",),
-            "raise_on_unavailable": True,
         }
     ]
     assert [row["source_tag"] for row in result] == ["tui"]
@@ -285,7 +284,7 @@ def test_cron_source_filter_uses_cron_rescue_limit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
     monkeypatch.setattr(models, "get_last_workspace", lambda profile=None: tmp_path)
-    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda *_a, **_kw: False)
     monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
     monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
 
@@ -297,7 +296,6 @@ def test_cron_source_filter_uses_cron_rescue_limit(monkeypatch, tmp_path):
             "log": models.logger,
             "exclude_sources": None,
             "include_sources": ("cron",),
-            "raise_on_unavailable": True,
         }
     ]
     assert [row["source_tag"] for row in result] == ["cron"]
