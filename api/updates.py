@@ -1438,8 +1438,13 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
             for local in explicit_untracked
             for incoming in added
         )
+        # Both directions matter: an incoming path at or below the collapsed
+        # directory, and a collapsed directory at or below an incoming blob
+        # (git refuses to replace a directory holding untracked content).
         collapsed_overlap = any(
-            incoming == local_dir or incoming.startswith(f'{local_dir}/')
+            incoming == local_dir
+            or incoming.startswith(f'{local_dir}/')
+            or local_dir.startswith(f'{incoming}/')
             for local_dir in collapsed_untracked_dirs
             for incoming in added
         )

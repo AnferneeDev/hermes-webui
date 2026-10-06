@@ -2141,6 +2141,31 @@ def test_update_recovery_hints_nested_untracked_repo_overlap_is_inconclusive(tmp
     assert hints == {'force': None, 'clear_lock': False}
 
 
+def test_update_recovery_hints_nested_untracked_repo_below_incoming_blob_is_inconclusive(tmp_path):
+    """A collapsed ``?? foo/bar/`` entry under an incoming blob ``foo`` is a blocker git refuses; never report it gone."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init', '-q')
+    _git(repo, 'config', 'user.email', 't@t.co')
+    _git(repo, 'config', 'user.name', 'Test')
+    (repo / 'base.txt').write_text('base\n', encoding='utf-8')
+    _git(repo, 'add', 'base.txt')
+    _git(repo, 'commit', '-q', '-m', 'base')
+    _git(repo, 'branch', 'base')
+    _git(repo, 'checkout', '-q', '-b', 'incoming')
+    (repo / 'foo').write_text('incoming blob\n', encoding='utf-8')
+    _git(repo, 'add', 'foo')
+    _git(repo, 'commit', '-q', '-m', 'incoming')
+    _git(repo, 'checkout', '-q', 'base')
+    (repo / 'foo').mkdir()
+    _git(repo, 'init', '-q', 'foo/bar')
+    (repo / 'foo' / 'bar' / 'x.txt').write_text('local\n', encoding='utf-8')
+
+    hints = updates._update_recovery_hints(repo, 'incoming')
+
+    assert hints == {'force': None, 'clear_lock': False}
+
+
 def test_update_recovery_hints_real_git_staged_rename_is_not_a_conflict(tmp_path):
     repo = tmp_path / 'repo'
     repo.mkdir()
