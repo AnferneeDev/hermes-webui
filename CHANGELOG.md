@@ -114,6 +114,13 @@
 
 ### Fixed
 
+- **Pinning is limited per profile, not across all profiles.** Three pinned conversations in one profile used to use
+  up the pin limit for every other profile, so the first pin in a second profile failed. The pin limit now counts
+  only the pinned conversations owned by the target conversation's profile (root-profile aliases of `default` share
+  one allowance), a profile-listing failure no longer blocks a first pin when the limit can't be reached, and an
+  empty pinned placeholder can no longer be moved into another profile by a chat or `/goal` from that profile while
+  the pin is being admitted. Thanks @starship-s. (#7823 by @starship-s)
+
 - **Gateway chats no longer replay error notices or empty cut-off replies as conversation history.** With the
   Gateway backend, the history sent to the agent for the next turn included the provider-error and cancel notices
   shown in the transcript (as if the assistant had said them) and reasoning-only or tool-only partial replies as
