@@ -533,6 +533,9 @@ REVIEW_IDN_ROWS = [
     # (_isCjkAutolinkChar covers only the BMP ranges).
     ("https://example.com。𠮷田", ["https://example.com"]),
     ("请访问 https://example.com。𠮷田さんの説明", ["https://example.com"]),
+    # Common-script characters whose script extension is CJK (〆, 々, ー) are prose too.
+    ("https://example.com。〆切は明日", ["https://example.com"]),
+    ("https://example.com。々の説明", ["https://example.com"]),
 ]
 
 
