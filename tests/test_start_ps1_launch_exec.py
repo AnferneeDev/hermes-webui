@@ -569,3 +569,105 @@ def test_legacy_webui_state_redirects_only_the_state_dir(tmp_path):
         + output
     )
     assert code == 0, output
+
+def test_unreadable_legacy_hermes_does_not_abort_startup(tmp_path):
+    """An access-denied legacy .hermes must not kill Test-HermesWebuiState.
+
+    Under $ErrorActionPreference = 'Stop', Test-Path on an unreadable path
+    throws UnauthorizedAccessException unless -ErrorAction SilentlyContinue is
+    set. Explicit Agent/home/state paths must still start.
+    """
+    fixture = tmp_path / "fx"
+    legacy = fixture / "user" / ".hermes"
+    legacy.mkdir(parents=True)
+    # Make the directory unreadable (and unsearchable) to the current user.
+    legacy.chmod(0o000)
+    agent = _make_agent(fixture / "local" / "hermes" / "hermes-agent")
+    state = fixture / "state"
+    state.mkdir(parents=True)
+
+    try:
+        code, output = _run_start_ps1(
+            fixture,
+            extra_env={
+                "HERMES_HOME": str(fixture / "local" / "hermes"),
+                "HERMES_WEBUI_STATE_DIR": str(state),
+                "HERMES_WEBUI_AGENT_DIR": str(agent),
+            },
+        )
+    finally:
+        legacy.chmod(0o755)
+
+    assert "UnauthorizedAccessException" not in output, (
+        "Test-HermesWebuiState must swallow access-denied on the legacy home; "
+        "got:\n" + output
+    )
+    assert "Access to the path" not in output, output
+    assert _agent_dir(output) == str(agent), output
+    assert code == 0, output
+
+
+def test_complete_sibling_without_venv_yields_to_pip_install_without_venv(tmp_path):
+    """Brick 2: complete no-venv sibling vs pip install that also has no venv.
+
+    The install's dependencies are already importable from the selected Python,
+    so requiring masterPick to have a venv left the sibling selected and its
+    exiting bootstrap aborted startup.
+    """
+    fixture = tmp_path / "fx"
+    installed = _make_agent(fixture / "local" / "hermes" / "hermes-agent")
+    sibling = _make_agent(fixture / "hermes-agent", complete=True)
+    (sibling / "hermes_bootstrap.py").write_text(
+        "raise SystemExit(7)\n", encoding="utf-8"
+    )
+    (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+
+    code, output = _run_start_ps1(
+        fixture,
+        extra_env={
+            "HERMES_HOME": str(fixture / "local" / "hermes"),
+            "HERMES_WEBUI_PYTHON": None,
+        },
+        activate=True,
+    )
+
+    assert code == 0, (
+        "a complete no-venv sibling must yield to a pip install even when that "
+        "install has no in-root venv; got:\n" + output
+    )
+    assert _agent_dir(output) == str(installed), output
+    assert "SERVER_BOUND" in output, output
+
+
+def test_complete_home_hermes_agent_checkout_yields_to_installed_venv(tmp_path):
+    """Brick 3: complete checkout at %USERPROFILE%\\hermes-agent bypassed repair.
+
+    It has hermes_cli and is not the repo sibling, so the old guard never fired;
+    with an exiting bootstrap, startup failed although a working installed Agent
+    with a venv exists.
+    """
+    fixture = tmp_path / "fx"
+    installed = _make_agent(fixture / "local" / "hermes" / "hermes-agent", venv=True)
+    venv_python = _make_venv_interpreter(installed)
+    home_checkout = _make_agent(fixture / "user" / "hermes-agent", complete=True)
+    (home_checkout / "hermes_bootstrap.py").write_text(
+        "raise SystemExit(7)\n", encoding="utf-8"
+    )
+    (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+
+    code, output = _run_start_ps1(
+        fixture,
+        extra_env={
+            "HERMES_HOME": str(fixture / "local" / "hermes"),
+            "HERMES_WEBUI_PYTHON": None,
+        },
+        activate=True,
+    )
+
+    assert code == 0, (
+        "a complete %USERPROFILE%\\hermes-agent checkout's bootstrap must not "
+        "decide the launch; got:\n" + output
+    )
+    assert _agent_dir(output) == str(installed), output
+    assert _python(output) == str(venv_python), output
+    assert "SERVER_BOUND" in output, output

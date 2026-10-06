@@ -107,7 +107,10 @@ function Test-HermesWebuiState {
     # script on the first call, before any Agent discovery.
     param([string]$BaseHome)
     foreach ($rel in @('webui\sessions', 'webui\settings.json', 'webui')) {
-        if (Test-Path (Join-Path $BaseHome $rel)) { return $true }
+        # SilentlyContinue: an unreadable legacy .hermes (access denied) must
+        # not abort startup under $ErrorActionPreference = 'Stop'. Matches the
+        # server's non-throwing state check — treat unreadable as "no state".
+        if (Test-Path (Join-Path $BaseHome $rel) -ErrorAction SilentlyContinue) { return $true }
     }
     return $false
 }
@@ -280,11 +283,19 @@ if (-not $AgentDir) {
     # HERMES_WEBUI_AGENT_DIR and the interpreter stay the same install.
     $selectedIsRepoSibling = $AgentDir -and (
         $AgentDir -eq (Join-Path (Split-Path -Parent $RepoRoot) 'hermes-agent'))
+    # Layout fallbacks that can displace a working install the same way the
+    # repo sibling does: a complete source tree at the repo parent itself, or
+    # at %USERPROFILE%\hermes-agent (server candidate 7 / Path.home()).
+    $selectedIsLayoutFallback = $selectedIsRepoSibling -or (
+        $AgentDir -and
+        (Test-Path (Join-Path $AgentDir 'run_agent.py') -PathType Leaf) -and
+        ($AgentDir -eq $repoParent -or
+         $AgentDir -eq (Join-Path $env:USERPROFILE 'hermes-agent')))
     if ($AgentDir -and
         -not (Test-Path (Join-Path $AgentDir 'venv\Scripts\python.exe')) -and
         (
             -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType Container) -or
-            $selectedIsRepoSibling
+            $selectedIsLayoutFallback
         )) {
         # Master's candidate order: %USERPROFILE%\.hermes, LOCALAPPDATA, then
         # Program Files, then the repo sibling. Built incrementally for the same
@@ -300,8 +311,13 @@ if (-not $AgentDir) {
         foreach ($c in $masterCandidates) {
             if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $masterPick = $c; break }
         }
+        # Layout-fallback selections may win over a pip install that has no
+        # in-root venv of its own (deps already importable from the selected
+        # Python). For those layouts only, accept masterPick without requiring
+        # its venv; otherwise keep requiring a usable venv so a random later
+        # install cannot displace a healthy selected root.
         if ($masterPick -and $masterPick -ne $AgentDir -and
-            (Test-Path (Join-Path $masterPick 'venv\Scripts\python.exe'))) {
+            ($selectedIsLayoutFallback -or (Test-Path (Join-Path $masterPick 'venv\Scripts\python.exe')))) {
             Write-Warning "Agent dir '$AgentDir' is a source checkout with no install of its own and no venv, so its dependencies would come from hermes_bootstrap.py, which can exit before the server starts; using the installed Agent at '$masterPick' instead, which is what this script selected before agent discovery was aligned with the server."
             $AgentDir = $masterPick
         }
