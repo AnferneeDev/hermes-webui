@@ -49,7 +49,7 @@ def test_autolink_uses_esc_for_xss_safety():
     autolink_idx = content.find('// Autolink: convert plain URLs')
     assert autolink_idx != -1, "Autolink comment not found in ui.js"
     # Extract the autolink block (next ~1600 chars after the comment; grown by
-    # the CJK-punctuation terminator class in the URL match)
+    # the shared autolink helper)
     autolink_block = content[autolink_idx:autolink_idx + 1600]
     # esc() must be used on the visible link text to prevent XSS
     assert 'esc(clean)' in autolink_block, (
@@ -108,8 +108,8 @@ def test_autolink_target_blank_and_rel():
     content = read_ui_js()
     autolink_idx = content.find('// Autolink: convert plain URLs')
     assert autolink_idx != -1, "Autolink comment not found"
-    # Use a larger window to account for the stash preamble and the CJK-punctuation
-    # terminator class, both of which grew this block
+    # Use a larger window to account for the stash preamble and shared autolink
+    # helper, both of which grew this block.
     autolink_block = content[autolink_idx:autolink_idx + 1600]
     assert 'target="_blank"' in autolink_block, (
         'Autolinked URLs should have target="_blank"'

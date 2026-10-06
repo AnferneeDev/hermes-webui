@@ -340,6 +340,15 @@ class TestAutolinkCjkProseContinuation:
         assert "</a>，参见" in out
 
     @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_cjk_path_does_not_override_query_prose_boundary(
+        self, driver_path, prefix
+    ):
+        out = _render(driver_path, prefix + "https://example.com/日本語?q=1，参见")
+        assert 'href="https://example.com/日本語?q=1"' in out
+        assert 'href="https://example.com/日本語?q=1，参见"' not in out
+        assert "</a>，参见" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
     def test_later_slash_does_not_reclassify_authority_full_stop(
         self, driver_path, prefix
     ):
@@ -349,6 +358,15 @@ class TestAutolinkCjkProseContinuation:
         assert "</a>。参见docs/guide.md" in out
 
     @pytest.mark.parametrize("prefix", ["", "- "])
+    @pytest.mark.parametrize(
+        "url", ["https://例子。中国/路径", "https://例え。日本/パス"]
+    )
+    def test_unicode_idn_labels_remain_linked(self, driver_path, prefix, url):
+        out = _render(driver_path, prefix + url)
+        assert f'href="{url}"' in out
+        assert f">{url}</a>" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
     def test_bare_host_full_stop_before_prose_ends_link(self, driver_path, prefix):
         out = _render(driver_path, prefix + "请访问 https://example.com。然后登录")
         assert 'href="https://example.com"' in out
@@ -356,20 +374,28 @@ class TestAutolinkCjkProseContinuation:
         assert "</a>。然后登录" in out
 
     def test_long_boundary_run_completes_without_quadratic_scan(self, driver_path):
-        markdown = "https://example.com/" + ("a" * 60000) + "日" + ("，" * 60000)
-        out, elapsed_ms = _render_timed(driver_path, markdown)
-        assert 'href="https://example.com/' in out
-        assert elapsed_ms < 3000, (
-            f"renderMd took {elapsed_ms:.2f} ms; boundary scan is not linear"
+        def render_size(size):
+            markdown = "https://example.com/" + ("a" * size) + "日" + ("，" * size)
+            return _render_timed(driver_path, markdown)
+
+        small_out, small_ms = render_size(30000)
+        large_out, large_ms = render_size(60000)
+        assert 'href="https://example.com/' in small_out
+        assert 'href="https://example.com/' in large_out
+        assert large_ms <= small_ms * 3 + 25, (
+            f"doubling input grew render time from {small_ms:.2f} to {large_ms:.2f} ms"
         )
 
     def test_thousands_of_urls_do_not_recurse(self, driver_path):
-        urls = [f"https://example.com/{i}" for i in range(5000)]
-        out, elapsed_ms = _render_timed(driver_path, "，".join(urls))
-        assert out.count("<a ") == len(urls)
+        small_urls = [f"https://example.com/{i}" for i in range(2500)]
+        large_urls = [f"https://example.com/{i}" for i in range(5000)]
+        _, small_ms = _render_timed(driver_path, "，".join(small_urls))
+        out, large_ms = _render_timed(driver_path, "，".join(large_urls))
+        assert out.count("<a ") == len(large_urls)
         assert 'href="https://example.com/4999"' in out
-        assert elapsed_ms < 3000, (
-            f"renderMd took {elapsed_ms:.2f} ms for iterative trail scanning"
+        assert large_ms <= small_ms * 3 + 25, (
+            f"doubling URL count grew render time from {small_ms:.2f} "
+            f"to {large_ms:.2f} ms"
         )
 
     @pytest.mark.parametrize("iri_char", ["—", "’"])
