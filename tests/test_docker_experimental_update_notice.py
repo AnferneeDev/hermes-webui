@@ -154,22 +154,59 @@ def test_experimental_matching_refs_follows_pagination(tmp_path, monkeypatch):
     assert seen_urls == [first_url, second_url]
 
 
-def test_experimental_final_release_sorts_above_release_candidate(tmp_path, monkeypatch):
+def test_experimental_release_candidates_are_not_offered(tmp_path, monkeypatch):
     payload = [
         {"ref": "refs/tags/exp-v0.52.416-rc1", "object": {"sha": "candidate"}},
         {"ref": "refs/tags/exp-v0.52.416", "object": {"sha": "final"}},
+        {"ref": "refs/tags/exp-v0.52.415", "object": {"sha": "current"}},
     ]
     monkeypatch.setattr(
         updates.urllib.request,
         "urlopen",
         lambda request, timeout=0: _FakeResponse(payload),
     )
-    monkeypatch.setattr(updates, "WEBUI_VERSION", "exp-v0.52.416-rc1")
+    monkeypatch.setattr(updates, "WEBUI_VERSION", "exp-v0.52.415")
 
     info = updates._check_repo(tmp_path, "webui", channel="experimental")
 
     assert info["behind"] == 1
     assert info["latest_version"] == "exp-v0.52.416"
+
+
+def test_stable_image_can_opt_into_experimental_updates(tmp_path, monkeypatch):
+    payload = [
+        {"ref": "refs/tags/exp-v0.52.108", "object": {"sha": "latest"}},
+        {"ref": "refs/tags/exp-v0.52.107", "object": {"sha": "middle"}},
+        {"ref": "refs/tags/exp-v0.52.105", "object": {"sha": "older"}},
+    ]
+    monkeypatch.setattr(
+        updates.urllib.request,
+        "urlopen",
+        lambda request, timeout=0: _FakeResponse(payload),
+    )
+    monkeypatch.setattr(updates, "WEBUI_VERSION", "v0.52.106")
+
+    info = updates._check_repo(tmp_path, "webui", channel="experimental")
+
+    assert info["behind"] == 2
+    assert info["current_version"] == "v0.52.106"
+    assert info["latest_version"] == "exp-v0.52.108"
+    assert info["channel"] == "experimental"
+
+
+def test_experimental_pagination_fails_closed_on_repeated_next_url(monkeypatch):
+    first_url = updates._GITHUB_EXPERIMENTAL_REFS_URL
+
+    monkeypatch.setattr(
+        updates.urllib.request,
+        "urlopen",
+        lambda request, timeout=0: _FakeResponse(
+            [{"ref": "refs/tags/exp-v0.52.416", "object": {"sha": "latest"}}],
+            link=f'<{first_url}>; rel="next"',
+        ),
+    )
+
+    assert updates._github_release_tags(channel="experimental") == []
 
 
 def _function_source(source: str, name: str) -> str:

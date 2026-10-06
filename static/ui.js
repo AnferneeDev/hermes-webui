@@ -11035,9 +11035,9 @@ function _showUpdateBanner(data){
     btnApply.style.display=hasApplyTargets?'':'none';
     if(webuiManual){
       const forceBtn=$('btnForceUpdate');
-      if(forceBtn){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
+      if(forceBtn&&!(agentUpdatable&&forceBtn.dataset.target==='agent')){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
       const clearLockBtn=$('btnClearUpdateLock');
-      if(clearLockBtn){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
+      if(clearLockBtn&&!(agentUpdatable&&clearLockBtn.dataset.target==='agent')){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
     }
   }
   if(!parts.length){
@@ -11161,6 +11161,7 @@ function _showUpdateError(target,res){
   // modifications).
   if(forceBtn&&(res.conflict||res.diverged)){
     forceBtn.dataset.target=target;
+    forceBtn.disabled=false;
     forceBtn.style.display='inline-block';
   }
   // Show "Clear lock and retry update" when the only failure was a stale
@@ -11169,6 +11170,7 @@ function _showUpdateError(target,res){
   const clearLockBtn=$('btnClearUpdateLock');
   if(clearLockBtn&&res.lock_conflict){
     clearLockBtn.dataset.target=target;
+    clearLockBtn.disabled=false;
     clearLockBtn.style.display='inline-block';
   }
 }

@@ -70,7 +70,13 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'ssl certificate problem',
 )
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
-_EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9][0-9A-Za-z.+-]*$')
+_EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9]+(?:\.[0-9]+)*$')
+_GITHUB_RELEASE_TAGS_URL = 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
+_GITHUB_EXPERIMENTAL_REFS_URL = (
+    'https://api.github.com/repos/nesquena/hermes-webui/'
+    'git/matching-refs/tags/exp-v?per_page=100'
+)
+_GITHUB_RELEASE_MAX_PAGES = 20
 # Phrases git emits when its own short-lived index/refs lock files block a
 # subsequent operation. Tuned to match only the true "lock file already exists"
 # semantics that warrant a lock-conflict response -- v2 deliberately drops the
@@ -882,24 +888,23 @@ def _is_stable_release_tag(tag):
 
 
 def _github_release_tags(
-    url='https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100',
+    url=None,
     *,
     timeout=3.0,
     channel=DEFAULT_UPDATE_CHANNEL,
 ):
     """Return GitHub tags for the selected channel, newest-first, with SHAs."""
     channel = _normalize_channel(channel)
-    use_matching_refs = channel == 'experimental' and url == (
-        'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
-    )
-    if use_matching_refs:
-        url = (
-            'https://api.github.com/repos/nesquena/hermes-webui/'
-            'git/matching-refs/tags/exp-v?per_page=100'
-        )
+    use_matching_refs = channel == 'experimental' and url is None
+    if url is None:
+        url = _GITHUB_EXPERIMENTAL_REFS_URL if use_matching_refs else _GITHUB_RELEASE_TAGS_URL
     payload = []
     next_url = url
+    seen_urls = set()
     while next_url:
+        if next_url in seen_urls or len(seen_urls) >= _GITHUB_RELEASE_MAX_PAGES:
+            return []
+        seen_urls.add(next_url)
         request = urllib.request.Request(
             next_url,
             headers={
@@ -959,7 +964,13 @@ def _check_webui_published_release_update(channel=DEFAULT_UPDATE_CHANNEL):
     """Return a manual-update payload when the baked WebUI trails its channel."""
     channel = _normalize_channel(channel)
     current_version = str(WEBUI_VERSION or '').strip()
-    if not _is_release_tag_for_channel(current_version, channel):
+    stable_to_experimental = (
+        channel == 'experimental' and _is_stable_release_tag(current_version)
+    )
+    if not (
+        _is_release_tag_for_channel(current_version, channel)
+        or stable_to_experimental
+    ):
         return None
     try:
         tags = _github_release_tags(channel=channel)
@@ -969,16 +980,30 @@ def _check_webui_published_release_update(channel=DEFAULT_UPDATE_CHANNEL):
         return None
 
     tag_names = [item['name'] for item in tags]
-    if current_version not in tag_names:
-        return None
-
-    latest = tags[0]
+    if stable_to_experimental:
+        current_key = _release_tag_sort_key(current_version)
+        newer_tags = [
+            item for item in tags
+            if _release_tag_sort_key(item['name']) > current_key
+        ]
+        if not newer_tags:
+            return None
+        latest = newer_tags[0]
+        behind = len(newer_tags)
+        current = {}
+    else:
+        if current_version not in tag_names:
+            return None
+        latest = tags[0]
+        behind = _release_gap(tag_names, current_version, latest['name'])
+        current = next(
+            (item for item in tags if item['name'] == current_version),
+            None,
+        ) or {}
     latest_version = latest['name']
-    behind = _release_gap(tag_names, current_version, latest_version)
     if behind <= 0:
         return None
 
-    current = next((item for item in tags if item['name'] == current_version), None) or {}
     current_ref = current.get('sha') or current_version
     latest_ref = latest.get('sha') or latest_version
     repo_url = 'https://github.com/nesquena/hermes-webui'
