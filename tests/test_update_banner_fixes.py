@@ -2297,6 +2297,9 @@ if (_healthResponseServerIdentity({{ server_started_at: null, uptime_seconds: nu
         assert 'clearLockBtn.disabled=false' in fn, (
             "_showUpdateError must re-enable a clear-lock recovery button"
         )
+        assert '_updateRecoveryGeneration' in fn, (
+            "_showUpdateError must invalidate older update-check recovery state"
+        )
 
     def test_error_displayed_persistently_not_just_toast(self):
         src = read('static/ui.js')
@@ -2430,7 +2433,7 @@ const state = {{
   btnClearUpdateLock: {{ disabled: false, style: {{ display: 'inline-block' }}, dataset: {{ target: 'agent' }} }},
   updateWhatsNewLinks: {{ style: {{ display: 'none' }}, replaceChildren() {{ this.cleared = true; }} }},
 }};
-global.window = {{}};
+global.window = {{ _updateRecoveryGeneration: 1 }};
 global.$ = (id) => state[id] || null;
 global._renderUpdateWhatsNewLinks = () => {{}};
 global.t = (key, ...args) => {{
@@ -2449,12 +2452,19 @@ _showUpdateBanner({{
 }});
 if(state.btnForceUpdate.style.display !== 'inline-block' || state.btnForceUpdate.disabled) throw new Error('cached result must not clear fresh force recovery');
 if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUpdateLock.disabled) throw new Error('cached result must not clear fresh lock recovery');
-// A fresh check that positively reports both recovery conditions gone clears
+// An older fresh check must not clear buttons armed after that check started.
+_showUpdateBanner({{
+  webui: {{ no_git: true, manual_update: true, behind: 1 }},
+  agent: {{ behind: 1, recovery: {{ force: false, clear_lock: false }} }},
+}}, 0);
+if(state.btnForceUpdate.style.display !== 'inline-block' || state.btnForceUpdate.disabled) throw new Error('older check must not clear fresh force recovery');
+if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUpdateLock.disabled) throw new Error('older check must not clear fresh lock recovery');
+// A fresh check from the current recovery generation that positively reports both recovery conditions gone clears
 // the buttons that a previous in-page failure had armed.
 _showUpdateBanner({{
   webui: {{ no_git: true, manual_update: true, behind: 1 }},
   agent: {{ behind: 1, recovery: {{ force: false, clear_lock: false }} }},
-}});
+}}, 1);
 if(state.btnForceUpdate.style.display !== 'none') throw new Error('resolved conflict must clear the stale force button');
 if(state.btnForceUpdate.disabled !== true) throw new Error('resolved conflict must disable the stale force button');
 if(state.btnForceUpdate.dataset.target !== '') throw new Error('resolved conflict must drop the stale force target');
@@ -2510,6 +2520,7 @@ let apiData = {{
   agent: null,
 }};
 function $(id) {{ return state[id] || null; }}
+global.window = {{}};
 function t(key, ...args) {{
   const values = {{
     settings_checking: 'Checking',
@@ -2720,7 +2731,7 @@ class TestUpdateCompareSource:
 
     def test_update_banner_clears_stale_links_when_no_updates_remain(self):
         src = read('static/ui.js')
-        start = src.find('function _showUpdateBanner(data)')
+        start = src.find('function _showUpdateBanner(data,recoveryGenerationAtCheck=null)')
         assert start != -1, "_showUpdateBanner not found"
         fn = src[start:src.find('function dismissUpdate()', start)]
         empty_idx = fn.find('if(!parts.length)')
@@ -2734,7 +2745,7 @@ class TestUpdateCompareSource:
         up_to_date_idx = src.find("settings_up_to_date")
         assert up_to_date_idx != -1, "manual update up-to-date branch not found"
         block = src[up_to_date_idx:up_to_date_idx + 300]
-        assert "_showUpdateBanner(data)" in block
+        assert "_showUpdateBanner(data,_recoveryGenerationAtCheck)" in block
 
 
 class TestWhatsNewSummaryToggle:

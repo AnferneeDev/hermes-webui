@@ -812,6 +812,21 @@ def test_run_git_returns_stdout_when_no_stderr(tmp_path):
     assert 'Already up to date' in out
 
 
+def test_run_git_preserves_whitespace_in_nul_delimited_output(tmp_path):
+    """Path-bearing -z output must remain byte-for-byte intact."""
+    with patch.object(updates.shutil, 'which', return_value='/usr/bin/git'), \
+         patch('subprocess.run') as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=' lead.txt\0trailing.txt \0',
+            stderr='',
+        )
+        out, ok = updates._run_git(['diff-tree', '--name-only', '-z'], tmp_path)
+
+    assert ok is True
+    assert out == ' lead.txt\0trailing.txt \0'
+
+
 def test_run_git_returns_exit_code_when_no_output(tmp_path):
     """If both stdout and stderr are empty, report the exit code."""
     with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
@@ -2071,6 +2086,7 @@ def test_update_recovery_hints_leave_gitfile_lock_state_unknown(tmp_path, monkey
         ('collision/local.txt', 'collision'),
         ('foo', 'foo/bar.txt'),
         (':weird.txt', ':weird.txt'),
+        (' lead.txt', ' lead.txt'),
     ],
 )
 def test_update_recovery_hints_real_git_collision_matrix(
@@ -2099,6 +2115,30 @@ def test_update_recovery_hints_real_git_collision_matrix(
     hints = updates._update_recovery_hints(repo, 'incoming')
 
     assert hints == {'force': True, 'clear_lock': False}
+
+
+def test_update_recovery_hints_nested_untracked_repo_overlap_is_inconclusive(tmp_path):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init', '-q')
+    _git(repo, 'config', 'user.email', 't@t.co')
+    _git(repo, 'config', 'user.name', 'Test')
+    (repo / 'base.txt').write_text('base\n', encoding='utf-8')
+    _git(repo, 'add', 'base.txt')
+    _git(repo, 'commit', '-q', '-m', 'base')
+    _git(repo, 'branch', 'base')
+    _git(repo, 'checkout', '-q', '-b', 'incoming')
+    (repo / 'foo').mkdir()
+    (repo / 'foo' / 'bar.txt').write_text('incoming\n', encoding='utf-8')
+    _git(repo, 'add', 'foo/bar.txt')
+    _git(repo, 'commit', '-q', '-m', 'incoming')
+    _git(repo, 'checkout', '-q', 'base')
+    _git(repo, 'init', '-q', 'foo')
+    (repo / 'foo' / 'unrelated.txt').write_text('local\n', encoding='utf-8')
+
+    hints = updates._update_recovery_hints(repo, 'incoming')
+
+    assert hints == {'force': None, 'clear_lock': False}
 
 
 def test_update_recovery_hints_real_git_staged_rename_is_not_a_conflict(tmp_path):

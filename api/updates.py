@@ -278,7 +278,11 @@ def _run_git(args, cwd, timeout=10):
         # On non-UTF-8 locales (e.g. Chinese Windows GBK), a binary git
         # output that fails to decode used to leave r.stdout = None and crash
         # the whole import with AttributeError. Guard against None defensively.
-        stdout = (r.stdout or '').strip()
+        raw_stdout = r.stdout or ''
+        # ``-z`` output is a byte-for-byte path protocol: leading/trailing
+        # whitespace belongs to filenames and must not be stripped.  Textual
+        # commands retain the historical trimming behaviour.
+        stdout = raw_stdout if '-z' in args else raw_stdout.strip()
         stderr = (r.stderr or '').strip()
         if r.returncode == 0:
             return stdout, True
@@ -1401,7 +1405,14 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
     diverged = int(counts[0]) > 0 and int(counts[1]) > 0
 
     untracked = [entry[3:] for entry in entries if entry.startswith('?? ')]
+    # Git collapses an untracked nested repository to ``dir/`` even with
+    # --untracked-files=all.  Its contents are therefore unknown: an incoming
+    # path below it may collide, but different contents may also be harmless.
+    # Keep that state inconclusive instead of claiming either safe or unsafe.
+    collapsed_untracked_dirs = [item.rstrip('/') for item in untracked if item.endswith('/')]
+    explicit_untracked = [item for item in untracked if not item.endswith('/')]
     collision = False
+    collapsed_overlap = False
     if untracked:
         added_out, added_ok = _run_git(
             [
@@ -1424,11 +1435,19 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
             local == incoming
             or local.startswith(f'{incoming}/')
             or incoming.startswith(f'{local}/')
-            for local in untracked
+            for local in explicit_untracked
+            for incoming in added
+        )
+        collapsed_overlap = any(
+            incoming == local_dir or incoming.startswith(f'{local_dir}/')
+            for local_dir in collapsed_untracked_dirs
             for incoming in added
         )
 
-    hints['force'] = diverged or collision
+    if diverged or collision:
+        hints['force'] = True
+    elif not collapsed_overlap:
+        hints['force'] = False
     return hints
 
 

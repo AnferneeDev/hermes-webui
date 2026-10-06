@@ -11058,7 +11058,7 @@ function _renderUpdateWhatsNewLinks(data){
   }
   _appendUpdateDiffLinks(container,targets,"What's new: ");
 }
-function _showUpdateBanner(data){
+function _showUpdateBanner(data,recoveryGenerationAtCheck=null){
   const parts=[];
   const webuiPart=_formatUpdateTargetStatus('WebUI',data.webui);
   const agentPart=_formatUpdateTargetStatus('Agent',data.agent);
@@ -11082,7 +11082,9 @@ function _showUpdateBanner(data){
       // that could not determine the state stay null and never clear. Cached
       // results also never clear buttons armed after that cache was recorded.
       const _agentRecovery=(data&&data.agent&&data.agent.recovery)||null;
-      const _recoveryGone=(kind)=>!!(!data.cached&&_agentRecovery&&_agentRecovery[kind]===false);
+      const _currentRecoveryGeneration=Number(window._updateRecoveryGeneration)||0;
+      const _recoveryGenerationIsCurrent=recoveryGenerationAtCheck===null||Number(recoveryGenerationAtCheck)===_currentRecoveryGeneration;
+      const _recoveryGone=(kind)=>!!(!data.cached&&_recoveryGenerationIsCurrent&&_agentRecovery&&_agentRecovery[kind]===false);
       const forceBtn=$('btnForceUpdate');
       if(forceBtn&&!(agentUpdatable&&forceBtn.dataset.target==='agent'&&!_recoveryGone('force'))){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
       const clearLockBtn=$('btnClearUpdateLock');
@@ -11202,6 +11204,9 @@ function _showUpdateError(target,res){
     errEl.style.display='block';
   } else {
     showToast(msg);
+  }
+  if(res.conflict||res.diverged||res.lock_conflict){
+    window._updateRecoveryGeneration=(Number(window._updateRecoveryGeneration)||0)+1;
   }
   // Show "Force update" button ONLY for errors recoverable by a destructive
   // hard reset. Lock-only failures are routed to a separate non-destructive
