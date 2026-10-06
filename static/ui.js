@@ -8300,16 +8300,18 @@ function renderMd(raw){
       if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
          &&i+1<authorityEnd){
         if(/[A-Za-z0-9_\-]/.test(run[i+1])){currentLabelStart=i+1;continue;}
-        // Keep a Unicode label when this is the first host separator or the
-        // immediately preceding label is itself Unicode. Tracking that label
-        // (rather than any earlier ASCII dot) preserves mixed IDNs such as
-        // www.例子。中国 while `example.com。参见` still ends at the TLD.
+        // Keep a Unicode label when this is the first host separator, when the
+        // immediately preceding label is itself Unicode (www.例子。中国), or when the
+        // next label starts with a non-CJK script letter (www.example。рф). CJK,
+        // Common-script and fullwidth characters after an ASCII label are prose, so
+        // `example.com。参见` / `example.com．次に進む` / `example.com。２０２４年` still end
+        // at the TLD.
         const firstLabelChar=String.fromCodePoint(run.codePointAt(i+1));
-        let unicodeLabel=mark!=='。'||currentLabelStart===schemeEnd
-          ||(/[\p{L}\p{N}]/u.test(firstLabelChar)
-             &&!/[A-Za-z0-9]/.test(firstLabelChar)
+        let unicodeLabel=currentLabelStart===schemeEnd
+          ||(/\p{L}/u.test(firstLabelChar)
+             &&!/[A-Za-z\p{Script=Common}\p{Script=Inherited}\uFF00-\uFFEF]/u.test(firstLabelChar)
              &&!_isCjkAutolinkChar(firstLabelChar)
-             &&!/[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}]/u.test(firstLabelChar));
+             &&!/[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u.test(firstLabelChar));
         for(let j=currentLabelStart;!unicodeLabel&&j<i;){
           const c=String.fromCodePoint(run.codePointAt(j));
           unicodeLabel=/[\p{L}\p{M}\p{N}]/u.test(c)

@@ -528,7 +528,8 @@ REVIEW_IDN_ROWS = [
     ("https://example。𠀀𠀁/x", ["https://example。𠀀𠀁/x"]),
     ("https://www.example。рф/path", ["https://www.example。рф/path"]),
     ("https://www.example．рф/path", ["https://www.example．рф/path"]),
-    ("https://www.example｡中国/path", ["https://www.example｡中国/path"]),
+    # ．/｡ follow the same rule as 。: CJK after an ASCII label is prose.
+    ("https://www.example｡中国/path", ["https://www.example"]),
     # Supplementary-plane Han after a full ASCII host is prose, not a label
     # (_isCjkAutolinkChar covers only the BMP ranges).
     ("https://example.com。𠮷田", ["https://example.com"]),
@@ -536,6 +537,13 @@ REVIEW_IDN_ROWS = [
     # Common-script characters whose script extension is CJK (〆, 々, ー) are prose too.
     ("https://example.com。〆切は明日", ["https://example.com"]),
     ("https://example.com。々の説明", ["https://example.com"]),
+    # Fullwidth digits/Latin, circled numbers and halfwidth/fullwidth-stop variants of
+    # 。 after a full ASCII host are prose, as on the contributor head.
+    ("https://example.com。２０２４年４月より", ["https://example.com"]),
+    ("https://example.com。①ログイン", ["https://example.com"]),
+    ("https://example.com｡然后登录", ["https://example.com"]),
+    ("https://example.com．次に進む", ["https://example.com"]),
+    ("https://example.com。ㄅㄆㄇ", ["https://example.com"]),
 ]
 
 
