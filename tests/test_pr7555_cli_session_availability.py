@@ -4,6 +4,7 @@ Master owns the strict read-only state.db connection layer. These tests cover th
 remaining cache and multi-profile availability semantics.
 """
 
+import os
 import sqlite3
 import time
 
@@ -62,6 +63,235 @@ def _make_state_db(path, *, sessions=80, messages_per_session=3, create_messages
     conn.close()
 
 
+def _insert_session(path, session_id, *, source="cli", started_at=None):
+    started_at = time.time() if started_at is None else started_at
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, source, session_source, title, model, started_at, message_count, parent_session_id, ended_at, end_reason)
+        VALUES (?, ?, ?, ?, 'openai/gpt-5', ?, 1, NULL, NULL, NULL)
+        """,
+        (session_id, source, source, session_id, started_at),
+    )
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'hello', ?)",
+        (f"msg-{session_id}", session_id, started_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _configure_real_single_profile(monkeypatch, tmp_path, db, *, ttl=60.0):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    projects = tmp_path / "projects.json"
+    projects.write_text("[]", encoding="utf-8")
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(models, "PROJECTS_FILE", projects)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "_projects_migrated", True)
+    monkeypatch.setattr(models, "get_last_workspace", lambda profile=None: tmp_path)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", ttl, raising=False)
+    monkeypatch.setattr(
+        models,
+        "_resolve_cli_sessions_context",
+        lambda source_filter=None, **_kwargs: (
+            home,
+            db,
+            "default",
+            (
+                str(home),
+                "default",
+                str(db),
+                source_filter or "",
+                models._sqlite_file_stat_cache_key(db),
+                False,
+                None,
+                None,
+                None,
+            ),
+        ),
+    )
+    models.clear_cli_sessions_cache()
+    return home, projects
+
+
+def _cli_ids(rows):
+    return {
+        row["session_id"]
+        for row in rows
+        if row.get("source_tag") not in {"cron", "webhook", "kanban"}
+    }
+
+
+def test_readonly_projects_file_keeps_cold_primary_rows_visible(tmp_path, monkeypatch):
+    """A real projects.json PermissionError is not state.db unavailability."""
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=2, messages_per_session=1)
+    _insert_session(db, "webhook-cold", source="webhook")
+    _home, projects = _configure_real_single_profile(monkeypatch, tmp_path, db)
+    os.chmod(projects, 0o444)
+
+    rows = models.get_cli_sessions()
+
+    assert _cli_ids(rows) == {"cli_perf_0000", "cli_perf_0001"}
+    assert isinstance(rows, list)
+
+
+def test_readonly_projects_file_serves_new_primary_row_after_warm_cache(
+    tmp_path, monkeypatch
+):
+    """A project persistence error must not make a warm cache stale."""
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=1, messages_per_session=1)
+    _home, projects = _configure_real_single_profile(monkeypatch, tmp_path, db)
+
+    assert _cli_ids(models.get_cli_sessions()) == {"cli_perf_0000"}
+    _insert_session(db, "cli-new-after-warm")
+    _insert_session(db, "webhook-after-warm", source="webhook")
+    os.chmod(projects, 0o444)
+
+    first_partial = models.get_cli_sessions()
+    second_partial = models.get_cli_sessions()
+
+    expected = {"cli_perf_0000", "cli-new-after-warm"}
+    assert _cli_ids(first_partial) == expected
+    assert _cli_ids(second_partial) == expected
+
+
+def test_all_profiles_readonly_projects_keeps_affected_and_healthy_primary_rows(
+    tmp_path, monkeypatch
+):
+    """One profile's optional failure must not stale the aggregate projection."""
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for home in homes:
+        home.mkdir()
+        _make_state_db(home / "state.db", sessions=1, messages_per_session=1)
+    _insert_session(homes[0] / "state.db", "a-webhook", source="webhook")
+    projects = tmp_path / "projects.json"
+    projects.write_text("[]", encoding="utf-8")
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+
+    monkeypatch.setattr(models, "PROJECTS_FILE", projects)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "_projects_migrated", True)
+    monkeypatch.setattr(models, "get_last_workspace", lambda profile=None: tmp_path)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(
+        models,
+        "_all_profiles_cli_contexts",
+        lambda: (
+            [
+                (homes[0], homes[0] / "state.db", "a"),
+                (homes[1], homes[1] / "state.db", "b"),
+            ],
+            tuple(
+                (
+                    str(home),
+                    profile,
+                    models._sqlite_file_stat_cache_key(home / "state.db"),
+                )
+                for home, profile in zip(homes, ("a", "b"), strict=True)
+            ),
+        ),
+    )
+    models.clear_cli_sessions_cache()
+    os.chmod(projects, 0o444)
+
+    warm = models.get_cli_sessions(all_profiles=True)
+    assert {(row["profile"], row["session_id"]) for row in warm} == {
+        ("a", "cli_perf_0000"),
+        ("b", "cli_perf_0000"),
+    }
+
+    _insert_session(homes[0] / "state.db", "a-new")
+    _insert_session(homes[1] / "state.db", "b-new")
+
+    rows = models.get_cli_sessions(all_profiles=True)
+
+    assert {(row["profile"], row["session_id"]) for row in rows} >= {
+        ("a", "cli_perf_0000"),
+        ("a", "a-new"),
+        ("b", "cli_perf_0000"),
+        ("b", "b-new"),
+    }
+    from api import routes
+
+    assert routes._lookup_cli_session_metadata("a-new", all_profiles=True)["profile"] == "a"
+
+
+@pytest.mark.parametrize("optional_source", ["cron", "webhook", "kanban"])
+def test_real_exclusive_lock_during_optional_pass_keeps_primary_rows(
+    tmp_path, monkeypatch, optional_source
+):
+    """A lock acquired after the primary read yields a fresh incomplete result."""
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=1, messages_per_session=1)
+    _insert_session(db, f"{optional_source}-locked", source=optional_source)
+    home = tmp_path / "home"
+    home.mkdir()
+    projects = tmp_path / "projects.json"
+    projects.write_text("[]", encoding="utf-8")
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "PROJECTS_FILE", projects)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "_projects_migrated", True)
+    monkeypatch.setattr(models, "get_last_workspace", lambda profile=None: tmp_path)
+
+    real_open = agent_sessions.open_state_db_readonly
+
+    def fast_locked_open(*args, **kwargs):
+        conn = real_open(*args, **kwargs)
+        conn.execute("PRAGMA busy_timeout=20")
+        return conn
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", fast_locked_open)
+    real_reader = models.read_importable_agent_session_rows
+    lock_conn = None
+    calls = 0
+
+    def lock_after_primary(*args, **kwargs):
+        nonlocal calls, lock_conn
+        calls += 1
+        rows = real_reader(*args, **kwargs)
+        if calls == 1:
+            lock_conn = sqlite3.connect(str(db), isolation_level=None)
+            lock_conn.execute("BEGIN EXCLUSIVE")
+        return rows
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", lock_after_primary)
+    try:
+        result = models._load_cli_sessions_uncached(
+            home,
+            db,
+            "default",
+            project_assigned_limit=False,
+            cron_project_limit=None if optional_source == "cron" else False,
+            webhook_project_limit=None if optional_source == "webhook" else False,
+            kanban_project_limit=None if optional_source == "kanban" else False,
+            _with_completeness=True,
+        )
+    finally:
+        if lock_conn is not None:
+            lock_conn.rollback()
+            lock_conn.close()
+
+    assert result.complete is False
+    assert _cli_ids(result.sessions) == {"cli_perf_0000"}
+
+
 def test_cache_owned_projection_preserves_rows_when_real_open_fails(tmp_path, monkeypatch):
     """A real read-only open failure must reach the stale-cache fallback."""
     db = tmp_path / "state.db"
@@ -95,8 +325,8 @@ def test_cache_owned_projection_preserves_rows_when_real_open_fails(tmp_path, mo
     assert models.get_cli_sessions() == warm
 
 
-def test_cache_owned_source_pass_failure_does_not_publish_partial_rows(tmp_path, monkeypatch):
-    """A source-specific open failure must not cache the earlier partial pass."""
+def test_cache_owned_source_pass_failure_serves_fresh_incomplete_rows_uncached(tmp_path, monkeypatch):
+    """A source-specific read failure retries instead of publishing or serving stale."""
     db = tmp_path / "state.db"
     _make_state_db(db, sessions=1, messages_per_session=1, source="cron", session_source="cron")
     home = tmp_path / "home"
@@ -131,8 +361,12 @@ def test_cache_owned_source_pass_failure_does_not_publish_partial_rows(tmp_path,
 
     monkeypatch.setattr(agent_sessions, "open_state_db_readonly", fail_second_open)
     revision[0] = "failed"
+    assert models.get_cli_sessions() == []
+    assert opens >= 2
+
+    # The incomplete optional result was not published under the failed key.
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", real_open)
     assert models.get_cli_sessions() == warm
-    assert opens == 2
 
 
 def test_all_profiles_partial_result_never_poison_ttl_or_stable_cache(monkeypatch, tmp_path):

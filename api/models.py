@@ -8098,6 +8098,7 @@ def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
 class _CliSessionsLoadResult:
     sessions: list
     complete: bool = True
+    fresh_when_incomplete: bool = False
 
 
 def _load_and_cache_cli_sessions(
@@ -8134,6 +8135,12 @@ def _load_and_cache_cli_sessions(
             return stable_sessions
         return []
     if not complete:
+        if isinstance(loaded, _CliSessionsLoadResult) and loaded.fresh_when_incomplete:
+            # Optional source passes are additive. If one cannot be read, the
+            # primary rows already loaded are newer and more useful than a stale
+            # complete snapshot. Serve them for this request only; never publish
+            # an incomplete projection to either cache.
+            return _copy_cli_sessions(sessions)
         if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
             return stale_sessions
         stable_sessions = _copy_last_known_good_cli_sessions(
@@ -8248,11 +8255,15 @@ def _path_stat_cache_key(path):
 
 
 def _callable_accepts_include_claude_code(callable_obj) -> bool:
+    return _callable_accepts_keyword(callable_obj, 'include_claude_code')
+
+
+def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
     try:
         signature = inspect.signature(callable_obj)
     except (TypeError, ValueError):
         return True
-    if 'include_claude_code' in signature.parameters:
+    if keyword in signature.parameters:
         return True
     return any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -8573,8 +8584,20 @@ def _load_cli_sessions_uncached(
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
-) -> list:
+    _with_completeness: bool = False,
+) -> list | _CliSessionsLoadResult:
     cli_sessions = []
+    projection_complete = True
+
+    def _result():
+        if _with_completeness:
+            return _CliSessionsLoadResult(
+                cli_sessions,
+                complete=projection_complete,
+                fresh_when_incomplete=not projection_complete,
+            )
+        return cli_sessions
+
     if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code:
         try:
             cli_sessions.extend(get_claude_code_sessions())
@@ -8582,11 +8605,11 @@ def _load_cli_sessions_uncached(
             logger.debug("Claude Code session scan failed", exc_info=True)
 
     if source_filter == CLAUDE_CODE_SOURCE:
-        return cli_sessions
+        return _result()
 
 
     if not db_path.exists():
-        return cli_sessions
+        return _result()
 
     # Memoize the cron project ID for this scan so we don't pay a lock-acquire +
     # disk-read of projects.json per cron session in the loop below.
@@ -9376,7 +9399,22 @@ def _load_cli_sessions_uncached(
         })
 
     if source_filter is not None:
-        return cli_sessions
+        return _result()
+
+    def _optional_source_rows(label: str, **kwargs):
+        """Read one additive source pass without discarding primary rows."""
+        nonlocal projection_complete
+        try:
+            return read_importable_agent_session_rows(db_path, **kwargs)
+        except (OSError, sqlite3.Error) as exc:
+            projection_complete = False
+            logger.warning(
+                "Optional %s state.db projection unavailable at %s: %s",
+                label,
+                db_path,
+                exc,
+            )
+            return ()
 
     # --- Second pass: fetch cron sessions that may have been squeezed out
     # of the default window by more-recent non-cron sessions.
@@ -9388,8 +9426,8 @@ def _load_cli_sessions_uncached(
     if cron_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
-                db_path,
+            for row in _optional_source_rows(
+                "cron",
                 limit=cron_project_limit,
                 log=logger,
                 exclude_sources=None,
@@ -9450,8 +9488,6 @@ def _load_cli_sessions_uncached(
                     'is_cli_session': is_cli_session_row(row),
                 })
                 existing_sids.add(sid)
-        except (OSError, sqlite3.Error):
-            raise
         except Exception:
             logger.debug("Cron project-chip second pass failed", exc_info=True)
 
@@ -9461,8 +9497,8 @@ def _load_cli_sessions_uncached(
     if webhook_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
-                db_path,
+            for row in _optional_source_rows(
+                "webhook",
                 limit=webhook_project_limit,
                 log=logger,
                 exclude_sources=None,
@@ -9521,8 +9557,6 @@ def _load_cli_sessions_uncached(
                     'is_cli_session': is_cli_session_row({**row, **_source_meta}),
                 })
                 existing_sids.add(sid)
-        except (OSError, sqlite3.Error):
-            raise
         except Exception:
             logger.debug("Webhook project-chip second pass failed", exc_info=True)
 
@@ -9531,8 +9565,8 @@ def _load_cli_sessions_uncached(
     if kanban_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
-                db_path,
+            for row in _optional_source_rows(
+                "kanban",
                 limit=kanban_project_limit,
                 log=logger,
                 exclude_sources=None,
@@ -9590,12 +9624,10 @@ def _load_cli_sessions_uncached(
                     'is_cli_session': is_cli_session_row({**row, **_source_meta}),
                 })
                 existing_sids.add(sid)
-        except (OSError, sqlite3.Error):
-            raise
         except Exception:
             logger.debug("Kanban sidebar second pass failed", exc_info=True)
 
-    return cli_sessions
+    return _result()
 
 
 def get_cli_sessions(
@@ -9655,10 +9687,14 @@ def get_cli_sessions(
         loader_supports_include_claude_code = _callable_accepts_include_claude_code(
             _load_cli_sessions_uncached
         )
+        loader_supports_completeness = _callable_accepts_keyword(
+            _load_cli_sessions_uncached, '_with_completeness'
+        )
         if all_profiles:
             merged: list[dict] = []
             unavailable_error = None
             successful_profiles = 0
+            optional_incomplete = False
             for ctx_home, ctx_db_path, ctx_profile in contexts:
                 load_kwargs = {
                     # NOTE: visible_session_limit=None is NOT "unbounded" for the
@@ -9680,13 +9716,23 @@ def get_cli_sessions(
                     # Claude Code is global rather than profile-owned. Scan it
                     # once below so profile 0 availability cannot suppress it.
                     load_kwargs['include_claude_code'] = False
+                if loader_supports_completeness:
+                    load_kwargs['_with_completeness'] = True
                 try:
-                    profile_rows = _load_cli_sessions_uncached(
+                    profile_loaded = _load_cli_sessions_uncached(
                         ctx_home,
                         ctx_db_path,
                         ctx_profile,
                         **load_kwargs,
                     )
+                    if isinstance(profile_loaded, _CliSessionsLoadResult):
+                        profile_rows = profile_loaded.sessions
+                        optional_incomplete = optional_incomplete or (
+                            not profile_loaded.complete
+                            and profile_loaded.fresh_when_incomplete
+                        )
+                    else:
+                        profile_rows = profile_loaded
                     merged.extend(profile_rows)
                     successful_profiles += 1
                 except (OSError, sqlite3.Error) as _profile_err:
@@ -9714,10 +9760,18 @@ def get_cli_sessions(
                     and successful_profiles == len(contexts)
                     and external_complete
                 ),
+                fresh_when_incomplete=(
+                    optional_incomplete
+                    and unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                ),
             )
         load_kwargs: dict = {'source_filter': source_filter}
         if loader_supports_include_claude_code:
             load_kwargs['include_claude_code'] = include_claude_code
+        if loader_supports_completeness:
+            load_kwargs['_with_completeness'] = True
         return _load_cli_sessions_uncached(
             hermes_home,
             db_path,
