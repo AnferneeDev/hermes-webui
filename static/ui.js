@@ -4284,6 +4284,19 @@ function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   // providers (@custom:name:model) without collapsing matching model IDs from
   // different providers.
   const rawId=String(modelId||'');
+  // `<provider>/<model>` is another routing spelling of `<model>`, so its badge
+  // key must not become a second picker row. configured_model_badges holds every
+  // spelling of a configured model and renderModelDropdown() synthesises a row
+  // for each key this predicate does not recognise. The provider-qualified
+  // spelling was missed because _normalizeConfiguredModelKey() strips only one
+  // leading slash segment (#3360 keeps `vendor_a/x` and `vendor_b/y/x` distinct),
+  // so `acme/example-model` and `custom/acme/example-model` normalise to
+  // different keys and the picker lists one model twice.
+  // Match it the way the `@provider:` rule below does: the badge declares a
+  // provider, the key starts with that provider's `<provider>/` prefix, and an
+  // existing row from the same provider normalises equal to the remainder. Two
+  // different models never satisfy the last clause, so this can only drop a
+  // duplicate of a row the catalog already produced.
   const slashPrefix=provider?`${provider}/`:'';
   if(slashPrefix&&rawId.toLowerCase().startsWith(slashPrefix)){
     const slashRoutedId=rawId.slice(slashPrefix.length);
