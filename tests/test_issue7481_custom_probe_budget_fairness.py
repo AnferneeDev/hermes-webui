@@ -313,10 +313,10 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
     probed_hosts = [url.split("://", 1)[1].split("/", 1)[0] for url in observed["order"]]
     assert probed_hosts == ["lan-dead.example:1234", "gw-live.example"], probed_hosts
 
-    # (3) Every probe was handed a bounded slice of the window — positive and
-    # strictly below the per-endpoint cap — rather than the whole cap.
+    # (3) HTTP attempts may outlive their serial wait slice, but never exceed
+    # the endpoint cap; later providers still receive their own in-band attempt.
     for url, timeout in observed["dead"] + observed["live"]:
-        assert timeout is not None and 0 < timeout < _WIDE_CAP, (url, timeout)
+        assert timeout is not None and 0 < timeout <= _WIDE_CAP, (url, timeout)
 
     # (4) The schedule's own arithmetic stayed inside the window. This is the
     # virtual clock, so it states "the chain fitted inside the window" on any
@@ -875,7 +875,8 @@ def test_probe_schedule_spends_the_callers_window_not_a_fresh_one(
     class StartedAfterDiscovery(threading.Thread):
         def start(self):
             super().start()
-            assert built.wait(5)
+            if self.name == "models-catalog-rebuild":
+                assert built.wait(5)
 
     class RecordingEvents:
         Thread = StartedAfterDiscovery

@@ -48,7 +48,7 @@ class _BuildDoneEvents:
 @pytest.mark.parametrize("boundary", [False, True])
 @pytest.mark.parametrize("stale", [False, True])
 def test_empty_truncated_partial_uses_existing_fallback(
-    monkeypatch, isolate_models_catalog_state, boundary, stale
+    monkeypatch, isolate_models_catalog_state, boundary, stale, caplog
 ):
     import urllib.request
     from tests.test_issue7481_custom_probe_budget_fairness import _FakeResponse, _catalog
@@ -79,6 +79,8 @@ def test_empty_truncated_partial_uses_existing_fallback(
             assert any(m["id"] == "some-local-model"
                        for g in result["groups"] for m in g["models"])
         assert cfg._available_models_cache is None
+        if not boundary:
+            assert "exceeded" not in caplog.text
     finally:
         release.set()
         for thread in threading.enumerate():

@@ -139,7 +139,10 @@ def test_lmstudio_fallback_uses_scheduled_timeout(monkeypatch, isolate_models_ca
     monkeypatch.setattr(urllib.request, "urlopen", probe)
     result = cfg.get_available_models()
     assert "lm-live" in _models_by_provider(result)["lmstudio"]
-    assert calls == [("https://lm-only.example/v1/models", 0.125)]
+    assert len(calls) == 1
+    assert calls[0][0] == "https://lm-only.example/v1/models"
+    # The schedule limits the wait; HTTP can use the remaining shared window.
+    assert 0.125 <= calls[0][1] < cfg._LIVE_REBUILD_BUDGET_SECONDS
 
 
 @pytest.mark.parametrize("provider", [None, "anthropic"])

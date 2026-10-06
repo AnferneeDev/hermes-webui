@@ -7028,12 +7028,15 @@ class _CustomProbeSchedule:
 
     A slice is ``left / (remaining + 0.1)`` with no lower bound: a fractional
     slot reserves publication headroom without halving a lone endpoint's window.
-    Unused time is lent to later probes. The active/LM Studio duplicate does not
-    reserve a second slot when its URL and configured credential match.
+    A slice bounds the serial wait, not the HTTP attempt: attempts may overlap
+    against the same deadline. After later probes, unused time is lent back to
+    still-running attempts before rebuilding from their outcomes in-band. The
+    active/LM Studio duplicate does not reserve a second slot when its URL and
+    configured credential match.
 
-    Even short chains can truncate a healthy endpoint. A timeout below the full
-    cap is therefore not evidence of unreachability: return a partial, uncached
-    catalog, then retry truncated targets at the full cap on the same worker.
+    Even the shared window can truncate a healthy endpoint. A timeout below the
+    full cap is therefore not evidence of unreachability: return a partial,
+    uncached catalog, then retry truncated targets at the full cap on the worker.
     Successful probes are retained and the final catalog uses the existing
     generation, identity, ownership and durable-publication fences.
 
@@ -9430,6 +9433,44 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     # attempts are removed before rebuilding the catalog on the same worker.
     _custom_endpoint_probe_memo: dict[tuple[str, str], tuple[str, object]] = {}
     _truncated_probes: set[tuple[str, str]] = set()
+    # A slice limits serial waiting, not the lifetime of the HTTP attempt.
+    # Later probes can run while earlier slow probes use the shared window.
+    # Only the catalog worker consumes outcomes/mutates the probe memo.
+    _pending_probes: dict[tuple[str, str], tuple[threading.Event, dict]] = {}
+
+    def _read_probe_payload(req, probe_key, timeout):
+        import urllib.request
+
+        pending = _pending_probes.get(probe_key)
+        if pending is None:
+            # Keep synchronous/full-cap continuation semantics. A bounded
+            # attempt gets the remaining caller window, not just its fair slice.
+            if _models_rebuild_deadline is None or _models_rebuild_abandoned.is_set():
+                with urllib.request.urlopen(req, timeout=timeout) as response:  # nosec B310
+                    return json.loads(response.read().decode("utf-8"))
+            remaining = max(timeout, _models_rebuild_deadline - time.monotonic() - 0.05)
+            request_timeout = min(CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS, remaining)
+            done, outcome = threading.Event(), {}
+
+            def read():
+                try:
+                    with urllib.request.urlopen(req, timeout=request_timeout) as response:  # nosec B310
+                        outcome["data"] = json.loads(response.read().decode("utf-8"))
+                except Exception as exc:
+                    outcome["error"] = exc
+                finally:
+                    done.set()
+
+            _pending_probes[probe_key] = (done, outcome)
+            threading.Thread(target=read, name="models-endpoint-probe", daemon=True).start()
+        else:
+            done, outcome = pending
+        if not done.wait(timeout):
+            raise TimeoutError("catalog probe slice exhausted")
+        _pending_probes.pop(probe_key, None)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["data"]
     # A full-cap custom retry must not repeat unrelated provider discovery.
     # Empty/failure fallbacks are retained too, but only for this invocation.
     _live_provider_memo: dict[str, tuple[bool, object]] = {}
@@ -10101,8 +10142,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if timeout_seconds is None
                     else float(timeout_seconds)
                 )
-                with urllib.request.urlopen(req, timeout=probe_timeout) as response:  # nosec B310
-                    data = json.loads(response.read().decode("utf-8"))
+                data = _read_probe_payload(req, probe_key, probe_timeout)
                 if probe_key is not None:
                     _custom_endpoint_probe_memo[probe_key] = ("ok", data)
                 return _extract_model_entries_from_payload(data, provider), None
@@ -10829,11 +10869,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                     # shared schedule instead of a hardcoded 5s that
                                     # could push the rebuild past the budget on its own.
                                     lm_timeout = custom_probe_schedule.next_timeout()
-                                    with _urlreq.urlopen(
-                                        req,
-                                        timeout=lm_timeout,
-                                    ) as resp:
-                                        lm_data = json.loads(resp.read().decode())
+                                    lm_data = _read_probe_payload(req, _lm_probe_key, lm_timeout)
                                     if _lm_probe_key is not None:
                                         _custom_endpoint_probe_memo[_lm_probe_key] = ("ok", lm_data)
                                 except Exception as exc:
@@ -11545,10 +11581,23 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             with _worker_scope:
                 try:
                     box["result"] = _invoke_models_rebuild(_build_available_models_uncached)
+                    if _pending_probes:
+                        # Lend all time left by later fast probes back to the
+                        # still-running attempts before yielding a partial.
+                        for done, _outcome in list(_pending_probes.values()):
+                            left = max(0.0, (_models_rebuild_deadline or 0.0) - time.monotonic())
+                            done.wait(max(0.0, left - 0.05))
+                        completed = [key for key, (done, _) in _pending_probes.items() if done.is_set()]
+                        if completed:
+                            for key in completed:
+                                _custom_endpoint_probe_memo.pop(key, None)
+                                _truncated_probes.discard(key)
+                            box.pop("result", None)
+                            box["result"] = _invoke_models_rebuild(_build_available_models_uncached)
                     if _truncated_probes:
                         # The foreground may use this partial catalog, but it is
                         # not authoritative and must never enter either cache.
-                        box["partial"] = box["result"]
+                        box["partial"] = box.pop("result")
                         build_done.set()
                         _models_rebuild_abandoned.wait()
                         with _cache_build_cv:
@@ -11556,6 +11605,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                 return
                         for key in _truncated_probes:
                             _custom_endpoint_probe_memo.pop(key, None)
+                            # A surviving HTTP attempt owns only its private box.
+                            # It cannot publish or write into this build's memo.
+                            _pending_probes.pop(key, None)
                         _truncated_probes.clear()
                         box.pop("result", None)
                         box["result"] = _invoke_models_rebuild(_build_available_models_uncached)
@@ -11598,7 +11650,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             if _models_rebuild_deadline is not None
             else float(_LIVE_REBUILD_BUDGET_SECONDS)
         )
-        if build_done.wait(timeout=timeout_remaining) and "partial" not in box:
+        finished_in_time = build_done.wait(timeout=timeout_remaining)
+        if finished_in_time and "partial" not in box:
             # Build finished within budget — foreground publishes
             # synchronously, exactly like the legacy path.
             if "error" in box:
@@ -11652,10 +11705,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             "live provider-catalog rebuild exceeded %.1fs budget — serving "
             "fallback, refreshing catalog out-of-band"
         )
-        if _should_warn_budget("live_rebuild_budget_exceeded"):
-            logger.warning(_budget_log_msg, _LIVE_REBUILD_BUDGET_SECONDS)
-        else:
-            logger.info(_budget_log_msg, _LIVE_REBUILD_BUDGET_SECONDS)
+        if not finished_in_time:
+            if _should_warn_budget("live_rebuild_budget_exceeded"):
+                logger.warning(_budget_log_msg, _LIVE_REBUILD_BUDGET_SECONDS)
+            else:
+                logger.info(_budget_log_msg, _LIVE_REBUILD_BUDGET_SECONDS)
         # ``stale_disk_groups`` is shape-valid but failed the strict metadata
         # checks required for authoritative cold-path use. It was read before
         # acquiring _available_models_cache_lock so this over-budget fallback
