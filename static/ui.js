@@ -8143,25 +8143,35 @@ function renderMd(raw){
   // Inline backtick spans: restore <code> tags produced in the stash callback above.
   // Must happen BEFORE bold/italic so **`code`** → <strong><code>code</code></strong>.
   s=s.replace(/\x00F(\d+)\x00/g,(_,i)=>fence_stash[+i]);
+  // Shared URL-boundary parser for inline and block autolink passes.
   function _bareAutolinkParts(rawUrl){
     const url=String(rawUrl||'');
     const schemeEnd=url.indexOf('://')+3;
     const authorityTail=url.slice(schemeEnd).search(/[/?#]/);
     const authorityEnd=authorityTail<0?url.length:schemeEnd+authorityTail;
-    const pathStart=url.indexOf('/',schemeEnd);
+    const pathStart=url[authorityEnd]==='/'?authorityEnd:-1;
+    const queryFragmentTail=url.slice(schemeEnd).search(/[?#]/);
+    const queryFragmentStart=queryFragmentTail<0?-1:schemeEnd+queryFragmentTail;
+    const cjkPathTail=pathStart<0?-1:url.slice(pathStart).search(/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/);
+    const firstCjkPath=cjkPathTail<0?-1:pathStart+cjkPathTail;
     const boundaryMarks='，。．｡；：！？、）】」》〕';
     for(let i=schemeEnd;i<url.length;i++){
       const mark=url[i];
       if(!boundaryMarks.includes(mark)) continue;
       // UTS #46 maps these three authority characters to an ASCII dot. They
-      // are label separators, not sentence endings, when another label follows.
+      // are label separators when another ASCII label follows. If a later
+      // path/query/fragment disambiguates the URL, keep a Unicode separator
+      // before that component too. A bare host followed by CJK prose instead
+      // ends at the mark, avoiding links that swallow the rest of a sentence.
       if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
-         &&i+1<authorityEnd&&/[A-Za-z0-9_\-\u0080-\uFFFF]/.test(url[i+1])) continue;
+         &&i+1<authorityEnd&&(/[A-Za-z0-9_\-]/.test(url[i+1])||authorityEnd<url.length)) continue;
+      // Query strings and fragments commonly contain unescaped CJK
+      // punctuation. Keep interior marks, while still stripping a final mark.
+      if(queryFragmentStart>=0&&i>queryFragmentStart&&i<url.length-1) continue;
       // Once a path contains raw CJK, interior CJK punctuation is a plausible
-      // IRI character. Keep it unless it is the final character in the run.
-      const cjkBeforeMark=pathStart>=0&&i>pathStart
-        &&/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(url.slice(pathStart,i));
-      if(cjkBeforeMark&&i<url.length-1) continue;
+      // IRI character. The first CJK index is computed once so this scan stays
+      // linear even for very long URLs with many boundary marks.
+      if(firstCjkPath>=0&&firstCjkPath<i&&i<url.length-1) continue;
       return [url.slice(0,i),url.slice(i)];
     }
     const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';
@@ -8191,7 +8201,7 @@ function renderMd(raw){
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
     t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
-    t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const [clean,trail]=_bareAutolinkParts(url);return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
+    t=_autolinkBareText(t);
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
@@ -8535,22 +8545,20 @@ function renderMd(raw){
   // renderer's generated </p> could provide a closing ">" and turn them into
   // executable HTML in innerHTML (for example: <img src=x onerror=...//).
   s=s.replace(/<[a-zA-Z][\w:-]*[^>\n]*$/gm,tag=>esc(tag));
-  // Autolink: convert plain URLs to clickable links.
+  // Autolink: convert plain URLs to clickable links. Both inline and block
+  // rendering use this helper so their boundary and safety rules stay equal.
+  function _autolinkBareText(text){
+    return String(text||'').replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
+      const [clean,trail]=_bareAutolinkParts(url);
+      return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail?_autolinkBareText(trail):''}`;
+    });
+  }
   // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
-  s=s.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{
-    // Strip trailing punctuation that was likely not part of the URL.
-    // High-confidence CJK sentence marks and closing brackets
-    // (）。，；：！？、】」》〕) stop the match so a URL glued to prose —
-    // （https://ex.com/，節錄原文） — ends before that prose. Keep other
-    // Unicode IRI characters (for example em dash and smart apostrophe)
-    // matchable rather than treating broad punctuation ranges as delimiters.
-    // This generalizes the #6792 strip, which could only drop a single mark
-    // sitting at the very end of the match.
-    const [clean,trail]=_bareAutolinkParts(url);
-    return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
-  });
+  // Split high-confidence sentence boundaries while preserving valid CJK IRI
+  // content, then rescan each plain-text trail so adjacent URLs all link.
+  s=_autolinkBareText(s);
   s=s.replace(/\x00B(\d+)\x00/g,(_,i)=>_al_stash[+i]);
   // Restore math stash → katex placeholder spans/divs
   // These will be rendered by renderKatexBlocks() after DOM insertion

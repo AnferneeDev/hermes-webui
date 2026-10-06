@@ -20,6 +20,7 @@ Every case asserts BOTH directions:
 """
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -266,7 +267,7 @@ class TestAutolinkCjkProseContinuation:
         assert f">{url}</a>" in out
 
     @pytest.mark.parametrize("prefix", ["", "- "])
-    @pytest.mark.parametrize("mark", ["，", "。", "；", "）"])
+    @pytest.mark.parametrize("mark", ["，", "。", "；"])
     def test_raw_cjk_path_preserves_interior_cjk_punctuation(
         self, driver_path, prefix, mark
     ):
@@ -274,6 +275,57 @@ class TestAutolinkCjkProseContinuation:
         out = _render(driver_path, prefix + url)
         assert f'href="{url}"' in out
         assert f">{url}</a>" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_adjacent_fullwidth_parenthesized_urls_stay_separate(
+        self, driver_path, prefix
+    ):
+        first = "https://example.com/a"
+        second = "https://example.org/b"
+        out = _render(driver_path, f"{prefix}（{first}）（{second}）")
+        assert f'href="{first}"' in out
+        assert f'href="{second}"' in out
+        assert out.count("<a ") == 2
+        assert f'href="{first}）（https://' not in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_every_url_after_cjk_boundaries_is_autolinked(self, driver_path, prefix):
+        urls = ["https://a.com/x", "https://b.com/y", "https://c.com/z"]
+        out = _render(driver_path, prefix + "参见 " + "，".join(urls))
+        for url in urls:
+            assert f'href="{url}"' in out
+        assert out.count("<a ") == 3
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com?q=你好，世界",
+            "https://example.com/?q=你好，世界",
+            "https://example.com/#section，two",
+        ],
+    )
+    def test_query_and_fragment_keep_interior_cjk_punctuation(
+        self, driver_path, prefix, url
+    ):
+        out = _render(driver_path, prefix + url)
+        assert f'href="{url}"' in out
+        assert f">{url}</a>" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_bare_host_full_stop_before_prose_ends_link(self, driver_path, prefix):
+        out = _render(driver_path, prefix + "请访问 https://example.com。然后登录")
+        assert 'href="https://example.com"' in out
+        assert 'href="https://example.com。然后登录"' not in out
+        assert "</a>。然后登录" in out
+
+    def test_long_boundary_run_completes_without_quadratic_scan(self, driver_path):
+        markdown = "https://example.com/" + ("a" * 60000) + "日" + ("，" * 60000)
+        started = time.monotonic()
+        out = _render(driver_path, markdown)
+        elapsed = time.monotonic() - started
+        assert 'href="https://example.com/' in out
+        assert elapsed < 3.0, f"renderMd took {elapsed:.2f}s; boundary scan is not linear"
 
     @pytest.mark.parametrize("iri_char", ["—", "’"])
     def test_outer_pass_preserves_unicode_iri_path_characters(self, driver_path, iri_char):
