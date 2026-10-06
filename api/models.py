@@ -9119,8 +9119,13 @@ def _load_cli_sessions_uncached(
                             )
                             widening_budget -= widened - scoped_limit
                             scoped_limit = widened
-            except (OSError, sqlite3.Error):
+            except (OSError, sqlite3.Error) as exc:
                 projection_complete = False
+                logger.warning(
+                    "Optional project-assigned recovery pass unavailable at %s: %s",
+                    db_path,
+                    exc,
+                )
             except Exception:
                 logger.debug("Project-assigned CLI recovery pass failed", exc_info=True)
 
@@ -9322,8 +9327,13 @@ def _load_cli_sessions_uncached(
                             ),
                         )
                     query_limit = min(scan_ceiling, next_query_limit)
-            except (OSError, sqlite3.Error):
+            except (OSError, sqlite3.Error) as exc:
                 projection_complete = False
+                logger.warning(
+                    "Optional unassigned refill pass unavailable at %s: %s",
+                    db_path,
+                    exc,
+                )
             except Exception:
                 logger.debug("Unassigned CLI refill pass failed", exc_info=True)
 
