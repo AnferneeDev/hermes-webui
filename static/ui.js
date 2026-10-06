@@ -6843,7 +6843,16 @@ if(typeof window!=='undefined'){
       // reaches it, so the gate would return false and a queued live-render
       // restore would undo this scroll (#7494 re-gate).
       const keyTarget = el.contains(a) ? a : el;
-      if(_isTranscriptScrollTarget(keyTarget,el)) _captureMessageScrollInputTail(el);
+      // Keyboard direction mirrors the browser's own key semantics: PageUp,
+      // ArrowUp, Home and Shift+Space scroll UP; every other key in this set
+      // scrolls DOWN. The nested-pane boundary check is direction-aware, so a
+      // direction-less gate would strictly consume a nested pane even when it
+      // is pinned at the boundary and the browser chains the key onward to the
+      // transcript — the scroll would land but its re-pin authority would not
+      // (#7494 re-gate: PageDown from a nested pane's boundary was undone by
+      // the queued live-render restore).
+      const keyDir=(e.key==='PageUp'||e.key==='ArrowUp'||e.key==='Home'||((e.key===' '||e.key==='Spacebar')&&e.shiftKey))?-1:1;
+      if(_isTranscriptScrollTarget(keyTarget,el,keyDir)) _captureMessageScrollInputTail(el);
       _lastMessageKeyScrollIntentMs=now;
       const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
       if(bottomDistance>120) _lastMessageScrollIntentMs=now;

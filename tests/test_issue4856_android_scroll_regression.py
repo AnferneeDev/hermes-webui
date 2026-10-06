@@ -596,6 +596,103 @@ console.log(JSON.stringify({afterBodyHover, afterInside, afterBodyNoHover}));
     )
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_keyboard_scroll_from_nested_pane_boundary_gets_direction():
+    # #7494 re-gate (Codex): the keydown gate called the targeting helper with
+    # NO direction, so the nested-pane boundary check stayed strictly consumed
+    # even when the nested pane was pinned at the boundary in the key's scroll
+    # direction and the browser chained the key onward to the transcript. With
+    # focus inside a real terminal-output pane pinned at its bottom, PageDown
+    # scrolled the transcript (274 → 925px) but minted no re-pin authority, so
+    # the queued delayed live-render restore snapped scrollTop back (925 → 274)
+    # while master kept it. The fix computes keyDir from the key semantics
+    # (PageUp/ArrowUp/Home/Shift+Space → -1, everything else → +1) and passes
+    # it to the direction-aware gate before capturing the input tail.
+    start = UI_JS.index("const _MESSAGE_SCROLL_KEYS=new Set")
+    end = UI_JS.index("  let _scrollRaf=0;", start)
+    region = UI_JS[start:end]
+    # Real direction-aware gate, mirroring _isTranscriptScrollTarget: a nested
+    # scroller between the target and el consumes the gesture unless it is
+    # pinned at the boundary in the given direction.
+    script = (
+        "const region = " + json.dumps(region) + ";\n"
+        + r"""
+let _lastMessageKeyScrollIntentMs = -Infinity;
+const performance = { now: () => 1234 };
+const el = {
+  contains(node){ return !!(node && node.inMessages); },
+  matches(sel){ return sel === ':hover'; },
+};
+const document = {
+  activeElement: null,
+  _handler: null,
+  addEventListener(type, fn){ if(type === 'keydown') this._handler = fn; },
+};
+const getComputedStyle = () => ({ overflowY: 'visible' });
+function _isTranscriptScrollTarget(node, pane, dir){
+  if(!node) return false;
+  let n=node;
+  while(n && n!==pane){
+    if(n.scrollable){
+      // Consumes unless pinned at the boundary in the gesture direction.
+      if(!(dir>0 ? n.pinnedDown : n.pinnedUp)) return false;
+    }
+    n=n.parentElement;
+  }
+  return n===pane;
+}
+const seenDirs = [];
+let captured = 0;
+const _captureMessageScrollInputTail = () => { captured += 1; };
+const _cancelBottomSettle = () => {};
+const nestedPane = {
+  tagName:'DIV', inMessages:true, isContentEditable:false,
+  parentElement: el, closest(){ return null; },
+  scrollable:true, pinnedDown:true, pinnedUp:false,
+};
+const env = Function('el','document','performance','_isTranscriptScrollTarget','_captureMessageScrollInputTail', `let _lastMessageKeyScrollIntentMs=-Infinity; ${region}
+return {handler:document._handler, setActive:(n)=>{document.activeElement=n;}};`)(el, document, performance, _isTranscriptScrollTarget, _captureMessageScrollInputTail);
+// Focus inside the nested pane so the handler resolves keyTarget to the pane
+// (el.contains(a)) and the gate actually walks its ancestor chain.
+env.setActive(nestedPane);
+env.handler({key:'PageDown', target:nestedPane});
+const afterPageDown = captured;
+env.handler({key:'PageUp', target:nestedPane});
+const afterPageUp = captured;
+env.handler({key:'Home', target:nestedPane});
+const afterHome = captured;
+env.handler({key:'ArrowDown', target:nestedPane});
+const afterArrowDown = captured;
+console.log(JSON.stringify({afterPageDown, afterPageUp, afterHome, afterArrowDown}));
+"""
+    )
+    result = subprocess.run(
+        [NODE, "-e", script], check=True, capture_output=True, text=True, timeout=30
+    )
+    state = json.loads(result.stdout.strip())
+    # PageDown/ArrowDown (dir +1): the nested pane is pinned at its bottom, so
+    # the key chains to the transcript and the capture MUST fire. Under the old
+    # direction-less call the pane strictly consumed and captured stayed put.
+    assert state["afterPageDown"] == 1, (
+        "PageDown at a nested pane's bottom boundary must chain through the "
+        "direction-aware gate and capture re-pin authority, or the queued "
+        "live-render restore undoes the scroll (#7494 re-gate)."
+    )
+    assert state["afterArrowDown"] == 2, (
+        "ArrowDown behaves like PageDown at the bottom boundary (dir +1); "
+        "the counter continues from the earlier PageDown capture."
+    )
+    # PageUp/Home (dir -1) at the bottom boundary: the pane CAN still scroll
+    # up, so it consumes the key and no capture fires.
+    assert state["afterPageUp"] == 1, (
+        "PageUp at the bottom boundary must be consumed by the nested pane "
+        "(dir -1, not pinned upward) — no re-pin authority."
+    )
+    assert state["afterHome"] == 1, (
+        "Home at the bottom boundary must also be consumed (dir -1)."
+    )
+
+
 def test_streaming_tick_calls_fix_before_dom_writes():
     # The streaming render tick in messages.js must call _fixMobileScrollJank()
     # before _lastRenderMs=performance.now() so anchor suppression covers every

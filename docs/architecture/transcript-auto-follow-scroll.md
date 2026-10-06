@@ -60,11 +60,13 @@ The contract that closes that race:
    browser passes the gesture on to the transcript itself and the capture
    survives unless the nested pane sets `overscroll-behavior-y: contain` or
    `none` (both block chaining even at the boundary). The opposite direction
-   still consumes (the pane can scroll that way), and a no-direction call
-   (the keyboard path) fails closed. The
-   transcript's own scrollbar and the focused-pane keyboard path are exempt
-   from the nested check: the scrollbar belongs to `.messages`, and the keydown
-   capture keys off the focused element rather than the event target.
+   still consumes (the pane can scroll that way), and the keyboard path passes
+   an explicit direction (`keyDir`, `-1` for PageUp/ArrowUp/Home/Shift+Space,
+   else `+1`) so its boundary chaining is evaluated with the key's real
+   direction. The transcript's own scrollbar is exempt from the nested check
+   because it belongs to `.messages`. The keydown path applies the check to the
+   focused element, falling back to `.messages` itself when focus is outside
+   the transcript (for example on `<body>` with the pointer over it).
 2. **Consume once.** Each captured input tail authorizes exactly one scroll
    event (`_messageScrollInputTailConsumedGeneration`). A later programmatic or
    layout scroll cannot reuse stale authority — this is what prevents the
