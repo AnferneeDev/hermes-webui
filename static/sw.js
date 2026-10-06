@@ -185,22 +185,35 @@ self.addEventListener('notificationclick', (event) => {
   const sameOrigin = (clientUrl) => {
     try { return new URL(clientUrl).origin === self.location.origin; } catch (_e) { return false; }
   };
-  // A sessionless cron completion targets `/?panel=tasks` (see
-  // `_notificationOptions` in static/messages.js). Honoring that intent means
-  // an already-open tab on `/` must actually LOAD it — boot's saved-chat restore
-  // otherwise wins and the click opens the wrong panel. Only that case pays for
-  // a query-string match plus a navigate.
+  // A panel-intent navigation is still worth it, but ONLY for a sessionless
+  // app-root target carrying the supported Tasks intent (the cron completion
+  // emits `/?panel=tasks`; see `_notificationOptions` in static/messages.js).
+  // Honoring that intent means an already-open tab on the app root must
+  // actually LOAD it — boot's saved-chat restore otherwise wins and the click
+  // opens the wrong panel. Only that case pays for a query-string match plus a
+  // navigate.
   //
   // Every other notification keeps master's behaviour: match on pathname alone
   // and focus(). A session deep link inherits the current page's query string,
-  // so requiring a query match would drop an already-open chat onto the
-  // navigate branch — a full reload that discards composer text still inside
-  // the 400ms draft-save window. Matching on pathname is what prevents a
-  // duplicate window there.
+  // including `panel` (`_sessionUrlForSid` in static/sessions.js retains it),
+  // so ANY `/session/<sid>` target must be classified as a session link, never
+  // a panel intent — otherwise the inherited query is misread as the special
+  // intent and an already-open chat is dropped onto the navigate branch: a full
+  // reload that discards composer text still inside the 400ms draft-save
+  // window. Pathname matching is what prevents a duplicate window there, and
+  // the panel-intent classification is restricted to the sessionless app root.
   const targetCarriesPanelIntent = (() => {
+    const scopeRoot = (() => {
+      try { return new URL(self.registration.scope || './').pathname.replace(/\/+$/, '') || '/'; }
+      catch (_e) { return '/'; }
+    })();
+    const targetRoot = (() => {
+      try { return targetPath.replace(/\/+$/, '') || '/'; }
+      catch (_e) { return '/'; }
+    })();
+    if (targetRoot !== scopeRoot) return false; // takes the application root, so the current chat may never be reloaded
     try {
-      const panel = new URL(targetUrl).searchParams.get('panel');
-      return !!panel && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(panel);
+      return new URL(targetUrl).searchParams.get('panel') === 'tasks';
     } catch (_e) { return false; }
   })();
   const samePathAndSearch = (clientUrl) => {

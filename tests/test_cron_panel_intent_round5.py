@@ -37,6 +37,7 @@ REPO = Path(__file__).resolve().parents[1]
 SW_JS_PATH = REPO / "static" / "sw.js"
 BOOT_JS_PATH = REPO / "static" / "boot.js"
 SESSIONS_JS_PATH = REPO / "static" / "sessions.js"
+MESSAGES_JS_PATH = REPO / "static" / "messages.js"
 INDEX_HTML_PATH = REPO / "static" / "index.html"
 
 NODE = shutil.which("node")
@@ -80,6 +81,7 @@ def _run_node(body: str, env_extra: dict | None = None) -> dict:
         "global.SW_SRC = fs.readFileSync(process.env.SW_JS_PATH, 'utf8');\n"
         "global.BOOT_SRC = fs.readFileSync(process.env.BOOT_JS_PATH, 'utf8');\n"
         "global.SESSIONS_SRC = fs.readFileSync(process.env.SESSIONS_JS_PATH, 'utf8');\n"
+        "global.MESSAGES_SRC = fs.readFileSync(process.env.MESSAGES_JS_PATH, 'utf8');\n"
         "global.INDEX_SRC = fs.readFileSync(process.env.INDEX_HTML_PATH, 'utf8');\n"
         + body
     )
@@ -97,6 +99,7 @@ def _run_node(body: str, env_extra: dict | None = None) -> dict:
                 "SW_JS_PATH": str(SW_JS_PATH),
                 "BOOT_JS_PATH": str(BOOT_JS_PATH),
                 "SESSIONS_JS_PATH": str(SESSIONS_JS_PATH),
+                "MESSAGES_JS_PATH": str(MESSAGES_JS_PATH),
                 "INDEX_HTML_PATH": str(INDEX_HTML_PATH),
                 **(env_extra or {}),
             },
@@ -238,6 +241,129 @@ def test_panel_intent_notification_focuses_a_tab_already_showing_the_intent():
     )
     assert out["clients"][0]["focused"] == 1
     assert out["clients"][0]["navigated"] == []
+
+
+def test_session_notification_with_inherited_panel_query_only_focuses():
+    """INVERSE of the panel-intent case, and the current resolver.
+    `_sessionUrlForSid` retains the page's current query string (`panel`
+    included), so a cron session notification is delivered as
+    `/session/abc?panel=tasks` — syntactically indistinguishable from the root
+    panel-intent URL except for the pathname. That inherited `panel` must NOT be
+    read as a panel intent: the client already has `/session/abc` open, so this
+    must be one focus() with no navigate() and no openWindow() — a reload would
+    discard composer text still inside the 400ms draft-save window."""
+    out = _sw_click(
+        "https://app.test/session/abc?panel=tasks",
+        ["https://app.test/session/abc"],
+    )
+    assert out["openedWindow"] is None, (
+        "an open chat must be focused, never re-opened in a new window"
+    )
+    client = out["clients"][0]
+    assert client["focused"] == 1, "the open chat must be focused"
+    assert client["navigated"] == [], (
+        "an inherited `panel` query on a session URL must not turn it into a "
+        "panel intent — navigating would reload the chat and discard an "
+        "unsaved draft"
+    )
+
+
+# Stands in for a session deep link the producer built with an inherited panel.
+# The REAL `_sessionUrlForSid` + `_notificationOptions` assemble the notification
+# target from the page the cron fires in, and the REAL SW handler then routes the
+# click. The page is on a chat whose URL carries `panel=tasks`; the notification
+# names sid `abc`, which is already open without the panel query.
+_SW_COMPOSE_HARNESS_JS = r"""
+function extractFn(name, src) {
+  const marker = 'function ' + name + '(';
+  const start = src.indexOf(marker);
+  if (start < 0) throw new Error('missing function ' + name);
+  let depth = 0, i = src.indexOf('(', start);
+  for (; i < src.length; i++) {
+    if (src[i] === '(') depth++;
+    else if (src[i] === ')') { depth--; if (depth === 0) break; }
+  }
+  const brace = src.indexOf('{', i);
+  depth = 0;
+  for (i = brace; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+  }
+  throw new Error('function did not close: ' + name);
+}
+function evalFrom(name, src) { globalThis[name] = (0, eval)('(' + extractFn(name, src) + ')'); }
+// The real producer chain: _sessionUrlForSid (sessions.js) builds the session
+// deep link retaining the current page query, and _notificationOptions
+// (messages.js) turns it into the notification's data.url.
+evalFrom('_sessionUrlForSid', SESSIONS_SRC);
+evalFrom('_appRootPath', SESSIONS_SRC);
+evalFrom('_notificationOptions', MESSAGES_SRC);
+global.window = {
+  location: { origin: 'http://app.test', href: 'http://app.test/session/current?panel=tasks' },
+};
+global.document = { baseURI: 'http://app.test/index.html' };
+global.location = { origin: 'http://app.test', href: 'http://app.test/session/current?panel=tasks' };
+global.S = { session: { session_id: 'current-chat' } };
+const composedUrl = _notificationOptions('cron run finished', { sid: 'abc' }).data.url;
+
+function makeClient(url) {
+  const rec = { url, focused: 0, navigated: [] };
+  rec.focus = () => { rec.focused++; return Promise.resolve(rec); };
+  rec.navigate = (target) => { rec.navigated.push(target); return Promise.resolve(rec); };
+  return rec;
+}
+const clients = [makeClient('http://app.test/session/abc')];
+let waited = null;
+let clickHandler = null;
+global.self = {
+  registration: { scope: 'http://app.test/' },
+  location: { origin: 'http://app.test' },
+  clients: {
+    matchAll: () => Promise.resolve(clients),
+    openWindow: (url) => { waited = { opened: url }; return Promise.resolve(); },
+  },
+  addEventListener: (type, fn) => { if (type === 'notificationclick') clickHandler = fn; },
+};
+(0, eval)(handler);
+const event = {
+  notification: { close() {}, data: { url: composedUrl } },
+  waitUntil: (p) => { waited = p; },
+};
+clickHandler(event);
+Promise.resolve(waited).then((w) => {
+  console.log(JSON.stringify({
+    composedUrl,
+    openedWindow: (w && w.opened) || false,
+    client: { url: clients[0].url, focused: clients[0].focused, navigated: clients[0].navigated },
+  }));
+}).catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def _sw_compose_click() -> dict:
+    return _run_node(
+        "const handler = " + json.dumps(_sw_handler()) + ";\n"
+        + _SW_COMPOSE_HARNESS_JS
+    )
+
+
+def test_producer_sends_session_intent_that_sw_focuses_and_never_reloads():
+    """Full producer -> service-worker composition. The cron fires while the
+    open chat's URL carries `?panel=tasks`; `_sessionUrlForSid` retains that
+    query on the `/session/abc` target and `_notificationOptions` ships it to
+    the worker. The worker must classify it as a session link (already-open
+    `/session/abc`), i.e. focus() with no navigate()/openWindow()."""
+    out = _sw_compose_click()
+    assert out["composedUrl"] == "http://app.test/session/abc?panel=tasks", (
+        "the producer must carry the inherited panel query on the session target, "
+        "got " + out["composedUrl"]
+    )
+    assert out["openedWindow"] is False
+    assert out["client"]["focused"] == 1, "the open chat must be focused"
+    assert out["client"]["navigated"] == [], (
+        "a session target with an inherited panel query must never be reloaded "
+        "by the worker (draft loss in the 400ms save window)"
+    )
 
 
 # --------------------------------------------------------------------------
