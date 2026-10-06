@@ -35,6 +35,24 @@ let _offlineHealthProbePromise=null;
 let _offlineFetchProbeFailures=0;
 let _offlineRawFetch=null;
 let _offlineFetchPatched=false;
+// #7542 helper: tag a free-text input (chat title, project name, file
+// rename, etc.) with the full set of attributes the WebUI's other
+// credential-shaped fields use, so Chrome and password-manager
+// extensions (1Password, LastPass, Bitwarden, Dashlane) do not
+// mis-classify it as a login form. Call from every site that creates
+// a ``createElement('input')`` text field for naming or renaming.
+function _markNonCredentialInput(inp){
+  if(!inp) return inp;
+  inp.autocomplete='off';
+  inp.setAttribute('autocorrect','off');
+  inp.setAttribute('autocapitalize','off');
+  inp.setAttribute('spellcheck','false');
+  inp.setAttribute('data-1p-ignore','true');
+  inp.setAttribute('data-lpignore','true');
+  inp.setAttribute('data-bwignore','true');
+  inp.setAttribute('data-form-type','other');
+  return inp;
+}
 function _browserReportsOnline(){return !('onLine' in navigator)||navigator.onLine!==false;}
 function _offlineHealthUrl(){const url=new URL('health',document.baseURI||location.href);url.searchParams.set('offline_probe',String(Date.now()));return url.href;}
 function _setOfflineChecking(checking){
@@ -4244,11 +4262,21 @@ function _normalizeConfiguredModelKey(modelId){
 function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   const normalized=_normalizeConfiguredModelKey(modelId);
   const provider=String(badge&&badge.provider||'').toLowerCase();
+  // A row synthesized from an ungrouped top-level OPTION (temporary/custom
+  // entries added by _ensureModelOptionInDropdown) is stored with providerId:''
+  // even when the option carries provider identity, so that row's provider
+  // authority has to fall back to its badge provider (same fallback already
+  // used by _modelProviderForSelectedBadge below). Without it neither the
+  // same-normalized fast path nor the routed spellings can see the row as
+  // belonging to that provider (#7290).
+  const _entryProvider=(entry)=>String(
+    (entry&&entry.providerId)||(entry&&entry.badge&&entry.badge.provider)||''
+  ).toLowerCase();
   const matchingEntries=(entries||[]).filter(existing=>
     _normalizeConfiguredModelKey(existing.value)===normalized
   );
   if(matchingEntries.some(existing=>{
-    const entryProvider=String(existing.providerId||'').toLowerCase();
+    const entryProvider=_entryProvider(existing);
     return !provider||!entryProvider||entryProvider===provider;
   })) return true;
   // @provider:model is an equivalent routing spelling only when an existing
@@ -4273,7 +4301,7 @@ function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   if(slashPrefix&&rawId.toLowerCase().startsWith(slashPrefix)){
     const slashRoutedId=rawId.slice(slashPrefix.length);
     if(slashRoutedId&&(entries||[]).some(entry=>
-      String(entry.providerId||'').toLowerCase()===provider
+      _entryProvider(entry)===provider
       &&_normalizeConfiguredModelKey(entry.value)===_normalizeConfiguredModelKey(slashRoutedId)
     )) return true;
   }
@@ -4281,7 +4309,7 @@ function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   if(!prefix||!rawId.toLowerCase().startsWith(prefix)) return false;
   const routedId=rawId.slice(prefix.length);
   return (entries||[]).some(entry=>
-    String(entry.providerId||'').toLowerCase()===provider
+    _entryProvider(entry)===provider
     &&_normalizeConfiguredModelKey(entry.value)===_normalizeConfiguredModelKey(routedId)
   );
 }
@@ -4726,7 +4754,15 @@ function renderModelDropdown(){
       const displayName=rawValue.startsWith('@custom:')
         ? getModelLabel(rawValue)
         : (child.textContent||getModelLabel(rawValue));
-      _modelData.push({value:child.value,name:esc(displayName),id:esc(child.value),group:'',groupKey,providerId:'',badge:_getConfiguredModelBadge(child.value,_badgeMap),hiddenByDefault:false});
+      // Keep the option's own provider authority: _ensureModelOptionInDropdown
+      // stamps dataset.provider on the temporary options it adds, and that
+      // authority has to reach both places later comparisons read (the
+      // structural providerId and the configured badge lookup). Storing
+      // providerId:'' here let a badge-owned `@commandcode:model-a` row claim
+      // providerless authority and suppress another provider's
+      // same-normalized configured entries (#7290).
+      const optionProviderId=_getOptionProviderId(child);
+      _modelData.push({value:child.value,name:esc(displayName),id:esc(child.value),group:'',groupKey,providerId:optionProviderId,badge:_getConfiguredModelBadge(child.value,_badgeMap,optionProviderId),hiddenByDefault:false});
       _groupMeta.get(groupKey).modelCount++;
     }
   }
@@ -4737,6 +4773,10 @@ function renderModelDropdown(){
       name:esc(getModelLabel(modelId)),
       id:esc(modelId),
       group:'',
+      // Stamp the badge provider onto the appended row so its provider
+      // authority is structural here instead of depending on the badge
+      // fallback later (#7290).
+      providerId:String((badge&&badge.provider)||''),
       badge,
     });
   }
@@ -22253,6 +22293,8 @@ function _renderTreeItems(container, entries, depth){
       }
       const inp=document.createElement('input');
       inp.className='file-rename-input';inp.value=item.name;
+      // #7542: workspace file rename, not a credentials field.
+      _markNonCredentialInput(inp);
       inp.onclick=(e2)=>e2.stopPropagation();
       const finish=async(save)=>{
         inp.onblur=null;

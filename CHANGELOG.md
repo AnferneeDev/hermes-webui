@@ -114,6 +114,16 @@
 
 ### Fixed
 
+- **The model picker no longer lists a slash-named model twice under a plugin provider.** With an active provider such
+  as Command Code and a configured model id that itself contains a slash (`deepseek/deepseek-v4-flash`), the
+  `provider/model` spelling no longer becomes a second row; each provider keeps its own row, so another provider's
+  `model-a` is never hidden behind a badge-owned one. Thanks @webtecnica. (#7292 by @webtecnica, fixes #7290)
+
+- **Renaming a conversation, project or file no longer triggers the browser's or a password manager's login
+  autofill.** Every rename and naming field (sidebar and titlebar conversation rename, project create and rename,
+  workspace file rename) is marked as a non-credential input, so Chrome and 1Password/LastPass/Bitwarden stop offering
+  saved logins in it. Thanks @happy5318. (#7689 by @happy5318, fixes #7542)
+
 - **A dead model endpoint no longer hides your other custom providers from the model picker.** The cold model
   catalog shares its time budget fairly across custom-provider probes: an unreachable endpoint can't use up the whole
   window, and a healthy slow gateway appears on the first picker load whatever its position in the configuration.
