@@ -114,6 +114,12 @@
 
 ### Fixed
 
+- **A MoA preset picked in the model picker runs its reference models once per call, not twice.** The WebUI also
+  sent a per-turn `moa_config` for these sessions, which made the Agent run a second, independent MoA round on every
+  API call, including each tool iteration, on top of the virtual provider's own. That roughly doubled reference and
+  aggregator calls and latency, and broke the preset's per-turn cache. With an Agent that serves the virtual `moa`
+  provider, the WebUI no longer sends it; older Agents keep the previous behaviour. Thanks @psanger. (#8065)
+
 - **The update banner's Force update and Clear lock buttons go away once they no longer apply.** After a failed
   Agent update armed them (a merge conflict, a diverged checkout, an untracked file in the way, or a stale
   `.git/index.lock`), they stayed until a reload even after the problem was fixed. A fresh update check now clears a
