@@ -866,8 +866,8 @@ def _run_gateway_runs_api_streaming(
             if content is not None:
                 content = _strip_oob_blocks(content)
                 history_rows.append((role, content, role == "user" and bool(entry.get("_recovered"))))
-        # A _recovered user row is sent only where it separates two assistant
-        # turns of the rows that are sent, as the legacy path decides it.
+        # A _recovered user row is sent only where it opens an answered turn
+        # (after an assistant turn or as the first row sent), as the legacy path decides it.
         for index, (role, content, recovered) in enumerate(history_rows):
             if recovered:
                 prev_role = conversation_history[-1]["role"] if conversation_history else None
