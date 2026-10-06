@@ -4,6 +4,7 @@ Master owns the strict read-only state.db connection layer. These tests cover th
 remaining cache and multi-profile availability semantics.
 """
 
+import copy
 import os
 import sqlite3
 import time
@@ -26,6 +27,7 @@ def _make_state_db(path, *, sessions=80, messages_per_session=3, create_messages
             model TEXT,
             started_at REAL NOT NULL,
             message_count INTEGER DEFAULT 0,
+            project_id TEXT,
             parent_session_id TEXT,
             ended_at REAL,
             end_reason TEXT
@@ -77,6 +79,16 @@ def _insert_session(path, session_id, *, source="cli", started_at=None):
     conn.execute(
         "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'hello', ?)",
         (f"msg-{session_id}", session_id, started_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _assign_project(path, session_id, project_id):
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "UPDATE sessions SET project_id = ? WHERE id = ?",
+        (project_id, session_id),
     )
     conn.commit()
     conn.close()
@@ -362,6 +374,178 @@ def test_all_profiles_real_optional_lock_serves_fresh_rows_without_caching(
         if lock_conn is not None:
             lock_conn.rollback()
             lock_conn.close()
+
+
+@pytest.mark.parametrize("locked_pass", ["assigned", "unassigned"])
+@pytest.mark.parametrize("all_profiles", [False, True])
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_real_recovery_lock_keeps_fresh_primary_rows_uncached(
+    tmp_path, monkeypatch, locked_pass, all_profiles, warm_cache
+):
+    """Recovery/refill locks keep the fresh 20-row primary projection."""
+    project_id = "project-1"
+    target_home = tmp_path / "target"
+    target_home.mkdir()
+    target_db = target_home / "state.db"
+    _make_state_db(target_db, sessions=25, messages_per_session=1)
+    _assign_project(target_db, "cli_perf_0024", project_id)
+
+    healthy_home = tmp_path / "healthy"
+    healthy_db = healthy_home / "state.db"
+    if all_profiles:
+        healthy_home.mkdir()
+        _make_state_db(healthy_db, sessions=1, messages_per_session=1)
+
+    projects = tmp_path / "projects.json"
+    projects.write_text("[]", encoding="utf-8")
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "PROJECTS_FILE", projects)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "_projects_migrated", True)
+    monkeypatch.setattr(models, "get_last_workspace", lambda profile=None: tmp_path)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(
+        models,
+        "profile_scoped_project_ids",
+        lambda _profile: frozenset({project_id}),
+    )
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+
+    fixed_single_key = (
+        str(target_home),
+        "default",
+        str(target_db),
+        "",
+        "unchanged-fingerprint",
+        False,
+        None,
+        None,
+        None,
+    )
+    monkeypatch.setattr(
+        models,
+        "_resolve_cli_sessions_context",
+        lambda source_filter=None, **_kwargs: (
+            target_home,
+            target_db,
+            "default",
+            fixed_single_key,
+        ),
+    )
+    if all_profiles:
+        monkeypatch.setattr(
+            models,
+            "_all_profiles_cli_contexts",
+            lambda: (
+                [
+                    (target_home, target_db, "target"),
+                    (healthy_home, healthy_db, "healthy"),
+                ],
+                (
+                    (str(target_home), "target", "unchanged-fingerprint"),
+                    (str(healthy_home), "healthy", "unchanged-fingerprint"),
+                ),
+            ),
+        )
+
+    real_loader = models._load_cli_sessions_uncached
+
+    def focused_loader(home, path, profile, **kwargs):
+        kwargs.update(
+            cron_project_limit=False,
+            webhook_project_limit=False,
+            kanban_project_limit=False,
+        )
+        return real_loader(home, path, profile, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", focused_loader)
+    models.clear_cli_sessions_cache()
+
+    call_kwargs = {
+        "all_profiles": all_profiles,
+        "include_claude_code": False,
+    }
+    if warm_cache:
+        warm = models.get_cli_sessions(**call_kwargs)
+        assert isinstance(warm, list)
+        assert "cli_perf_0024" in _cli_ids(warm)
+        _insert_session(target_db, "new-after-warm")
+        with models._CLI_SESSIONS_CACHE_LOCK:
+            for key, (_expires, stamp, rows) in list(models._CLI_SESSIONS_CACHE.items()):
+                models._CLI_SESSIONS_CACHE[key] = (0.0, stamp, rows)
+
+    cache_before = copy.deepcopy(models._CLI_SESSIONS_CACHE)
+    lkg_before = copy.deepcopy(models._CLI_SESSIONS_LAST_KNOWN_GOOD)
+
+    real_open = agent_sessions.open_state_db_readonly
+
+    def short_busy_timeout(*args, **kwargs):
+        conn = real_open(*args, **kwargs)
+        conn.execute("PRAGMA busy_timeout=20")
+        return conn
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", short_busy_timeout)
+    real_reader = models.read_importable_agent_session_rows
+    lock_conn = None
+    targeted_reads = 0
+
+    def lock_at_secondary_read(path, **kwargs):
+        nonlocal lock_conn, targeted_reads
+        if (
+            path == target_db
+            and kwargs.get("project_assignment") == locked_pass
+            and lock_conn is None
+        ):
+            targeted_reads += 1
+            lock_conn = sqlite3.connect(str(target_db), isolation_level=None)
+            lock_conn.execute("BEGIN EXCLUSIVE")
+        return real_reader(path, **kwargs)
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", lock_at_secondary_read)
+    try:
+        rows = models.get_cli_sessions(**call_kwargs)
+        assert isinstance(rows, list)
+        target_rows = [
+            row for row in rows
+            if not all_profiles or row.get("profile") == "target"
+        ]
+        expected_primary = {f"cli_perf_{i:04d}" for i in range(5, 25)}
+        if warm_cache:
+            expected_primary = {
+                *(f"cli_perf_{i:04d}" for i in range(6, 25)),
+                "new-after-warm",
+            }
+        assert _cli_ids(target_rows) == expected_primary
+        if all_profiles:
+            assert ("healthy", "cli_perf_0000") in {
+                (row.get("profile"), row["session_id"]) for row in rows
+            }
+        assert targeted_reads == 1
+        assert models._CLI_SESSIONS_CACHE == cache_before
+        assert models._CLI_SESSIONS_LAST_KNOWN_GOOD == lkg_before
+    finally:
+        if lock_conn is not None:
+            lock_conn.rollback()
+            lock_conn.close()
+
+    # The incomplete attempt was not published, so the same cache fingerprint
+    # must retry the real loader and observe another committed primary row.
+    _insert_session(target_db, "retry-visible")
+    retry_rows = models.get_cli_sessions(**call_kwargs)
+    assert isinstance(retry_rows, list)
+    assert "retry-visible" in _cli_ids(
+        [
+            row for row in retry_rows
+            if not all_profiles or row.get("profile") == "target"
+        ]
+    )
+    if all_profiles:
+        assert ("healthy", "cli_perf_0000") in {
+            (row.get("profile"), row["session_id"]) for row in retry_rows
+        }
 
 
 def test_cache_owned_projection_preserves_rows_when_real_open_fails(tmp_path, monkeypatch):
