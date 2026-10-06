@@ -1894,15 +1894,64 @@ def test_apply_update_pull_lock_no_stash_when_clean(tmp_path, monkeypatch):
 def test_update_recovery_hints_report_conflict_and_lock(tmp_path, monkeypatch):
     (tmp_path / '.git').mkdir()
     (tmp_path / '.git' / 'index.lock').write_text('', encoding='utf-8')
-    monkeypatch.setattr(updates, '_run_git', lambda *a, **k: ('UU src/app.py\n', True))
+    monkeypatch.setattr(updates, '_run_git', lambda *a, **k: ('UU src/app.py\0', True))
     hints = updates._update_recovery_hints(tmp_path)
     assert hints == {'force': True, 'clear_lock': True}
 
 
 def test_update_recovery_hints_clear_on_clean_repo(tmp_path, monkeypatch):
     (tmp_path / '.git').mkdir()
-    monkeypatch.setattr(updates, '_run_git', lambda *a, **k: ('', True))
-    assert updates._update_recovery_hints(tmp_path) == {'force': False, 'clear_lock': False}
+    monkeypatch.setattr(
+        updates,
+        '_run_git',
+        lambda args, *a, **k: ('0\t1', True) if args[0] == 'rev-list' else ('', True),
+    )
+    assert updates._update_recovery_hints(tmp_path, 'origin/main') == {
+        'force': False,
+        'clear_lock': False,
+    }
+
+
+def test_update_recovery_hints_keep_force_for_diverged_checkout(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    monkeypatch.setattr(
+        updates,
+        '_run_git',
+        lambda args, *a, **k: ('2\t3', True) if args[0] == 'rev-list' else ('', True),
+    )
+    assert updates._update_recovery_hints(tmp_path, 'origin/main')['force'] is True
+
+
+def test_update_recovery_hints_keep_force_for_untracked_collision(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, *a, **k):
+        if args[0] == 'status':
+            return '?? src/generated.py\0', True
+        if args[0] == 'rev-list':
+            return '0\t1', True
+        if args[0] == 'ls-tree':
+            return 'src/generated.py\0', True
+        return '', True
+
+    monkeypatch.setattr(updates, '_run_git', fake_git)
+    assert updates._update_recovery_hints(tmp_path, 'origin/main')['force'] is True
+
+
+def test_update_recovery_hints_clear_for_benign_untracked_file(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, *a, **k):
+        if args[0] == 'status':
+            return '?? notes.txt\0', True
+        if args[0] == 'rev-list':
+            return '0\t1', True
+        if args[0] == 'ls-tree':
+            return '', True
+        return '', True
+
+    monkeypatch.setattr(updates, '_run_git', fake_git)
+    assert updates._update_recovery_hints(tmp_path, 'origin/main')['force'] is False
 
 
 def test_update_recovery_hints_stay_unknown_when_status_probe_fails(tmp_path, monkeypatch):
@@ -1919,7 +1968,7 @@ def test_check_repo_attaches_recovery_hints(tmp_path, monkeypatch):
 
     def fake_git(args, cwd, timeout=10):
         if args and args[0] == 'status':
-            return 'UU src/app.py\n', True
+            return 'UU src/app.py\0', True
         return '', False  # fetch fails -> minimal stale payload
 
     monkeypatch.setattr(updates, '_run_git', fake_git)
@@ -1927,4 +1976,3 @@ def test_check_repo_attaches_recovery_hints(tmp_path, monkeypatch):
     assert info is not None
     assert info.get('stale_check') is True
     assert info['recovery'] == {'force': True, 'clear_lock': False}
-

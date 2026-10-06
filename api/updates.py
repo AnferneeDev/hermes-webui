@@ -1333,7 +1333,7 @@ def _check_repo_branch(path, name, *, fetch=True):
     }
 
 
-def _update_recovery_hints(path: Path) -> dict:
+def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
     """Report which update-recovery conditions a checkout still shows.
 
     The Docker manual notice keeps Agent recovery buttons (``Force update`` /
@@ -1343,8 +1343,9 @@ def _update_recovery_hints(path: Path) -> dict:
     #8040). Every check now answers "does the recovery condition still
     exist?" from live repo state:
 
-    - ``force``: unresolved merge conflicts -- the same porcelain codes the
-      apply path fails on before its ``conflict`` response.
+    - ``force``: unresolved merge conflicts, divergent history, or an
+      untracked path that the offered ref would overwrite -- every condition
+      that can arm the destructive recovery button.
     - ``clear_lock``: a stale ``.git/index.lock`` is present (the only lock
       the clear-lock flow addresses).
 
@@ -1355,13 +1356,50 @@ def _update_recovery_hints(path: Path) -> dict:
     inv = _inventory_locks(path)
     hints['clear_lock'] = bool(inv.get('well_known_lock_present'))
     status_out, status_ok = _run_git(
-        ['status', '--porcelain', '--untracked-files=no'], path, timeout=5
+        ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        path,
+        timeout=5,
     )
-    if status_ok:
-        hints['force'] = any(
-            line[:2] in {'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'}
-            for line in status_out.splitlines()
+    if not status_ok:
+        return hints
+
+    entries = [entry for entry in status_out.split('\0') if entry]
+    if any(
+        entry[:2] in {'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'}
+        for entry in entries
+    ):
+        hints['force'] = True
+        return hints
+
+    # Without a freshly fetched comparison ref, a clean index is not enough
+    # to clear Force update: the checkout may still be divergent or an
+    # untracked path may still collide with the pending update.
+    if not compare_ref:
+        return hints
+
+    counts_out, counts_ok = _run_git(
+        ['rev-list', '--left-right', '--count', f'HEAD...{compare_ref}'],
+        path,
+        timeout=5,
+    )
+    counts = counts_out.split() if counts_ok else []
+    if len(counts) != 2 or not all(part.isdigit() for part in counts):
+        return hints
+    diverged = int(counts[0]) > 0 and int(counts[1]) > 0
+
+    untracked = [entry[3:] for entry in entries if entry.startswith('?? ')]
+    collision = False
+    if untracked:
+        tracked_out, tracked_ok = _run_git(
+            ['ls-tree', '-r', '--name-only', '-z', compare_ref, '--', *untracked],
+            path,
+            timeout=5,
         )
+        if not tracked_ok:
+            return hints
+        collision = bool(tracked_out.strip('\0'))
+
+    hints['force'] = diverged or collision
     return hints
 
 
@@ -1396,7 +1434,10 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     # Agent-only recovery buttons; other targets keep their payload unchanged.
     # This is what lets the frontend clear a stale recovery button once the
     # repo no longer needs it (Greptile P1 on #8040).
-    recovery = _update_recovery_hints(path) if name == 'agent' else None
+    def attach_recovery(payload, compare_ref=None):
+        if payload is not None and name == 'agent':
+            payload['recovery'] = _update_recovery_hints(path, compare_ref)
+        return payload
 
     # Fetch tags first so update prompts track published releases, not every
     # development commit that lands on master/main after the latest release.
@@ -1418,9 +1459,7 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
             release_info['error'] = message
             release_info['stale_check'] = True
             release_info['dirty'] = _is_dirty(path)
-            if recovery is not None:
-                release_info['recovery'] = recovery
-            return release_info
+            return attach_recovery(release_info)
         payload = {
             'name': name,
             'behind': None,
@@ -1428,26 +1467,20 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
             'stale_check': True,
             'dirty': _is_dirty(path),
         }
-        if recovery is not None:
-            payload['recovery'] = recovery
-        return payload
+        return attach_recovery(payload)
 
     release_info = _check_repo_release(path, name, channel)
     if release_info is not None:
         release_info = dict(release_info)
         release_info['dirty'] = _is_dirty(path)
-        if recovery is not None:
-            release_info['recovery'] = recovery
-        return release_info
+        return attach_recovery(release_info, release_info.get('branch'))
 
     branch_info = _check_repo_branch(path, name, fetch=False)
     if branch_info is not None:
         branch_info = dict(branch_info)
         branch_info['dirty'] = _is_dirty(path)
         branch_info['channel'] = channel
-        if recovery is not None:
-            branch_info['recovery'] = recovery
-        return branch_info
+        return attach_recovery(branch_info, branch_info.get('branch'))
     return None
 
 
