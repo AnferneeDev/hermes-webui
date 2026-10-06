@@ -587,6 +587,13 @@ def test_cache_owned_source_pass_failure_serves_fresh_incomplete_rows_uncached(t
     _make_state_db(db, sessions=1, messages_per_session=1, source="cron", session_source="cron")
     home = tmp_path / "home"
     home.mkdir()
+    # Isolate projects like the other tests here: a "Cron Jobs" project left in the shared
+    # projects file by an earlier test (e.g. test_1079) changes which state.db open is the
+    # second one, so the injected failure would land outside the cron pass.
+    projects = tmp_path / "projects.json"
+    projects.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(models, "PROJECTS_FILE", projects)
+    monkeypatch.setattr(models, "_projects_migrated", True)
     revision = ["warm"]
     monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0.001, raising=False)
     monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
