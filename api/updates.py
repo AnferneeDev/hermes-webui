@@ -1353,10 +1353,23 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
     button on a failed probe.
     """
     hints = {'force': None, 'clear_lock': None}
-    inv = _inventory_locks(path)
-    hints['clear_lock'] = bool(inv.get('well_known_lock_present'))
+    git_dir = path / '.git'
+    try:
+        git_dir_is_directory = git_dir.is_dir()
+    except OSError:
+        git_dir_is_directory = False
+    if git_dir_is_directory:
+        inv = _inventory_locks(path)
+        hints['clear_lock'] = bool(inv.get('well_known_lock_present'))
     status_out, status_ok = _run_git(
-        ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        [
+            '--no-optional-locks',
+            'status',
+            '--porcelain=v1',
+            '-z',
+            '--untracked-files=all',
+            '--no-renames',
+        ],
         path,
         timeout=5,
     )
@@ -1390,23 +1403,29 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
     untracked = [entry[3:] for entry in entries if entry.startswith('?? ')]
     collision = False
     if untracked:
-        tracked_out, tracked_ok = _run_git(
+        added_out, added_ok = _run_git(
             [
-                '--literal-pathspecs',
-                'ls-tree',
+                'diff-tree',
                 '-r',
+                '--diff-filter=A',
                 '--name-only',
                 '-z',
+                'HEAD',
                 compare_ref,
-                '--',
-                *untracked,
             ],
             path,
             timeout=5,
         )
-        if not tracked_ok:
+        if not added_ok:
             return hints
-        collision = bool(tracked_out.strip('\0'))
+        added = [entry for entry in added_out.split('\0') if entry]
+        collision = any(
+            local == incoming
+            or local.startswith(f'{incoming}/')
+            or incoming.startswith(f'{local}/')
+            for local in untracked
+            for incoming in added
+        )
 
     hints['force'] = diverged or collision
     return hints
@@ -1573,9 +1592,13 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
             and cache_matches
             and time.time() - _update_cache['checked_at'] < CACHE_TTL
         ):
-            return dict(_update_cache)
+            cached = dict(_update_cache)
+            cached['cached'] = True
+            return cached
         if _check_in_progress and cache_matches:
-            return dict(_update_cache)  # another thread is already checking this channel
+            cached = dict(_update_cache)
+            cached['cached'] = True
+            return cached  # another thread is already checking this channel
         _check_in_progress = True
 
     try:

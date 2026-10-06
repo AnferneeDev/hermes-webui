@@ -2440,6 +2440,15 @@ global.t = (key, ...args) => {{
 {format_fn}
 {instruction_fn}
 {show_fn}
+// A cached result predating the failure must not clear buttons that the
+// subsequent failed update just armed.
+_showUpdateBanner({{
+  cached: true,
+  webui: {{ no_git: true, manual_update: true, behind: 1 }},
+  agent: {{ behind: 1, recovery: {{ force: false, clear_lock: false }} }},
+}});
+if(state.btnForceUpdate.style.display !== 'inline-block' || state.btnForceUpdate.disabled) throw new Error('cached result must not clear fresh force recovery');
+if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUpdateLock.disabled) throw new Error('cached result must not clear fresh lock recovery');
 // A fresh check that positively reports both recovery conditions gone clears
 // the buttons that a previous in-page failure had armed.
 _showUpdateBanner({{

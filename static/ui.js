@@ -11079,9 +11079,10 @@ function _showUpdateBanner(data){
       // condition gone (recovery.force / recovery.clear_lock === false) clears
       // the stale button so a destructive force update cannot linger after the
       // conflict was resolved outside the UI (Greptile P1 on #8040). Probes
-      // that could not determine the state stay null and never clear.
+      // that could not determine the state stay null and never clear. Cached
+      // results also never clear buttons armed after that cache was recorded.
       const _agentRecovery=(data&&data.agent&&data.agent.recovery)||null;
-      const _recoveryGone=(kind)=>!!(_agentRecovery&&_agentRecovery[kind]===false);
+      const _recoveryGone=(kind)=>!!(!data.cached&&_agentRecovery&&_agentRecovery[kind]===false);
       const forceBtn=$('btnForceUpdate');
       if(forceBtn&&!(agentUpdatable&&forceBtn.dataset.target==='agent'&&!_recoveryGone('force'))){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
       const clearLockBtn=$('btnClearUpdateLock');
