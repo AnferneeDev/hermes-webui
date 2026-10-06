@@ -518,6 +518,17 @@ REVIEW_IDN_ROWS = [
     ("https://example.com/?q=Foo｡bar", ["https://example.com/?q=Foo｡bar"]),
     ("https://example.com/#Foo．bar", ["https://example.com/#Foo．bar"]),
     ("https://example.com/#Foo｡bar", ["https://example.com/#Foo｡bar"]),
+    # Release gate 2026-10-06 (maintainer follow-up): labels with combining marks
+    # (Devanagari, Bengali, Thai vowel signs/tone marks) and supplementary-plane
+    # characters, and a Unicode label after an ASCII label joined by ．/｡/。.
+    ("https://example。भारत/path", ["https://example。भारत/path"]),
+    ("https://भारत。भारत/path", ["https://भारत。भारत/path"]),
+    ("https://example．বাংলা", ["https://example．বাংলা"]),
+    ("https://example。ตัวอย่าง", ["https://example。ตัวอย่าง"]),
+    ("https://example。𠀀𠀁/x", ["https://example。𠀀𠀁/x"]),
+    ("https://www.example。рф/path", ["https://www.example。рф/path"]),
+    ("https://www.example．рф/path", ["https://www.example．рф/path"]),
+    ("https://www.example｡中国/path", ["https://www.example｡中国/path"]),
 ]
 
 

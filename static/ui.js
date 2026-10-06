@@ -8304,15 +8304,22 @@ function renderMd(raw){
         // immediately preceding label is itself Unicode. Tracking that label
         // (rather than any earlier ASCII dot) preserves mixed IDNs such as
         // www.例子。中国 while `example.com。参见` still ends at the TLD.
-        let unicodeLabel=currentLabelStart===schemeEnd;
-        for(let j=currentLabelStart;!unicodeLabel&&j<i;j++){
-          unicodeLabel=/[\p{L}\p{N}]/u.test(run[j])
-            &&!/[A-Za-z0-9]/.test(run[j]);
+        const firstLabelChar=String.fromCodePoint(run.codePointAt(i+1));
+        let unicodeLabel=mark!=='。'||currentLabelStart===schemeEnd
+          ||(/[\p{L}\p{N}]/u.test(firstLabelChar)
+             &&!/[A-Za-z0-9]/.test(firstLabelChar)
+             &&!_isCjkAutolinkChar(firstLabelChar));
+        for(let j=currentLabelStart;!unicodeLabel&&j<i;){
+          const c=String.fromCodePoint(run.codePointAt(j));
+          unicodeLabel=/[\p{L}\p{M}\p{N}]/u.test(c)
+            &&!/[A-Za-z0-9]/.test(c);
+          j+=c.length;
         }
-        for(let j=i+1;unicodeLabel&&j<authorityEnd;j++){
-          const c=run[j];
+        for(let j=i+1;unicodeLabel&&j<authorityEnd;){
+          const c=String.fromCodePoint(run.codePointAt(j));
           if(c==='.'||c===':'||boundaryMarks.includes(c)) break;
-          unicodeLabel=/[\p{L}\p{N}_\-]/u.test(c);
+          unicodeLabel=/[\p{L}\p{M}\p{N}_\-]/u.test(c);
+          j+=c.length;
         }
         if(unicodeLabel){currentLabelStart=i+1;continue;}
       }
