@@ -175,6 +175,9 @@ os.environ['HERMES_WEBUI_TEST_STATE_DIR'] = str(TEST_STATE_DIR)
 os.environ['HERMES_WEBUI_STATE_DIR'] = str(TEST_STATE_DIR)
 os.environ['HERMES_WEBUI_DEFAULT_WORKSPACE'] = str(TEST_WORKSPACE)
 os.environ['HERMES_HOME'] = str(TEST_STATE_DIR)
+# Never let a test process, or a server.py child that copies os.environ, install Agent
+# dependencies into the test home (pm.install.lazy_installs_allowed / venv_sync.prepare_launch).
+os.environ['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
 os.environ['HERMES_BASE_HOME'] = str(TEST_STATE_DIR)
 # Hermes Agent sessions may inherit HERMES_CONFIG_PATH pointing at the live
 # ~/.hermes/config.yaml.  Override it before any product modules are imported so
@@ -249,11 +252,14 @@ def _no_agent_environment_installed_into_tmp_path(request):
     tmp = request.node.funcargs.get("tmp_path") if hasattr(request.node, "funcargs") else None
     if tmp is None:
         return
+    tmp_root = pathlib.Path(tmp).resolve()
     hits = [
         str(p)
         for pattern in _AGENT_INSTALL_GLOBS
         for p in pathlib.Path(tmp).glob(pattern)
-        if _tree_exceeds(p, _AGENT_INSTALL_FLAG_BYTES)
+        # Only trees that physically live under tmp_path: a test that symlinks an
+        # installs/ or environments/ dir at the real ~/.hermes must not be flagged.
+        if p.resolve().is_relative_to(tmp_root) and _tree_exceeds(p, _AGENT_INSTALL_FLAG_BYTES)
     ]
     if hits:
         pytest.fail(
