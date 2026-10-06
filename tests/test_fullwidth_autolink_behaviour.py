@@ -20,7 +20,6 @@ Every case asserts BOTH directions:
 """
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -77,7 +76,13 @@ eval(extractFunc('renderMd'));
 
 let buf = '';
 process.stdin.on('data', c => { buf += c; });
-process.stdin.on('end', () => { process.stdout.write(renderMd(buf)); });
+process.stdin.on('end', () => {
+  const started = process.hrtime.bigint();
+  const rendered = renderMd(buf);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  process.stdout.write(rendered);
+  if (process.env.RENDER_TIMING === '1') process.stderr.write(String(elapsedMs));
+});
 """
 
 
@@ -101,6 +106,21 @@ def _render(driver_path, markdown: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed: {result.stderr}")
     return result.stdout
+
+
+def _render_timed(driver_path, markdown: str) -> tuple[str, float]:
+    """Return rendered HTML and renderer-only time, excluding Node startup."""
+    result = subprocess.run(
+        [NODE, driver_path, str(UI_JS_PATH)],
+        input=markdown,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": str(Path(NODE).parent), "RENDER_TIMING": "1"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"node driver failed: {result.stderr}")
+    return result.stdout, float(result.stderr)
 
 
 # Every CJK full-width mark the fix adds to the trailing-punctuation strip:
@@ -313,6 +333,22 @@ class TestAutolinkCjkProseContinuation:
         assert f">{url}</a>" in out
 
     @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_query_mark_before_cjk_prose_ends_link(self, driver_path, prefix):
+        out = _render(driver_path, prefix + "https://example.com?q=1，参见")
+        assert 'href="https://example.com?q=1"' in out
+        assert 'href="https://example.com?q=1，参见"' not in out
+        assert "</a>，参见" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_later_slash_does_not_reclassify_authority_full_stop(
+        self, driver_path, prefix
+    ):
+        out = _render(driver_path, prefix + "https://example.com。参见docs/guide.md")
+        assert 'href="https://example.com"' in out
+        assert 'href="https://example.com。参见docs/guide.md"' not in out
+        assert "</a>。参见docs/guide.md" in out
+
+    @pytest.mark.parametrize("prefix", ["", "- "])
     def test_bare_host_full_stop_before_prose_ends_link(self, driver_path, prefix):
         out = _render(driver_path, prefix + "请访问 https://example.com。然后登录")
         assert 'href="https://example.com"' in out
@@ -321,11 +357,20 @@ class TestAutolinkCjkProseContinuation:
 
     def test_long_boundary_run_completes_without_quadratic_scan(self, driver_path):
         markdown = "https://example.com/" + ("a" * 60000) + "日" + ("，" * 60000)
-        started = time.monotonic()
-        out = _render(driver_path, markdown)
-        elapsed = time.monotonic() - started
+        out, elapsed_ms = _render_timed(driver_path, markdown)
         assert 'href="https://example.com/' in out
-        assert elapsed < 3.0, f"renderMd took {elapsed:.2f}s; boundary scan is not linear"
+        assert elapsed_ms < 3000, (
+            f"renderMd took {elapsed_ms:.2f} ms; boundary scan is not linear"
+        )
+
+    def test_thousands_of_urls_do_not_recurse(self, driver_path):
+        urls = [f"https://example.com/{i}" for i in range(5000)]
+        out, elapsed_ms = _render_timed(driver_path, "，".join(urls))
+        assert out.count("<a ") == len(urls)
+        assert 'href="https://example.com/4999"' in out
+        assert elapsed_ms < 3000, (
+            f"renderMd took {elapsed_ms:.2f} ms for iterative trail scanning"
+        )
 
     @pytest.mark.parametrize("iri_char", ["—", "’"])
     def test_outer_pass_preserves_unicode_iri_path_characters(self, driver_path, iri_char):

@@ -8154,20 +8154,25 @@ function renderMd(raw){
     const queryFragmentStart=queryFragmentTail<0?-1:schemeEnd+queryFragmentTail;
     const cjkPathTail=pathStart<0?-1:url.slice(pathStart).search(/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/);
     const firstCjkPath=cjkPathTail<0?-1:pathStart+cjkPathTail;
+    const cjkQueryTail=queryFragmentStart<0?-1:url.slice(queryFragmentStart+1).search(/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/);
+    const firstCjkQuery=cjkQueryTail<0?-1:queryFragmentStart+1+cjkQueryTail;
     const boundaryMarks='，。．｡；：！？、）】」》〕';
     for(let i=schemeEnd;i<url.length;i++){
       const mark=url[i];
       if(!boundaryMarks.includes(mark)) continue;
       // UTS #46 maps these three authority characters to an ASCII dot. They
-      // are label separators when another ASCII label follows. If a later
-      // path/query/fragment disambiguates the URL, keep a Unicode separator
-      // before that component too. A bare host followed by CJK prose instead
-      // ends at the mark, avoiding links that swallow the rest of a sentence.
+      // are label separators when another ASCII label follows. A later slash,
+      // query, or fragment is not sufficient evidence: it may belong to prose
+      // after the sentence-ending mark.
       if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
-         &&i+1<authorityEnd&&(/[A-Za-z0-9_\-]/.test(url[i+1])||authorityEnd<url.length)) continue;
-      // Query strings and fragments commonly contain unescaped CJK
-      // punctuation. Keep interior marks, while still stripping a final mark.
-      if(queryFragmentStart>=0&&i>queryFragmentStart&&i<url.length-1) continue;
+         &&i+1<authorityEnd&&/[A-Za-z0-9_\-]/.test(url[i+1])) continue;
+      // Preserve marks in a query/fragment after raw CJK content. ASCII
+      // fragment continuations are also common section identifiers. A mark
+      // before the first CJK character remains a prose boundary, so
+      // `?q=1，参见` does not swallow the following sentence.
+      if(queryFragmentStart>=0&&i>queryFragmentStart&&i<url.length-1
+         &&((firstCjkQuery>=0&&firstCjkQuery<i)
+            ||(url[queryFragmentStart]==='#'&&/[A-Za-z0-9_\-]/.test(url[i+1])))) continue;
       // Once a path contains raw CJK, interior CJK punctuation is a plausible
       // IRI character. The first CJK index is computed once so this scan stays
       // linear even for very long URLs with many boundary marks.
@@ -8548,10 +8553,21 @@ function renderMd(raw){
   // Autolink: convert plain URLs to clickable links. Both inline and block
   // rendering use this helper so their boundary and safety rules stay equal.
   function _autolinkBareText(text){
-    return String(text||'').replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
-      const [clean,trail]=_bareAutolinkParts(url);
-      return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail?_autolinkBareText(trail):''}`;
-    });
+    const input=String(text||'');
+    const urlRe=/(https?:\/\/[^\s<>"')\]\uFF09]+)/g;
+    let out='';
+    let cursor=0;
+    let match;
+    while((match=urlRe.exec(input))){
+      const [clean]=_bareAutolinkParts(match[0]);
+      out+=input.slice(cursor,match.index);
+      out+=`<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>`;
+      cursor=match.index+clean.length;
+      // Continue from the strictly later boundary in the original input.
+      // This links every URL in a trail without growing the JS call stack.
+      urlRe.lastIndex=cursor;
+    }
+    return out+input.slice(cursor);
   }
   // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
