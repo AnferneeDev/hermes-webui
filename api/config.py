@@ -9491,7 +9491,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     return json.loads(response.read().decode("utf-8"))
             remaining = max(timeout, _models_rebuild_deadline - time.monotonic() - 0.05)
             request_timeout = min(CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS, remaining)
-            done, outcome = threading.Event(), {}
+            done, outcome = threading.Event(), {"timeout": request_timeout}
 
             def read():
                 try:
@@ -9510,7 +9510,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             raise TimeoutError("catalog probe slice exhausted")
         _pending_probes.pop(probe_key, None)
         if "error" in outcome:
-            raise outcome["error"]
+            exc = outcome["error"]
+            if outcome.get("timeout", 0.0) >= CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS:
+                # The HTTP attempt itself ran at the full endpoint cap, so its
+                # timeout IS evidence of unreachability even when a later pass
+                # consumes the outcome under a smaller fair-share slice.
+                exc.hermes_full_cap_attempt = True
+            raise exc
         return outcome["data"]
     # A full-cap custom retry must not repeat unrelated provider discovery.
     # Empty/failure fallbacks are retained too, but only for this invocation.
@@ -10197,6 +10203,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             except Exception as exc:
                 reason = getattr(exc, "reason", exc)
                 if (probe_key is not None and probe_timeout < CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS
+                        and not getattr(exc, "hermes_full_cap_attempt", False)
                         and isinstance(reason, (TimeoutError, socket.timeout))):
                     _truncated_probes.add(probe_key)
                     _custom_endpoint_probe_memo[probe_key] = ("truncated", None)
@@ -10916,6 +10923,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                 except Exception as exc:
                                     if _lm_probe_key is not None:
                                         if (lm_timeout < CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS
+                                                and not getattr(exc, "hermes_full_cap_attempt", False)
                                                 and isinstance(getattr(exc, "reason", exc), TimeoutError)):
                                             _truncated_probes.add(_lm_probe_key)
                                             _custom_endpoint_probe_memo[_lm_probe_key] = ("truncated", None)
