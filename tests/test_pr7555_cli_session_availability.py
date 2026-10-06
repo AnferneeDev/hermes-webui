@@ -292,6 +292,78 @@ def test_real_exclusive_lock_during_optional_pass_keeps_primary_rows(
     assert _cli_ids(result.sessions) == {"cli_perf_0000"}
 
 
+@pytest.mark.parametrize("optional_source", ["cron", "webhook", "kanban"])
+def test_all_profiles_real_optional_lock_serves_fresh_rows_without_caching(
+    tmp_path, monkeypatch, optional_source
+):
+    """Carry real optional-read incompleteness through aggregate TTL ownership."""
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+        _make_state_db(home / "state.db", sessions=1, messages_per_session=1)
+    db = homes[0] / "state.db"
+    _insert_session(db, "optional-row", source=optional_source)
+    _configure_real_single_profile(monkeypatch, tmp_path, db, ttl=60.0)
+    monkeypatch.setattr(models, "_all_profiles_cli_contexts", lambda: (
+        [(homes[0], db, "a"), (homes[1], homes[1] / "state.db", "b")],
+        ((str(homes[0]), "a", "unchanged"), (str(homes[1]), "b", "unchanged")),
+    ))
+    real_loader = models._load_cli_sessions_uncached
+
+    def limited_loader(home, path, profile, **kwargs):
+        kwargs.update(
+            project_assigned_limit=False,
+            cron_project_limit=None if optional_source == "cron" else False,
+            webhook_project_limit=None if optional_source == "webhook" else False,
+            kanban_project_limit=None if optional_source == "kanban" else False,
+        )
+        return real_loader(home, path, profile, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", limited_loader)
+    real_open = agent_sessions.open_state_db_readonly
+
+    def short_busy_timeout(*args, **kwargs):
+        conn = real_open(*args, **kwargs)
+        conn.execute("PRAGMA busy_timeout=20")
+        return conn
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", short_busy_timeout)
+    real_reader = models.read_importable_agent_session_rows
+    lock_conn = None
+    reads = 0
+
+    def lock_after_primary(path, **kwargs):
+        nonlocal lock_conn, reads
+        rows = real_reader(path, **kwargs)
+        if path == db and lock_conn is None:
+            reads += 1
+            lock_conn = sqlite3.connect(str(db), isolation_level=None)
+            lock_conn.execute("BEGIN EXCLUSIVE")
+        return rows
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", lock_after_primary)
+    try:
+        for iteration in range(2):
+            rows = models.get_cli_sessions(all_profiles=True, include_claude_code=False)
+            ids = {(r["profile"], r["session_id"]) for r in rows}
+            assert {("a", "cli_perf_0000"), ("b", "cli_perf_0000")} <= ids
+            if iteration:
+                assert ("a", "new-primary") in ids
+            assert not models._CLI_SESSIONS_CACHE
+            assert not models._CLI_SESSIONS_LAST_KNOWN_GOOD
+            assert lock_conn is not None
+            lock_conn.rollback()
+            lock_conn.close()
+            lock_conn = None
+            if not iteration:
+                _insert_session(db, "new-primary")
+        assert reads == 2
+    finally:
+        if lock_conn is not None:
+            lock_conn.rollback()
+            lock_conn.close()
+
+
 def test_cache_owned_projection_preserves_rows_when_real_open_fails(tmp_path, monkeypatch):
     """A real read-only open failure must reach the stale-cache fallback."""
     db = tmp_path / "state.db"

@@ -9759,6 +9759,7 @@ def get_cli_sessions(
                     unavailable_error is None
                     and successful_profiles == len(contexts)
                     and external_complete
+                    and not optional_incomplete
                 ),
                 fresh_when_incomplete=(
                     optional_incomplete
