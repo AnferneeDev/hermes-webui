@@ -34,8 +34,12 @@ def _run(script_body: str) -> dict:
         const vm = require('vm');
         const mkEl = () => {{
           const set = new Set();
+          let html = '';
           return {{
-            className: '', dataset: {{}}, innerHTML: '', style: {{}}, children: [], value: '',
+            className: '', dataset: {{}}, style: {{}}, children: [], value: '',
+            // Like the DOM: assigning innerHTML replaces the element's children.
+            get innerHTML() {{ return html; }},
+            set innerHTML(v) {{ html = v; this.children = []; }},
             classList: {{ add: (c) => set.add(c), remove: (c) => set.delete(c), contains: (c) => set.has(c) }},
             appendChild(c) {{ this.children.push(c); }},
             querySelectorAll() {{ return this.children; }},
@@ -60,7 +64,10 @@ def _run(script_body: str) -> dict:
             if (path === '/api/skills') {{
               if (holdSkills) await new Promise((resolve) => held.push(resolve));
               if (failSkills) throw new Error('agent-free server: no skills');
-              return {{ skills: [{{ name: 'gamma-live', description: 'A skill' }}] }};
+              return {{ skills: [
+                {{ name: 'gamma-live', description: 'A skill' }},
+                {{ name: 'newish-skill', description: 'A skill that shares the /ne prefix with built-ins' }},
+              ] }};
             }}
             if (path === '/api/commands') return {{ commands: [] }};
             if (path === '/api/commands/bundles') return {{ bundles: [] }};
@@ -147,14 +154,14 @@ def test_late_failing_skill_load_does_not_reopen_after_escape():
 
 
 def test_loader_landing_while_the_list_is_open_still_refreshes_it():
-    """An open list still picks up late skills."""
+    """An open list of built-ins (`/ne` -> /new ...) still picks up a skill that loads late."""
     result = _run(
         f"""
         await loadBundleCommands(true);
         await loadAgentCommandMetadata(true);
         __hold(true);
-        __msg.value = '/gam';
-        showCmdDropdown(await getSlashAutocompleteMatches('/gam'));
+        __msg.value = '/ne';
+        showCmdDropdown(await getSlashAutocompleteMatches('/ne'));
         const before = __dd.children.length;
         ensureSkillCommandsLoadedForAutocomplete();
         __release();
@@ -162,8 +169,9 @@ def test_loader_landing_while_the_list_is_open_still_refreshes_it():
         return {{ open: __dd.classList.contains('open'), before, after: __dd.children.length }};
         """
     )
+    assert result["before"] >= 1, "the /ne list must already show built-ins before the skill load lands"
     assert result["open"] is True
-    assert result["after"] > result["before"], "the late skill load must still add gamma-live to an open list"
+    assert result["after"] == result["before"] + 1, "the late skill load must add newish-skill to the open list"
 
 
 def test_no_match_close_is_not_a_dismissal_so_late_skills_still_show():
@@ -209,7 +217,8 @@ def test_an_edit_after_a_pick_lets_late_loads_refresh_again():
 
 
 def test_boot_input_and_escape_handlers_use_the_dismissal():
-    escape = re.search(r"if\(e\.key==='Escape'\)\{[^\n]*\}", BOOT_JS)
+    # The composer keydown's dropdown branch: the single-line Escape handler that closes the slash list.
+    escape = re.search(r"if\(e\.key==='Escape'\)\{[^\n]*hideCmdDropdown\(\)[^\n]*\}", BOOT_JS)
     assert escape and "markSlashDropdownDismissed()" in escape.group(0), "Escape must record the dismissal"
     handler = BOOT_JS[BOOT_JS.index("$('msg').addEventListener('input'"):]
     handler = handler[: handler.index("\n});")]
