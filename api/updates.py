@@ -1407,6 +1407,7 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
             [
                 'diff-tree',
                 '-r',
+                '--no-renames',
                 '--diff-filter=A',
                 '--name-only',
                 '-z',

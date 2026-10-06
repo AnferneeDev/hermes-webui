@@ -1982,7 +1982,7 @@ def test_update_recovery_hints_treat_pattern_characters_as_literal_names(tmp_pat
     assert updates._update_recovery_hints(tmp_path, 'origin/main')['force'] is True
     diff_tree = next(args for args in calls if args[0] == 'diff-tree')
     assert diff_tree == [
-        'diff-tree', '-r', '--diff-filter=A', '--name-only', '-z',
+        'diff-tree', '-r', '--no-renames', '--diff-filter=A', '--name-only', '-z',
         'HEAD', 'origin/main',
     ]
 
@@ -2115,6 +2115,27 @@ def test_update_recovery_hints_real_git_staged_rename_is_not_a_conflict(tmp_path
     hints = updates._update_recovery_hints(repo, 'HEAD')
 
     assert hints == {'force': False, 'clear_lock': False}
+
+
+def test_update_recovery_hints_real_git_incoming_rename_collision(tmp_path):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init', '-q')
+    _git(repo, 'config', 'user.email', 't@t.co')
+    _git(repo, 'config', 'user.name', 'Test')
+    (repo / 'source.txt').write_text('same contents\n', encoding='utf-8')
+    _git(repo, 'add', 'source.txt')
+    _git(repo, 'commit', '-q', '-m', 'base')
+    _git(repo, 'branch', 'base')
+    _git(repo, 'checkout', '-q', '-b', 'incoming')
+    _git(repo, 'mv', 'source.txt', 'target.txt')
+    _git(repo, 'commit', '-q', '-m', 'rename source to target')
+    _git(repo, 'checkout', '-q', 'base')
+    (repo / 'target.txt').write_text('local untracked\n', encoding='utf-8')
+
+    hints = updates._update_recovery_hints(repo, 'incoming')
+
+    assert hints == {'force': True, 'clear_lock': False}
 
 
 def test_check_repo_attaches_recovery_hints(tmp_path, monkeypatch):
