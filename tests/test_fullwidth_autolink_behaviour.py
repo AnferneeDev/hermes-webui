@@ -529,6 +529,10 @@ REVIEW_IDN_ROWS = [
     ("https://www.example。рф/path", ["https://www.example。рф/path"]),
     ("https://www.example．рф/path", ["https://www.example．рф/path"]),
     ("https://www.example｡中国/path", ["https://www.example｡中国/path"]),
+    # Supplementary-plane Han after a full ASCII host is prose, not a label
+    # (_isCjkAutolinkChar covers only the BMP ranges).
+    ("https://example.com。𠮷田", ["https://example.com"]),
+    ("请访问 https://example.com。𠮷田さんの説明", ["https://example.com"]),
 ]
 
 

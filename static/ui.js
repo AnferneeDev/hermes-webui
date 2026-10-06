@@ -8308,7 +8308,8 @@ function renderMd(raw){
         let unicodeLabel=mark!=='。'||currentLabelStart===schemeEnd
           ||(/[\p{L}\p{N}]/u.test(firstLabelChar)
              &&!/[A-Za-z0-9]/.test(firstLabelChar)
-             &&!_isCjkAutolinkChar(firstLabelChar));
+             &&!_isCjkAutolinkChar(firstLabelChar)
+             &&!/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(firstLabelChar));
         for(let j=currentLabelStart;!unicodeLabel&&j<i;){
           const c=String.fromCodePoint(run.codePointAt(j));
           unicodeLabel=/[\p{L}\p{M}\p{N}]/u.test(c)
