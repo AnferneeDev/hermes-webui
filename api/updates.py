@@ -1391,7 +1391,16 @@ def _update_recovery_hints(path: Path, compare_ref: str | None = None) -> dict:
     collision = False
     if untracked:
         tracked_out, tracked_ok = _run_git(
-            ['ls-tree', '-r', '--name-only', '-z', compare_ref, '--', *untracked],
+            [
+                '--literal-pathspecs',
+                'ls-tree',
+                '-r',
+                '--name-only',
+                '-z',
+                compare_ref,
+                '--',
+                *untracked,
+            ],
             path,
             timeout=5,
         )

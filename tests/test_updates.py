@@ -1930,12 +1930,33 @@ def test_update_recovery_hints_keep_force_for_untracked_collision(tmp_path, monk
             return '?? src/generated.py\0', True
         if args[0] == 'rev-list':
             return '0\t1', True
-        if args[0] == 'ls-tree':
+        if 'ls-tree' in args:
             return 'src/generated.py\0', True
         return '', True
 
     monkeypatch.setattr(updates, '_run_git', fake_git)
     assert updates._update_recovery_hints(tmp_path, 'origin/main')['force'] is True
+
+
+def test_update_recovery_hints_use_literal_untracked_pathspecs(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    calls = []
+
+    def fake_git(args, *a, **k):
+        calls.append(args)
+        if args[0] == 'status':
+            return '?? src/generated[1].py\0', True
+        if args[0] == 'rev-list':
+            return '0\t1', True
+        if 'ls-tree' in args:
+            return 'src/generated[1].py\0', True
+        return '', True
+
+    monkeypatch.setattr(updates, '_run_git', fake_git)
+    assert updates._update_recovery_hints(tmp_path, 'origin/main')['force'] is True
+    ls_tree = next(args for args in calls if 'ls-tree' in args)
+    assert ls_tree[0] == '--literal-pathspecs'
+    assert ls_tree[-1] == 'src/generated[1].py'
 
 
 def test_update_recovery_hints_clear_for_benign_untracked_file(tmp_path, monkeypatch):
@@ -1946,7 +1967,7 @@ def test_update_recovery_hints_clear_for_benign_untracked_file(tmp_path, monkeyp
             return '?? notes.txt\0', True
         if args[0] == 'rev-list':
             return '0\t1', True
-        if args[0] == 'ls-tree':
+        if 'ls-tree' in args:
             return '', True
         return '', True
 
