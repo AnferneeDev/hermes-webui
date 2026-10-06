@@ -114,6 +114,13 @@
 
 ### Fixed
 
+- **Cron results now raise a browser notification when the WebUI tab is in the background.** The cron completion poll
+  skipped every tick while the tab was hidden, so a job delivering to its origin chat left a transcript entry and an
+  unread dot but never a notification, which is exactly when one is useful (and the Android app relays these). The
+  poll now runs while hidden; a visible tab still shows the toast, and a hidden one sends the browser notification
+  through the existing notification setting and permission. Clicking it focuses the right chat or the Tasks panel.
+  Thanks @happy5318. (#7652, fixes #7257)
+
 - **Links next to Chinese/Japanese punctuation end in the right place, and internationalized domains stay whole.** A URL
   followed by full-width punctuation (`，`, `）`, `。`, opening brackets and quotes) now ends before it, so the prose after
   it is no longer pulled into the link, while hosts written with the full-width dots (`https://例子。中国`,
