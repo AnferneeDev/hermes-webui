@@ -15,8 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, *, link=""):
         self._body = json.dumps(payload).encode("utf-8")
+        self.headers = {"Link": link} if link else {}
 
     def __enter__(self):
         return self
@@ -118,8 +119,57 @@ def test_no_git_update_uses_channel_prefix_for_older_installed_version(tmp_path,
     assert info["latest_version"] == "exp-v0.52.416"
     assert seen_urls == [
         "https://api.github.com/repos/nesquena/hermes-webui/"
-        "git/matching-refs/tags/exp-v",
+        "git/matching-refs/tags/exp-v?per_page=100",
     ]
+
+
+def test_experimental_matching_refs_follows_pagination(tmp_path, monkeypatch):
+    first_url = (
+        "https://api.github.com/repos/nesquena/hermes-webui/"
+        "git/matching-refs/tags/exp-v?per_page=100"
+    )
+    second_url = first_url + "&page=2"
+    pages = {
+        first_url: _FakeResponse(
+            [{"ref": "refs/tags/exp-v0.52.416", "object": {"sha": "latest"}}],
+            link=f'<{second_url}>; rel="next", <{second_url}>; rel="last"',
+        ),
+        second_url: _FakeResponse(
+            [{"ref": "refs/tags/exp-v0.52.414", "object": {"sha": "current"}}]
+        ),
+    }
+    seen_urls = []
+
+    def fake_urlopen(request, timeout=0):
+        seen_urls.append(request.full_url)
+        return pages[request.full_url]
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(updates, "WEBUI_VERSION", "exp-v0.52.414")
+
+    info = updates._check_repo(tmp_path, "webui", channel="experimental")
+
+    assert info["behind"] == 1
+    assert info["latest_version"] == "exp-v0.52.416"
+    assert seen_urls == [first_url, second_url]
+
+
+def test_experimental_final_release_sorts_above_release_candidate(tmp_path, monkeypatch):
+    payload = [
+        {"ref": "refs/tags/exp-v0.52.416-rc1", "object": {"sha": "candidate"}},
+        {"ref": "refs/tags/exp-v0.52.416", "object": {"sha": "final"}},
+    ]
+    monkeypatch.setattr(
+        updates.urllib.request,
+        "urlopen",
+        lambda request, timeout=0: _FakeResponse(payload),
+    )
+    monkeypatch.setattr(updates, "WEBUI_VERSION", "exp-v0.52.416-rc1")
+
+    info = updates._check_repo(tmp_path, "webui", channel="experimental")
+
+    assert info["behind"] == 1
+    assert info["latest_version"] == "exp-v0.52.416"
 
 
 def _function_source(source: str, name: str) -> str:

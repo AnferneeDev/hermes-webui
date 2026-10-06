@@ -860,6 +860,10 @@ def _release_tag_sort_key(tag):
         if not chunk:
             continue
         parts.append((0, int(chunk)) if chunk.isdigit() else (1, chunk.lower()))
+    # For the same numeric release, the final tag sorts after prereleases so
+    # reverse=True puts exp-v1.2.3 ahead of exp-v1.2.3-rc1.
+    if '-' not in raw:
+        parts.append((2, ''))
     return tuple(parts)
 
 
@@ -891,19 +895,39 @@ def _github_release_tags(
     if use_matching_refs:
         url = (
             'https://api.github.com/repos/nesquena/hermes-webui/'
-            'git/matching-refs/tags/exp-v'
+            'git/matching-refs/tags/exp-v?per_page=100'
         )
-    request = urllib.request.Request(
-        url,
-        headers={
-            'Accept': 'application/vnd.github+json',
-            'User-Agent': 'hermes-webui',
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode('utf-8'))
-    if not isinstance(payload, list):
-        return []
+    payload = []
+    next_url = url
+    while next_url:
+        request = urllib.request.Request(
+            next_url,
+            headers={
+                'Accept': 'application/vnd.github+json',
+                'User-Agent': 'hermes-webui',
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            page = json.loads(response.read().decode('utf-8'))
+            link = getattr(response, 'headers', {}).get('Link', '')
+        if not isinstance(page, list):
+            return []
+        payload.extend(page)
+        next_url = None
+        if use_matching_refs and link:
+            match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            if match:
+                candidate = match.group(1)
+                parsed = urlparse(candidate)
+                if (
+                    parsed.scheme == 'https'
+                    and parsed.netloc == 'api.github.com'
+                    and parsed.path == (
+                        '/repos/nesquena/hermes-webui/'
+                        'git/matching-refs/tags/exp-v'
+                    )
+                ):
+                    next_url = candidate
     tags = []
     for item in payload:
         if not isinstance(item, dict):
