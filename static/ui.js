@@ -8168,7 +8168,10 @@ function renderMd(raw){
       if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
          &&i+1<authorityEnd){
         if(/[A-Za-z0-9_\-]/.test(run[i+1])) continue;
-        let cjkLabel=nextCjk[schemeEnd]>=0&&nextCjk[schemeEnd]<i;
+        // A raw-CJK suffix is only strong enough evidence when a path/query/
+        // fragment follows it. Otherwise `例子.com。然后登录` is ordinary prose.
+        let cjkLabel=authorityEnd<run.length
+          &&nextCjk[schemeEnd]>=0&&nextCjk[schemeEnd]<i;
         for(let j=i+1;cjkLabel&&j<authorityEnd;j++) cjkLabel=_isCjkAutolinkChar(run[j]);
         if(cjkLabel) continue;
       }

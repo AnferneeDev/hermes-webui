@@ -373,6 +373,15 @@ class TestAutolinkCjkProseContinuation:
         assert 'href="https://example.com。然后登录"' not in out
         assert "</a>。然后登录" in out
 
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    def test_cjk_ascii_host_full_stop_before_prose_ends_link(
+        self, driver_path, prefix
+    ):
+        out = _render(driver_path, prefix + "https://例子.com。然后登录")
+        assert 'href="https://例子.com"' in out
+        assert 'href="https://例子.com。然后登录"' not in out
+        assert "</a>。然后登录" in out
+
     def test_long_boundary_run_completes_without_quadratic_scan(self, driver_path):
         def render_size(size):
             markdown = "https://example.com/" + ("a" * size) + "日" + ("，" * size)
