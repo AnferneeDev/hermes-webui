@@ -8161,8 +8161,10 @@ function renderMd(raw){
     // there. The raw-CJK-path guard further down still keeps interior marks
     // of genuine IRIs (for example `…/wiki/スター（映画）`).
     const boundaryMarks='，。．｡；：！？、）】」》〕（【「『';
+    let seenAsciiDot=false;
     for(let i=schemeEnd;i<run.length;i++){
       const mark=run[i];
+      if(mark==='.'){seenAsciiDot=true;continue;}
       if(!boundaryMarks.includes(mark)) continue;
       if(run.startsWith('http://',i+1)||run.startsWith('https://',i+1)) return i;
       // UTS #46 maps these three authority characters to an ASCII dot. They
@@ -8171,12 +8173,18 @@ function renderMd(raw){
       // such as 例子。中国 without mistaking example.com。参见docs/ for one.
       if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
          &&i+1<authorityEnd){
-        if(/[A-Za-z0-9_\-]/.test(run[i+1])) continue;
-        // A raw-CJK suffix is only strong enough evidence when a path/query/
-        // fragment follows it. Otherwise `例子.com。然后登录` is ordinary prose.
-        let cjkLabel=authorityEnd<run.length
-          &&nextCjk[schemeEnd]>=0&&nextCjk[schemeEnd]<i;
-        for(let j=i+1;cjkLabel&&j<authorityEnd;j++) cjkLabel=_isCjkAutolinkChar(run[j]);
+        if(/[A-Za-z0-9_\-]/.test(run[i+1])){seenAsciiDot=true;continue;}
+        // Keep a CJK label while the host has no completed ASCII label yet
+        // (no ASCII dot before this mark), or when a path/query/fragment
+        // follows a host that already contains raw CJK. `例子.com。然后登录`
+        // and `example.com。参见docs/` therefore end at their ASCII TLD.
+        let cjkLabel=!seenAsciiDot
+          ||(authorityEnd<run.length&&nextCjk[schemeEnd]>=0&&nextCjk[schemeEnd]<i);
+        for(let j=i+1;cjkLabel&&j<authorityEnd;j++){
+          const c=run[j];
+          if(c===':'||boundaryMarks.includes(c)) break;
+          cjkLabel=_isCjkAutolinkChar(c)||/[A-Za-z0-9_\-]/.test(c);
+        }
         if(cjkLabel) continue;
       }
       // Preserve marks in a query/fragment after raw CJK content. ASCII

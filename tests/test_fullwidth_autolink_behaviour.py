@@ -498,3 +498,28 @@ class TestAutolinkCjkOpeningMarks:
         out = _render(driver_path, "見 https://example.com/日本語（続きはこちら）d")
         assert 'href="https://example.com/日本語（続きはこちら"' in out
         assert 'href="https://example.com/日本語"' not in out
+
+
+# IDN hosts written with UTS #46 full-stop variants must remain whole in both
+# paragraph and inline/list rendering.
+REVIEW_IDN_ROWS = [
+    ("https://例子。中国", ["https://例子。中国"]),
+    ("https://example。中国/路径", ["https://example。中国/路径"]),
+    ("https://www。例子。中国/path", ["https://www。例子。中国/path"]),
+    ("https://例子。中国。中国/path", ["https://例子。中国。中国/path"]),
+    ("https://例子。中国:8080/x", ["https://例子。中国:8080/x"]),
+    ("https://例子。中国，https://b.com", ["https://例子。中国", "https://b.com"]),
+]
+
+
+class TestAutolinkIdnHostReviewTable:
+    @pytest.mark.parametrize("prefix", ["", "- "])
+    @pytest.mark.parametrize("markdown,expected", REVIEW_IDN_ROWS)
+    def test_idn_host_rows_link_whole(self, driver_path, prefix, markdown, expected):
+        import re as _re
+
+        out = _render(driver_path, prefix + markdown)
+        hrefs = _re.findall(r'href="([^"]*)"', out)
+        assert hrefs == expected, (
+            f"{markdown!r} -> {hrefs!r}, expected {expected!r}. Got: {out!r}"
+        )
