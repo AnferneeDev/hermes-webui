@@ -5,6 +5,15 @@
 
 ### Added
 
+- **Extensions can add a small action to each message without touching transcript DOM.** A new
+  `ext.messages.registerAction({ id, label, icon, roles, getPressed, onInvoke })` on the boot-trusted extension handle
+  lets an extension put a Core-rendered `pin`, `bookmark` or `star` button after the built-in actions on settled user
+  and assistant messages, with an `aria-pressed` toggle state, a pending state while the action runs, and a page-wide
+  limit of two actions. Core keeps the row identity, pagination offset, cache restore, virtualization, disable and
+  uninstall in step, and re-resolves the message at click time so a stale button fails closed. Without an extension
+  using it nothing changes on screen, and the transcript render skips the slot work entirely. Documented in
+  `docs/EXTENSIONS.md`. Thanks @franksong2702. (#7245 by @franksong2702)
+
 - **Per-job "Tasks badge" toggle for scheduled jobs.** A new checkbox in the cron edit form (default on) controls
   whether that job's completions count toward the Tasks unread badge and new-run marker, so a high-frequency
   silent job (a sync or heartbeat) no longer keeps the badge lit. It mirrors the existing per-job "Completion
