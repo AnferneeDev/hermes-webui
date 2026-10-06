@@ -8161,31 +8161,37 @@ function renderMd(raw){
     // there. The raw-CJK-path guard further down still keeps interior marks
     // of genuine IRIs (for example `…/wiki/スター（映画）`).
     const boundaryMarks='，。．｡；：！？、）】」》〕（【「『';
-    let seenAsciiDot=false;
+    let currentLabelStart=schemeEnd;
     for(let i=schemeEnd;i<run.length;i++){
       const mark=run[i];
-      if(mark==='.'){seenAsciiDot=true;continue;}
+      if(mark==='.'){currentLabelStart=i+1;continue;}
       if(!boundaryMarks.includes(mark)) continue;
       if(run.startsWith('http://',i+1)||run.startsWith('https://',i+1)) return i;
+      // U+FF0E and U+FF61 are ordinary IRI characters outside the authority.
+      // Keep them in paths, queries, and fragments just as master does.
+      if((mark==='．'||mark==='｡')&&i>=authorityEnd) continue;
       // UTS #46 maps these three authority characters to an ASCII dot. They
       // are label separators before an ASCII label. Also retain a CJK label
       // when the host prefix already contains raw CJK; this covers real IDNs
       // such as 例子。中国 without mistaking example.com。参见docs/ for one.
       if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
          &&i+1<authorityEnd){
-        if(/[A-Za-z0-9_\-]/.test(run[i+1])){seenAsciiDot=true;continue;}
-        // Keep a CJK label while the host has no completed ASCII label yet
-        // (no ASCII dot before this mark), or when a path/query/fragment
-        // follows a host that already contains raw CJK. `例子.com。然后登录`
-        // and `example.com。参见docs/` therefore end at their ASCII TLD.
-        let cjkLabel=!seenAsciiDot
-          ||(authorityEnd<run.length&&nextCjk[schemeEnd]>=0&&nextCjk[schemeEnd]<i);
-        for(let j=i+1;cjkLabel&&j<authorityEnd;j++){
-          const c=run[j];
-          if(c===':'||boundaryMarks.includes(c)) break;
-          cjkLabel=_isCjkAutolinkChar(c)||/[A-Za-z0-9_\-]/.test(c);
+        if(/[A-Za-z0-9_\-]/.test(run[i+1])){currentLabelStart=i+1;continue;}
+        // Keep a Unicode label when this is the first host separator or the
+        // immediately preceding label is itself Unicode. Tracking that label
+        // (rather than any earlier ASCII dot) preserves mixed IDNs such as
+        // www.例子。中国 while `example.com。参见` still ends at the TLD.
+        let unicodeLabel=currentLabelStart===schemeEnd;
+        for(let j=currentLabelStart;!unicodeLabel&&j<i;j++){
+          unicodeLabel=/[\p{L}\p{N}]/u.test(run[j])
+            &&!/[A-Za-z0-9]/.test(run[j]);
         }
-        if(cjkLabel) continue;
+        for(let j=i+1;unicodeLabel&&j<authorityEnd;j++){
+          const c=run[j];
+          if(c==='.'||c===':'||boundaryMarks.includes(c)) break;
+          unicodeLabel=/[\p{L}\p{N}_\-]/u.test(c);
+        }
+        if(unicodeLabel){currentLabelStart=i+1;continue;}
       }
       // Preserve marks in a query/fragment after raw CJK content. ASCII
       // fragment continuations are also common section identifiers. A mark

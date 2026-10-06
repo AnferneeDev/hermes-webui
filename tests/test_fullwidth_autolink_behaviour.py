@@ -509,6 +509,15 @@ REVIEW_IDN_ROWS = [
     ("https://例子。中国。中国/path", ["https://例子。中国。中国/path"]),
     ("https://例子。中国:8080/x", ["https://例子。中国:8080/x"]),
     ("https://例子。中国，https://b.com", ["https://例子。中国", "https://b.com"]),
+    ("https://www。例子.com/path", ["https://www。例子.com/path"]),
+    ("https://www.例子。中国", ["https://www.例子。中国"]),
+    ("https://example。рф", ["https://example。рф"]),
+    ("https://example.com/Foo．bar", ["https://example.com/Foo．bar"]),
+    ("https://example.com/Foo｡bar", ["https://example.com/Foo｡bar"]),
+    ("https://example.com/?q=Foo．bar", ["https://example.com/?q=Foo．bar"]),
+    ("https://example.com/?q=Foo｡bar", ["https://example.com/?q=Foo｡bar"]),
+    ("https://example.com/#Foo．bar", ["https://example.com/#Foo．bar"]),
+    ("https://example.com/#Foo｡bar", ["https://example.com/#Foo｡bar"]),
 ]
 
 
