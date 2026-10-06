@@ -434,3 +434,67 @@ class TestAutolinkCjkProseContinuation:
         assert f'href="{url}"' in out
         assert ">guide</a>" in out
         assert out.count("<a ") == 1
+
+
+# ── Follow-up fix: URL directly followed by a full-width OPENING mark ─────
+#
+# The #7979 boundary scan stopped only at closing marks and sentence
+# punctuation. When a URL was immediately followed by a full-width opening
+# mark and an ASCII label — e.g. `…/pull/8040（OPEN、非草稿、5 檔案…` — the
+# next stop was the first interior mark, so `（OPEN` stayed glued to href and
+# the link clicked through to a broken URL. Fix: the opening marks
+# （ (U+FF08), 【 (U+3010), 「 (U+300C), 『 (U+300E) also end the URL when no
+# raw CJK path content precedes them; raw-CJK IRI paths keep interior marks
+# exactly as before (same guard the closing marks use).
+# Reported shape: https://github.com/nesquena/hermes-webui/pull/8040（OPEN、非草稿、5 檔案 +210/-14、MERGEABLE；內文與你核准的稿逐字相同）
+
+CJK_OPENING_MARKS = ["（", "【", "「", "『"]
+
+
+class TestAutolinkCjkOpeningMarks:
+    """A full-width opening mark right after a URL must end the link."""
+
+    @pytest.mark.parametrize("mark", CJK_OPENING_MARKS)
+    def test_outer_pass_opening_mark_terminates_and_prose_stays_visible(self, driver_path, mark):
+        out = _render(driver_path, f"See https://example.com/x{mark}OPEN、後續說明）")
+        assert 'href="https://example.com/x"' in out, (
+            f"Opening mark {mark!r} must end the URL match. Got: {out!r}"
+        )
+        assert f'href="https://example.com/x{mark}' not in out, (
+            f"Opening mark {mark!r} leaked into href. Got: {out!r}"
+        )
+        assert f"</a>{mark}OPEN、後續說明）" in out, (
+            f"Prose after {mark!r} must stay visible outside the anchor. Got: {out!r}"
+        )
+
+    @pytest.mark.parametrize("mark", ["（", "「"])
+    def test_inline_pass_opening_mark_terminates_and_prose_stays_visible(self, driver_path, mark):
+        out = _render(driver_path, f"- See https://example.com/x{mark}OPEN、後續")
+        assert 'href="https://example.com/x"' in out, (
+            f"Inline pass: opening mark {mark!r} must end the URL match. Got: {out!r}"
+        )
+        assert f'href="https://example.com/x{mark}' not in out
+        assert f"</a>{mark}OPEN、後續" in out
+
+    def test_reported_shape_pr_8040_with_ascii_label(self, driver_path):
+        """The reported message shape: URL（OPEN、非草稿、5 檔案 +210/-14、…）."""
+        out = _render(
+            driver_path,
+            "https://github.com/nesquena/hermes-webui/pull/8040"
+            "（OPEN、非草稿、5 檔案 +210/-14、MERGEABLE；內文與你核准的稿逐字相同）",
+        )
+        assert 'href="https://github.com/nesquena/hermes-webui/pull/8040"' in out
+        assert 'href="https://github.com/nesquena/hermes-webui/pull/8040（' not in out
+        assert "</a>（OPEN、非草稿、5 檔案 +210/-14、MERGEABLE；內文與你核准的稿逐字相同）" in out
+
+    def test_raw_cjk_iri_path_keeps_opening_mark(self, driver_path):
+        """No regression:（ inside a raw-CJK IRI path must NOT split the URL."""
+        out = _render(driver_path, "see https://ja.wikipedia.org/wiki/スター（映画）ok")
+        assert 'href="https://ja.wikipedia.org/wiki/スター（映画"' in out
+        assert 'href="https://ja.wikipedia.org/wiki/スター"' not in out
+
+    def test_raw_cjk_path_with_open_mark_and_prose_unchanged(self, driver_path):
+        """No regression: prose after（ inside a raw-CJK path behaves as before."""
+        out = _render(driver_path, "見 https://example.com/日本語（続きはこちら）d")
+        assert 'href="https://example.com/日本語（続きはこちら"' in out
+        assert 'href="https://example.com/日本語"' not in out

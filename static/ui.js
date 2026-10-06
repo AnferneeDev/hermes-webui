@@ -8156,7 +8156,11 @@ function renderMd(raw){
     const queryFragmentStart=nextQuery[schemeEnd];
     const firstCjkPath=pathStart<0?-1:nextCjk[pathStart];
     const firstCjkQuery=queryFragmentStart<0?-1:nextCjk[queryFragmentStart+1];
-    const boundaryMarks='，。．｡；：！？、）】」》〕';
+    // Closing marks and sentence punctuation end a URL. Full-width OPENING
+    // marks（【「『 also end it: prose such as `…/pull/8040（OPEN、…` starts
+    // there. The raw-CJK-path guard further down still keeps interior marks
+    // of genuine IRIs (for example `…/wiki/スター（映画）`).
+    const boundaryMarks='，。．｡；：！？、）】」》〕（【「『';
     for(let i=schemeEnd;i<run.length;i++){
       const mark=run[i];
       if(!boundaryMarks.includes(mark)) continue;
