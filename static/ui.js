@@ -11074,10 +11074,18 @@ function _showUpdateBanner(data){
     btnApply.disabled=!hasApplyTargets;
     btnApply.style.display=hasApplyTargets?'':'none';
     if(webuiManual){
+      // Keep an Agent recovery button only while the fresh check still shows
+      // the condition it recovers from. A check that positively reports the
+      // condition gone (recovery.force / recovery.clear_lock === false) clears
+      // the stale button so a destructive force update cannot linger after the
+      // conflict was resolved outside the UI (Greptile P1 on #8040). Probes
+      // that could not determine the state stay null and never clear.
+      const _agentRecovery=(data&&data.agent&&data.agent.recovery)||null;
+      const _recoveryGone=(kind)=>!!(_agentRecovery&&_agentRecovery[kind]===false);
       const forceBtn=$('btnForceUpdate');
-      if(forceBtn&&!(agentUpdatable&&forceBtn.dataset.target==='agent')){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
+      if(forceBtn&&!(agentUpdatable&&forceBtn.dataset.target==='agent'&&!_recoveryGone('force'))){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
       const clearLockBtn=$('btnClearUpdateLock');
-      if(clearLockBtn&&!(agentUpdatable&&clearLockBtn.dataset.target==='agent')){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
+      if(clearLockBtn&&!(agentUpdatable&&clearLockBtn.dataset.target==='agent'&&!_recoveryGone('clear_lock'))){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
     }
   }
   if(!parts.length){

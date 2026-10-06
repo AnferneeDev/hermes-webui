@@ -2416,6 +2416,65 @@ if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUp
 """.strip()
         subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
+    def test_manual_webui_banner_clears_stale_agent_recovery_on_recheck(self):
+        src = read('static/ui.js')
+        format_fn = extract_js_function(src, '_formatUpdateTargetStatus')
+        instruction_fn = extract_js_function(src, '_formatManualUpdateInstruction')
+        show_fn = extract_js_function(src, '_showUpdateBanner')
+        script = f"""
+const state = {{
+  updateBanner: {{ classList: {{ added: false, add() {{ this.added = true; }}, remove() {{ this.removed = true; }} }} }},
+  updateMsg: {{ textContent: '' }},
+  btnApplyUpdate: {{ disabled: false, style: {{ display: '' }} }},
+  btnForceUpdate: {{ disabled: false, style: {{ display: 'inline-block' }}, dataset: {{ target: 'agent' }} }},
+  btnClearUpdateLock: {{ disabled: false, style: {{ display: 'inline-block' }}, dataset: {{ target: 'agent' }} }},
+  updateWhatsNewLinks: {{ style: {{ display: 'none' }}, replaceChildren() {{ this.cleared = true; }} }},
+}};
+global.window = {{}};
+global.$ = (id) => state[id] || null;
+global._renderUpdateWhatsNewLinks = () => {{}};
+global.t = (key, ...args) => {{
+  const values = {{ settings_update_manual_docker: 'Manual update required: run {{0}}, then recreate the container.' }};
+  return (values[key] || key).replace(/\\{{(\\d+)}}/g, (_, i) => args[Number(i)] ?? '');
+}};
+{format_fn}
+{instruction_fn}
+{show_fn}
+// A fresh check that positively reports both recovery conditions gone clears
+// the buttons that a previous in-page failure had armed.
+_showUpdateBanner({{
+  webui: {{ no_git: true, manual_update: true, behind: 1 }},
+  agent: {{ behind: 1, recovery: {{ force: false, clear_lock: false }} }},
+}});
+if(state.btnForceUpdate.style.display !== 'none') throw new Error('resolved conflict must clear the stale force button');
+if(state.btnForceUpdate.disabled !== true) throw new Error('resolved conflict must disable the stale force button');
+if(state.btnForceUpdate.dataset.target !== '') throw new Error('resolved conflict must drop the stale force target');
+if(state.btnClearUpdateLock.style.display !== 'none') throw new Error('removed lock must clear the stale lock button');
+if(state.btnClearUpdateLock.disabled !== true) throw new Error('removed lock must disable the stale lock button');
+if(state.btnClearUpdateLock.dataset.target !== '') throw new Error('removed lock must drop the stale lock target');
+// The same failure context still present keeps both buttons armed.
+state.btnForceUpdate.disabled = false;
+state.btnForceUpdate.style.display = 'inline-block';
+state.btnForceUpdate.dataset.target = 'agent';
+state.btnClearUpdateLock.disabled = false;
+state.btnClearUpdateLock.style.display = 'inline-block';
+state.btnClearUpdateLock.dataset.target = 'agent';
+_showUpdateBanner({{
+  webui: {{ no_git: true, manual_update: true, behind: 1 }},
+  agent: {{ behind: 1, recovery: {{ force: true, clear_lock: true }} }},
+}});
+if(state.btnForceUpdate.style.display !== 'inline-block' || state.btnForceUpdate.disabled) throw new Error('persisting conflict must keep the force recovery');
+if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUpdateLock.disabled) throw new Error('persisting lock must keep the lock recovery');
+// An inconclusive probe (null) must never clear a recovery button.
+_showUpdateBanner({{
+  webui: {{ no_git: true, manual_update: true, behind: 1 }},
+  agent: {{ behind: 1, recovery: {{ force: null, clear_lock: null }} }},
+}});
+if(state.btnForceUpdate.style.display !== 'inline-block' || state.btnForceUpdate.disabled) throw new Error('inconclusive probe must not clear the force recovery');
+if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUpdateLock.disabled) throw new Error('inconclusive probe must not clear the lock recovery');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
     def test_settings_manual_webui_update_includes_pull_guidance(self):
         ui_src = read('static/ui.js')
         panels_src = read('static/panels.js')

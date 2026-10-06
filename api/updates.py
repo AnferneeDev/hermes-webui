@@ -1333,6 +1333,38 @@ def _check_repo_branch(path, name, *, fetch=True):
     }
 
 
+def _update_recovery_hints(path: Path) -> dict:
+    """Report which update-recovery conditions a checkout still shows.
+
+    The Docker manual notice keeps Agent recovery buttons (``Force update`` /
+    ``Clear lock and retry``) alive across update checks. Persisting them
+    without re-validating the repo left a destructive force button armed after
+    the underlying conflict was resolved outside the UI (Greptile P1 on
+    #8040). Every check now answers "does the recovery condition still
+    exist?" from live repo state:
+
+    - ``force``: unresolved merge conflicts -- the same porcelain codes the
+      apply path fails on before its ``conflict`` response.
+    - ``clear_lock``: a stale ``.git/index.lock`` is present (the only lock
+      the clear-lock flow addresses).
+
+    ``None`` means "could not determine": the UI must never clear a recovery
+    button on a failed probe.
+    """
+    hints = {'force': None, 'clear_lock': None}
+    inv = _inventory_locks(path)
+    hints['clear_lock'] = bool(inv.get('well_known_lock_present'))
+    status_out, status_ok = _run_git(
+        ['status', '--porcelain', '--untracked-files=no'], path, timeout=5
+    )
+    if status_ok:
+        hints['force'] = any(
+            line[:2] in {'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'}
+            for line in status_out.splitlines()
+        )
+    return hints
+
+
 def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     """Check if a git repo is behind its latest release. Returns dict or None.
 
@@ -1360,6 +1392,12 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
             'no_git': True,
         }
 
+    # Recovery hints are consumed by the Docker manual notice, which offers
+    # Agent-only recovery buttons; other targets keep their payload unchanged.
+    # This is what lets the frontend clear a stale recovery button once the
+    # repo no longer needs it (Greptile P1 on #8040).
+    recovery = _update_recovery_hints(path) if name == 'agent' else None
+
     # Fetch tags first so update prompts track published releases, not every
     # development commit that lands on master/main after the latest release.
     #
@@ -1380,19 +1418,26 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
             release_info['error'] = message
             release_info['stale_check'] = True
             release_info['dirty'] = _is_dirty(path)
+            if recovery is not None:
+                release_info['recovery'] = recovery
             return release_info
-        return {
+        payload = {
             'name': name,
             'behind': None,
             'error': message,
             'stale_check': True,
             'dirty': _is_dirty(path),
         }
+        if recovery is not None:
+            payload['recovery'] = recovery
+        return payload
 
     release_info = _check_repo_release(path, name, channel)
     if release_info is not None:
         release_info = dict(release_info)
         release_info['dirty'] = _is_dirty(path)
+        if recovery is not None:
+            release_info['recovery'] = recovery
         return release_info
 
     branch_info = _check_repo_branch(path, name, fetch=False)
@@ -1400,6 +1445,8 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
         branch_info = dict(branch_info)
         branch_info['dirty'] = _is_dirty(path)
         branch_info['channel'] = channel
+        if recovery is not None:
+            branch_info['recovery'] = recovery
         return branch_info
     return None
 

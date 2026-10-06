@@ -1890,3 +1890,41 @@ def test_apply_update_pull_lock_no_stash_when_clean(tmp_path, monkeypatch):
     # No stash pop on a clean pull-lock path.
     assert not any(c[0] == 'stash' for c in git_calls)
 
+
+def test_update_recovery_hints_report_conflict_and_lock(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    (tmp_path / '.git' / 'index.lock').write_text('', encoding='utf-8')
+    monkeypatch.setattr(updates, '_run_git', lambda *a, **k: ('UU src/app.py\n', True))
+    hints = updates._update_recovery_hints(tmp_path)
+    assert hints == {'force': True, 'clear_lock': True}
+
+
+def test_update_recovery_hints_clear_on_clean_repo(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    monkeypatch.setattr(updates, '_run_git', lambda *a, **k: ('', True))
+    assert updates._update_recovery_hints(tmp_path) == {'force': False, 'clear_lock': False}
+
+
+def test_update_recovery_hints_stay_unknown_when_status_probe_fails(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    monkeypatch.setattr(updates, '_run_git', lambda *a, **k: ('fatal: bad object', False))
+    hints = updates._update_recovery_hints(tmp_path)
+    assert hints['force'] is None
+    assert hints['clear_lock'] is False
+
+
+def test_check_repo_attaches_recovery_hints(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    monkeypatch.setattr(updates, '_check_repo_release', lambda *a, **k: None)
+
+    def fake_git(args, cwd, timeout=10):
+        if args and args[0] == 'status':
+            return 'UU src/app.py\n', True
+        return '', False  # fetch fails -> minimal stale payload
+
+    monkeypatch.setattr(updates, '_run_git', fake_git)
+    info = updates._check_repo(tmp_path, 'agent')
+    assert info is not None
+    assert info.get('stale_check') is True
+    assert info['recovery'] == {'force': True, 'clear_lock': False}
+
