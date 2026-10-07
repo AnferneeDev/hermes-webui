@@ -120,6 +120,38 @@
   portrait reflows are no longer mistaken for your own scrolling. Keyboard scrolling inside a nested pane such as
   terminal output chains to the transcript at the pane's edge. Thanks @CharlesMcquade. (#7494)
 
+- **A MoA preset picked in the model picker runs its reference models once per call, not twice.** The WebUI also
+  sent a per-turn `moa_config` for these sessions, which made the Agent run a second, independent MoA round on every
+  API call, including each tool iteration, on top of the virtual provider's own. That roughly doubled reference and
+  aggregator calls and latency, and broke the preset's per-turn cache. With an Agent that serves the virtual `moa`
+  provider, the WebUI no longer sends it; older Agents keep the previous behaviour. Thanks @psanger. (#8065)
+
+- **Cron results now raise a browser notification when the WebUI tab is in the background.** The cron completion poll
+  skipped every tick while the tab was hidden, so a job delivering to its origin chat left a transcript entry and an
+  unread dot but never a notification, which is exactly when one is useful (and the Android app relays these). The
+  poll now runs while hidden; a visible tab still shows the toast, and a hidden one sends the browser notification
+  through the existing notification setting and permission. Clicking it focuses the right chat or the Tasks panel.
+  Thanks @happy5318. (#7652, fixes #7257)
+
+- **The update banner's Force update and Clear lock buttons go away once they no longer apply.** After a failed
+  Agent update armed them (a merge conflict, a diverged checkout, an untracked file in the way, or a stale
+  `.git/index.lock`), they stayed until a reload even after the problem was fixed. A fresh update check now clears a
+  button only when it can confirm the condition is gone. A result it can't confirm (for example an untracked nested
+  repository) keeps the button, as does a cached result or an older check that a newer failed update overtook. The
+  check never takes git's index lock. Thanks @pxxD1998. (#8058, follows #8040)
+
+- **Typing `/new` and pressing Enter twice quickly starts the new chat.** The first Enter takes `/new` from the
+  slash-command list. When skills couldn't load (for example on a server without an Agent), a skill request that
+  arrived a moment later re-opened the list, so the second Enter picked `/new` again instead of sending it. Picking a
+  command or pressing Escape now keeps the list closed for that text until you type again; a list that is still open
+  picks up late skills as before. This was also the intermittent `/new` failure in the browser-smoke check. (#8063,
+  fixes #8050)
+
+- **Running the test suite on a machine with Hermes Agent installed no longer fills the disk.** Three tests started
+  the server with a minimal environment that dropped `HERMES_DISABLE_LAZY_INSTALLS`, so each one installed a full
+  Agent environment (about 1.1 GB) into its temp folder, about 16 GB per run, and then failed. They now pass the flag,
+  and a test that installs an Agent environment into its temp folder fails with the fix in the message. (#8064)
+
 - **Links next to Chinese/Japanese punctuation end in the right place, and internationalized domains stay whole.** A URL
   followed by full-width punctuation (`，`, `）`, `。`, opening brackets and quotes) now ends before it, so the prose after
   it is no longer pulled into the link, while hosts written with the full-width dots (`https://例子。中国`,
