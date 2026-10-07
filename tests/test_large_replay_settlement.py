@@ -147,3 +147,35 @@ def test_stale_cleanup_releases_lock_after_save_failure(monkeypatch):
     routes._clear_stale_stream_state(session)
     assert lock.acquire(blocking=False)
     lock.release()
+
+
+def test_chat_start_cleanup_waits_for_a_transient_writer(monkeypatch):
+    """chat_start is itself a writer: a dead stream id must be cleared after a brief
+    holder releases the lock, not answered with 409 (maintainer fix on #8072)."""
+    session_lock = threading.Lock()
+    monkeypatch.setattr(routes, "STREAMS", {})
+    monkeypatch.setattr(config, "ACTIVE_RUNS", {})
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: session_lock)
+    saved = []
+    session = SimpleNamespace(
+        session_id="chat-start-dead-stream", active_stream_id="dead-stream",
+        pending_user_message=None, pending_started_at=None,
+        _loaded_metadata_only=False, messages=[],
+        save=lambda **kw: saved.append(kw),
+    )
+    result = []
+    session_lock.acquire()
+    worker = threading.Thread(
+        target=lambda: result.append(routes._clear_stale_stream_state(session, wait_for_writer=True)))
+    try:
+        worker.start()
+        worker.join(.3)
+        waited = worker.is_alive()
+    finally:
+        session_lock.release()
+        worker.join(5)
+    assert waited, "chat_start cleanup returned while a writer held the lock"
+    assert result == [True]
+    assert session.active_stream_id is None
+    assert saved
+    assert not session_lock.locked()
