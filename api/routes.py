@@ -3283,6 +3283,13 @@ def _clear_stale_stream_state(session) -> bool:
         )
         return False
 
+    # Observation must not queue behind a worker committing a large transcript.
+    # The locked() probe avoids a needless full reload; acquire below is the
+    # actual synchronization check and also covers a writer starting afterward.
+    session_lock = _get_session_agent_lock(session.session_id)
+    if session_lock.locked():
+        return False
+
     # ── #1558 P0 safety: if we were handed a metadata-only stub, reload the
     # full session before touching persisted state. The original
     # metadata-only object is left untouched so the caller's read path is
@@ -3333,7 +3340,9 @@ def _clear_stale_stream_state(session) -> bool:
     # active_stream_id under it. A concurrent chat_start may have already
     # registered a new stream after our STREAMS_LOCK check above; in that
     # case we must NOT clobber its session.active_stream_id.
-    with _get_session_agent_lock(session.session_id):
+    if not session_lock.acquire(blocking=False):
+        return False
+    try:
         if getattr(session, "active_stream_id", None) != stream_id:
             return False
         if getattr(session, "pending_user_message", None):
@@ -3391,6 +3400,8 @@ def _clear_stale_stream_state(session) -> bool:
                 "_clear_stale_stream_state: save() failed for session %s",
                 getattr(session, "session_id", "?"),
             )
+    finally:
+        session_lock.release()
     # Patch the caller's stub (if different from the full-load object) so
     # its in-memory active_stream_id matches what just got persisted.
     if original_stub is not session:
