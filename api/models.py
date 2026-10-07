@@ -12778,8 +12778,9 @@ def _cancelled_journal_turn_owner(
             continue
         segment = messages[owner_idx + 1:error_idx]
         has_partial = any(row.get('_partial') for row in segment)
-        if has_partial and not include_live_partial:
-            continue
+        if has_partial and (not include_live_partial
+                            or carrier.get('type') not in (None, '', 'cancelled')):
+            continue  # A typed crash/provider interruption is not a user Stop.
         if (has_partial or any(row.get('_recovered_from_cancel_journal') is True for row in segment)):
             return messages[owner_idx], carrier
     return None
@@ -13565,8 +13566,14 @@ def _merge_session_messages_append_only_impl(
     post_cancel_state = False
     owns_live_partial = _selected_history_owns_live_partial(sidecar_messages, owner_messages)
     cancelled_turn = _cancelled_journal_turn_owner(owner_messages, include_live_partial=owns_live_partial)
-    if (incoming_provenance != 'state_db'
-            and (owns_live_partial or _sidecar_has_terminal_partial_error(owner_messages))):
+    latest_error = next((row for row in reversed(owner_messages)
+                         if isinstance(row, dict) and row.get('role') == 'assistant'
+                         and row.get('_error')), None)
+    owns_live_stop = (owns_live_partial and cancelled_turn is not None
+                      and cancelled_turn[1] is latest_error)
+    if ((owns_live_partial and not owns_live_stop)
+            or (incoming_provenance != 'state_db'
+                and (owns_live_partial or _sidecar_has_terminal_partial_error(owner_messages)))):
         # The selected history owns the veto. Deferred model context can still
         # precede the displayed Stop; SQLite must fill that older snapshot.
         state_messages = []

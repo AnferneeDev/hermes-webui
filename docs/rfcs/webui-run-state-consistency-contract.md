@@ -175,7 +175,9 @@ The live-partial veto belongs to the selected history: a displayed Stop cannot
 suppress SQLite completion of an older deferred model-context snapshot. A terminal
 live Stop excludes its proved raw execution rather than vetoing all SQLite
 history, so its proved successor Gateway suffix remains visible and reaches
-next-send provider history. Rebase tool-card owners through the same display
+next-send provider history. A typed crash/provider interruption is not a user
+Stop: its selected live-partial veto remains in force, including when an older
+cancelled segment also exists in the saved history. Rebase tool-card owners through the same display
 projection before hydration/pagination, including cached limited reads; do not
 rewrite saved owner metadata.
 Selected context may omit the display-only terminal carrier. Its user and each

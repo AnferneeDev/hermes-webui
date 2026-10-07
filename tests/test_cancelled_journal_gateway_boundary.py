@@ -99,6 +99,23 @@ def test_later_live_partial_veto_wins_over_historical_cancelled_journal():
     assert models.merge_session_messages_append_only(sidecar, state, incoming_provenance='state_db') == sidecar
 
 
+@pytest.mark.parametrize('previous_stop', [False, True])
+@pytest.mark.parametrize('terminal_type', ['interrupted', 'provider_error'])
+def test_typed_non_cancelled_partial_does_not_inherit_stop_successor_authority(previous_stop, terminal_type):
+    sidecar = (_sidecar() if previous_stop else []) + [
+        {'role': 'user', 'content': 'CRASH_OWNER', 'timestamp': 21},
+        {'role': 'assistant', 'content': 'LIVE_PARTIAL', 'timestamp': 22, '_partial': True},
+        {'role': 'assistant', 'content': 'ERROR', 'timestamp': 23, '_error': True, 'type': terminal_type},
+    ]
+    state = [
+        {'role': 'user', 'content': 'CRASH_OWNER', 'timestamp': 21},
+        {'role': 'assistant', 'content': 'RAW_REPLAY', 'timestamp': 24},
+        {'role': 'user', 'content': 'LATER_USER', 'timestamp': 25},
+        {'role': 'assistant', 'content': 'LATER_ANSWER', 'timestamp': 26},
+    ]
+    assert models.merge_session_messages_append_only(sidecar, state, incoming_provenance='state_db') == sidecar
+
+
 @pytest.mark.parametrize('field', ['timestamp', '_ts'])
 @pytest.mark.parametrize('value', [True, float('inf'), float('nan')])
 def test_invalid_terminal_clock_does_not_authorize_later_only_store(field, value):
