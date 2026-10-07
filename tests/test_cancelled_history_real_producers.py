@@ -431,3 +431,86 @@ def test_real_http_restored_tool_cards_follow_exact_assistant(
             idx,
             [r.get("content") for r in rows],
         )
+
+
+@pytest.mark.parametrize("database", ["missing", "empty", "filtered"])
+@pytest.mark.parametrize("transport", ["handler", "http"])
+def test_sidecar_only_stop_tool_owner_survives_repeated_paged_get(
+    tmp_path, monkeypatch, database, transport
+):
+    """Actual Stop/restart, handler and HTTP keep page-local exact owners."""
+    from urllib.parse import urlparse
+
+    from tests.test_native_image_turn_display_context import (
+        _durable_agent_content, _settle_image_turn,
+    )
+    from tests.test_webui_state_db_reconciliation import _GetHandler
+
+    sid = "cancelled-sidecar-card-" + database
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    prior = [
+        {"role": "user", "content": "PRIOR_Q", "timestamp": 1},
+        {"role": "assistant", "content": "CACHED_A", "timestamp": 2},
+        {"role": "user", "content": "CACHED_Q", "timestamp": 5},
+        {"role": "assistant", "content": "CACHED_A", "timestamp": 6},
+    ]
+    context = prior
+    state = []
+    if database == "filtered":
+        image, _, _ = _settle_image_turn(
+            session_id=sid, text="CACHED_Q", timestamp=5,
+            agent_row_id=1, previous_messages=prior[:2],
+            previous_context=prior[:2],
+        )
+        prior = image.messages
+        prior[-1].update(content="CACHED_A", timestamp=6)
+        context = image.context_messages
+        state = [{"role": "user", "content": _durable_agent_content(
+            context[2]["content"]), "timestamp": 5}]
+    session, _ = _recover(sid, prior)
+    if database == "filtered":
+        session.context_messages = copy.deepcopy(context) + session.context_messages[4:]
+    session.tool_calls = [
+        {"id": "exact-card", "name": "read", "done": True,
+         "result": "LOCAL_CARD_RESULT", "assistant_msg_idx": 3},
+        {"id": "missing-owner", "name": "read", "done": True,
+         "assistant_msg_idx": 99},
+    ]
+    session.save(touch_updated_at=False)
+    if database != "missing":
+        _make_state_db(db, sid, state)
+    if database == "filtered":
+        raw = models.get_state_db_session_messages(sid, include_row_identity=True)
+        assert raw
+        assert models._suppress_native_image_display_mirrors(session, raw) == []
+    persisted = copy.deepcopy(models.Session.load(sid).tool_calls)
+    queries = [("msg_limit=all", 3), ("msg_limit=4", 0),
+               ("msg_limit=4&msg_before=6", 1), ("msg_limit=2&msg_before=2", None)]
+
+    def check(data, expected, source):
+        cards = [c for c in data["tool_calls"] if c.get("id") == "exact-card"]
+        assert not any(c.get("id") == "missing-owner" for c in data["tool_calls"])
+        if expected is None:
+            assert not cards, (source, data)
+        else:
+            assert len(cards) == 1, (source, data)
+            assert cards[0]["assistant_msg_idx"] == expected, (source, data)
+            assert cards[0]["result"] == "LOCAL_CARD_RESULT"
+            assert data["messages"][expected]["content"] == "CACHED_A"
+
+    if transport == "handler":
+        for repeat in range(2):
+            for query, expected in queries:
+                handler = _GetHandler(f"/api/session?session_id={sid}&{query}")
+                routes._handle_session_get(handler, urlparse(handler.path))
+                assert handler.status == 200
+                check(handler.response_json["session"], expected, ("handler", repeat, query))
+    else:
+        with _new_server(http_env(tmp_path), ROOT, tmp_path / "server.log") as base:
+            for repeat in range(2):
+                for query, expected in queries:
+                    status, body, _ = _request(base, f"/api/session?session_id={sid}&{query}")
+                    assert status == 200
+                    check(json.loads(body)["session"], expected, ("http", repeat, query))
+    assert models.Session.load(sid).tool_calls == persisted

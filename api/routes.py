@@ -9698,12 +9698,16 @@ def _limited_webui_messages_for_display_with_sidecar(
         sidecar_messages = list(sidecar_messages or [])
     state_db_messages = list(state_db_messages or [])
     if not state_db_messages:
+        if owner_positions is not None:
+            owner_positions.update(_display_exact_owner_positions(session, sidecar_messages))
         return sidecar_messages
     state_db_messages = _suppress_native_image_display_mirrors(
         session,
         state_db_messages,
     )
     if not state_db_messages:
+        if owner_positions is not None:
+            owner_positions.update(_display_exact_owner_positions(session, sidecar_messages))
         return sidecar_messages
 
     # NOTE: do not short-circuit to the sidecar when state.db has no strictly
