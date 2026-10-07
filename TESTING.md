@@ -27,6 +27,8 @@ reject ambiguous or malformed ownership, and check rollback and repeated-load
 idempotence, with capacity cases up to 17 hooks and 64 tool cards. This coverage
 does not certify external provider execution or filesystem crash durability.
 
+Run `./scripts/test.sh tests/test_cancelled_history_real_producers.py` for independent Agent-flush versus WebUI-settlement clocks, later Gateway turns after a live Stop, legacy integer/fractional Stop owners, and tool-card owners on cold/cached paginated HTTP reads. A terminal Stop excludes only its proved raw execution block, including when it retained live partial output; proved later Gateway exchanges remain in display and next-send history. Ambiguous clock/content occurrences still prevent prefix restoration. The worker stubs write real SQLite rows and exercise production worker/HTTP paths; they do not certify a real provider call.
+
 ## Session-scoped media authorization
 
 Run `./scripts/test.sh tests/test_media_inline.py tests/test_media_session_preview_auth.py`.
@@ -138,6 +140,13 @@ It is intentionally **credential-free**: it strips every `*_API_KEY` from the
 environment before launching the server, needs no secrets, and does not drive a
 real model (it verifies the app *loads and initializes* cleanly — the brick class
 that breaks the page for everyone).
+
+The same job then runs `tests/browser_new_chat_focus.py`, on the same agent-free
+setup: with every `/api/sessions` response held, New Chat, Cmd/Ctrl+K and the
+typed `/new` command must focus the composer (and `/new` show its toast), and
+the first message typed with no conversation open must be sent; each reads the
+session list once before that, and shows the new row once the list is released
+(#7936, #7996, #8004). Run it locally with `python tests/browser_new_chat_focus.py`.
 
 ## Public conversation lifecycle gate
 

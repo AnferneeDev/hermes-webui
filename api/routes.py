@@ -437,7 +437,7 @@ def _session_row_lineage_root_id(session, sessions_by_id) -> str:
     return current or sid
 
 
-def _visible_pinned_lineage_ids(session_rows) -> set[str]:
+def _visible_pinned_lineage_ids(session_rows, excluding=None, profiles=None) -> set[str]:
     sessions_by_id = {}
     for row in session_rows:
         sid = str(_session_field(row, "session_id", "") or "")
@@ -447,9 +447,13 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
     for row in session_rows:
         if not _session_counts_toward_pin_quota(row):
             continue
+        if profiles is not None and str(_session_field(row, "profile", None) or "default") not in profiles:
+            continue
         root = _session_row_lineage_root_id(row, sessions_by_id)
         if root:
             roots.add(root)
+    if excluding is not None:
+        roots.discard(_session_row_lineage_root_id(excluding, sessions_by_id))
     return roots
 
 
@@ -474,6 +478,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     _profiles_match,
     _is_isolated_profile_mode,
     _is_root_profile,
+    _root_profile_names_snapshot,
     _SKILLS_STATS_CACHE,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
@@ -535,6 +540,45 @@ def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
     if not isinstance(session_profile, str):
         session_profile = None
     return _profiles_match(session_profile, active_profile)
+
+
+def _retag_empty_session_profile(session, requested_profile):
+    """Atomically retag an empty, unpinned placeholder with pin admission."""
+    # Warm the canonical root-alias cache before LOCK, then use its snapshot
+    # below so a concurrent cache invalidation cannot trigger listing in-LOCK.
+    _profiles_match(getattr(session, "profile", None), requested_profile)
+    root_profile_names = set(_root_profile_names_snapshot() or ()) | {"default"}
+    with LOCK:
+        session_profile = getattr(session, "profile", None)
+        row_profile = session_profile or "default"
+        requested_owner = requested_profile or "default"
+        if row_profile == requested_owner or (
+            row_profile in root_profile_names and requested_owner in root_profile_names
+        ):
+            return session_profile, "same_owner"
+        has_persisted_turns = bool(
+            getattr(session, "messages", None)
+            or getattr(session, "context_messages", None)
+            or getattr(session, "pending_user_message", None)
+        )
+        is_pinned = bool(getattr(session, "pinned", False))
+        if has_persisted_turns:
+            return session_profile, "nonempty"
+        if is_pinned:
+            return session_profile, "pinned_empty"
+        session.profile = requested_profile
+        return requested_profile, "retagged"
+
+
+def _session_profile_mismatch_response(handler, session_id, session_profile):
+    if session_profile:
+        return j(handler, {
+            "error": "Session belongs to a different profile",
+            "code": "session_profile_mismatch",
+            "session_id": session_id,
+            "profile": session_profile,
+        }, status=409)
+    return bad(handler, "Session not found", 404)
 
 
 def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
@@ -9562,7 +9606,33 @@ def _display_merge_session_is_active(session) -> bool:
     )
 
 
-def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None):
+def _display_exact_owner_positions(session, messages):
+    """Map saved row positions before display/cache copies lose object identity."""
+    projected = {id(row): index for index, row in enumerate(messages)}
+    return {
+        index: projected[id(row)]
+        for index, row in enumerate(getattr(session, "messages", None) or [])
+        if id(row) in projected
+    }
+
+
+def _display_rebased_tool_calls(tool_calls, owner_positions):
+    """Project cards onto proven owners without changing persisted metadata."""
+    projected = []
+    for card in tool_calls or []:
+        if not isinstance(card, dict):
+            projected.append(card)
+            continue
+        owner = card.get("assistant_msg_idx")
+        if type(owner) is int:
+            if owner not in owner_positions:
+                continue
+            card = dict(card, assistant_msg_idx=owner_positions[owner])
+        projected.append(card)
+    return projected
+
+
+def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None, owner_positions=None):
     """Return the memoized merged transcript, or None when it can't be reused.
 
     Lets GET /api/session skip loading the state.db rows entirely on a hit. That
@@ -9602,6 +9672,10 @@ def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None
         entry = _display_merge_cache.get(sid)
         if not _display_merge_cache_entry_usable(entry, cache_key):
             return None
+        if owner_positions is not None:
+            if "owner_positions" not in entry:
+                return None
+            owner_positions.update(entry["owner_positions"])
         _display_merge_cache.move_to_end(sid, last=True)
         return [dict(m) if isinstance(m, dict) else m for m in entry["messages"]]
 
@@ -9616,6 +9690,7 @@ def _limited_webui_messages_for_display_with_sidecar(
     *,
     state_db_signature=_DISPLAY_STATE_SIGNATURE_UNSET,
     msg_before=None,
+    owner_positions=None,
 ) -> list:
     if sidecar_messages is None:
         sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
@@ -9681,7 +9756,10 @@ def _limited_webui_messages_for_display_with_sidecar(
         sid = str(getattr(session, "session_id", "") or "")
         with _display_merge_cache_lock:
             entry = _display_merge_cache.get(sid)
-            if _display_merge_cache_entry_usable(entry, cache_key):
+            if (_display_merge_cache_entry_usable(entry, cache_key)
+                    and (owner_positions is None or "owner_positions" in entry)):
+                if owner_positions is not None:
+                    owner_positions.update(entry["owner_positions"])
                 _display_merge_cache.move_to_end(sid, last=True)
                 return [dict(m) if isinstance(m, dict) else m for m in entry["messages"]]
     merged = merge_session_messages_append_only(
@@ -9697,6 +9775,9 @@ def _limited_webui_messages_for_display_with_sidecar(
         state_db_messages,
         merged,
     )
+    projected_owners = _display_exact_owner_positions(session, merged)
+    if owner_positions is not None:
+        owner_positions.update(projected_owners)
     if cache_key is not None:
         _state_key = cache_key[4]
         _streaming_key = (
@@ -9720,6 +9801,7 @@ def _limited_webui_messages_for_display_with_sidecar(
             _display_merge_cache[sid] = {
                 "key": cache_key,
                 "messages": merged,
+                "owner_positions": projected_owners,
                 "stored_at": time.monotonic(),
             }
             _display_merge_cache.move_to_end(sid, last=True)
@@ -13715,6 +13797,9 @@ def _handle_session_get(handler, parsed) -> bool:
         # branch below, including the ones that never probe the cache.
         _display_cache_hit = None
         _display_state_db_signature = None
+        _display_owner_positions = ({} if load_messages and _cancelled_journal_turn_owner(
+            getattr(s, "messages", None) or [], include_live_partial=True
+        ) else None)
         if is_messaging_session:
             cli_messages = get_cli_session_messages(sid)
         elif load_messages:
@@ -13728,7 +13813,7 @@ def _handle_session_get(handler, parsed) -> bool:
                     msg_before=msg_before,
                 )
             _state_db_reader_kwargs = {"profile": _session_profile}
-            if _cancelled_journal_turn_owner(getattr(s, "messages", None) or []):
+            if _cancelled_journal_turn_owner(getattr(s, "messages", None) or [], include_live_partial=True):
                 _state_db_reader_kwargs["include_row_identity"] = True
             if state_db_since_timestamp is not None:
                 _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
@@ -13763,6 +13848,7 @@ def _handle_session_get(handler, parsed) -> bool:
                     s,
                     limited_sidecar_messages,
                     msg_before=msg_before,
+                    owner_positions=_display_owner_positions,
                 )
             if _display_cache_hit is not None:
                 state_db_messages = []
@@ -13826,6 +13912,7 @@ def _handle_session_get(handler, parsed) -> bool:
                         state_db_messages,
                         state_db_signature=_display_state_db_signature,
                         msg_before=msg_before,
+                        owner_positions=_display_owner_positions,
                     )
             else:
                 state_db_messages = _suppress_native_image_display_mirrors(
@@ -13886,6 +13973,13 @@ def _handle_session_get(handler, parsed) -> bool:
         else:
             _summary_message_count = None
             _summary_last_message_at = None
+        _display_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
+        if _display_owner_positions is not None:
+            if msg_limit is None:
+                _display_owner_positions.update(_display_exact_owner_positions(s, _all_msgs))
+            _display_tool_calls = _display_rebased_tool_calls(
+                _display_tool_calls, _display_owner_positions
+            )
         if load_messages:
             _truncated_msgs, _messages_offset = _message_window_for_display(
                 _all_msgs,
@@ -13899,7 +13993,7 @@ def _handle_session_get(handler, parsed) -> bool:
                 _truncated_msgs,
                 getattr(s, "anchor_activity_scenes", None),
                 message_offset=_messages_offset,
-                tool_calls=getattr(s, "tool_calls", None),
+                tool_calls=_display_tool_calls,
             )
         else:
             _truncated_msgs = []
@@ -13971,7 +14065,7 @@ def _handle_session_get(handler, parsed) -> bool:
                         _fb_cl,
                     )
                 _persisted_cl = _fb_cl
-        _session_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
+        _session_tool_calls = _display_tool_calls
         # Always include session-level tool_calls so the browser can merge
         # them with per-message tool_calls for messages that lack the
         # per-message variant (older messages whose tool_calls live only
@@ -14282,9 +14376,21 @@ def handle_get(handler, parsed) -> bool:
 
             # The disk read + process-constant token substitutions are cached;
             # only the per-session CSRF token and per-request extension tags are
-            # applied here (see _render_index_shell_base).
-            html = _render_index_shell_base().replace(
-                "__CSRF_TOKEN_JSON__", json.dumps(csrf_token)
+            # applied here (see _render_index_shell_base). The CSP image
+            # allowlist is computed once and shared with the header via
+            # _csp_extra_img_src_preset, so the renderer's inert-placeholder
+            # decision always matches what the browser will enforce (#7941).
+            from api.helpers import _csp_extra_img_src, csp_img_extra_sources
+
+            extra_img_src = _csp_extra_img_src()
+            handler._csp_extra_img_src_preset = extra_img_src
+            html = (
+                _render_index_shell_base()
+                .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
+                .replace(
+                    "__CSP_IMG_EXTRA_JSON__",
+                    json.dumps(csp_img_extra_sources(extra_img_src)).replace("<", "\\u003c"),
+                )
             )
             return t(
                 handler,
@@ -14296,9 +14402,20 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/share" or parsed.path.startswith("/share/"):
         share_path = (Path(__file__).parent.parent / "static" / "share.html").resolve()
+        # Same contract as the app shell: the share page renders with renderMd(),
+        # so it needs the validated CSP image allowlist, computed once and shared
+        # with this response's header (#7941).
+        from api.helpers import _csp_extra_img_src, csp_img_extra_sources
+
+        share_img_src = _csp_extra_img_src()
+        handler._csp_extra_img_src_preset = share_img_src
+        share_html = share_path.read_text(encoding="utf-8").replace(
+            "__CSP_IMG_EXTRA_JSON__",
+            json.dumps(csp_img_extra_sources(share_img_src)).replace("<", "\\u003c"),
+        )
         return t(
             handler,
-            share_path.read_text(encoding="utf-8"),
+            share_html,
             content_type="text/html; charset=utf-8",
             extra_headers={
                 "X-Robots-Tag": "noindex, nofollow",
@@ -16356,7 +16473,7 @@ def handle_post(handler, parsed) -> bool:
 
             copy_messages = session.messages
             copy_context = getattr(session, "context_messages", None) or []
-            if _cancelled_journal_turn_owner(session.messages):
+            if _cancelled_journal_turn_owner(session.messages, include_live_partial=True):
                 # Read one complete private snapshot for both persisted layers.
                 # A recovered sidecar can predate later Gateway exchanges.
                 copy_state = get_state_db_session_messages(
@@ -17261,7 +17378,7 @@ def handle_post(handler, parsed) -> bool:
             _state_db_reader_kwargs = {
                 "profile": getattr(source, "profile", None) or None,
             }
-            cancelled_owner = _cancelled_journal_turn_owner(source.messages)
+            cancelled_owner = _cancelled_journal_turn_owner(source.messages, include_live_partial=True)
             if cancelled_owner:
                 _state_db_reader_kwargs["include_row_identity"] = True
             _backstop = _state_db_backstop_limit_for_display(source, None)
@@ -18014,25 +18131,41 @@ def handle_post(handler, parsed) -> bool:
         # persisted index outside the lock, then re-check the in-memory
         # mutation set inside the lock and commit the pin atomically.
         if pin_requested and not getattr(s, "pinned", False):
+            try:
+                profiles = list_profiles_api()
+            except Exception:
+                profiles = []
+            root_profile_names = set(_root_profile_names_snapshot() or ()) | {"default"}
+            listed_root_names = {str(p["name"]) for p in profiles or [] if p.get("name") and p.get("is_default") is True}
+            nonroot_names = {str(p["name"]) for p in profiles or [] if p.get("name") and p.get("is_default") is False}
+            root_profile_names.update(listed_root_names)
+            conflicts = (root_profile_names - {"default"}) & nonroot_names
+            known_nonroots = nonroot_names - conflicts - {"default"}
+            pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
             # Pre-snapshot from persisted index (acquires LOCK internally,
             # so must run outside our own LOCK acquire below).
             persisted_rows = [
                 existing for existing in all_sessions()
                 if _session_counts_toward_pin_quota(existing)
             ]
+            admission_error = None
             with LOCK:
+                owner_profile = str(_session_field(s, "profile", None) or "default")
+                uncertain_owner = owner_profile in conflicts or owner_profile not in root_profile_names | nonroot_names
+                root_owner = owner_profile not in known_nonroots
+                quota_profile_names = root_profile_names - conflicts if root_owner else {owner_profile}
+                candidate_rows = list(persisted_rows)
                 # Final authoritative count: merge persisted pinned rows with the
                 # in-memory SESSIONS snapshot. Count logical sidebar-visible pin
                 # lineages rather than raw session rows so continuation siblings
                 # in the same visible lineage do not consume extra pin quota.
-                candidate_rows = list(persisted_rows)
                 candidate_rows.extend(
                     existing.compact() for existing in SESSIONS.values()
                     if _session_counts_toward_pin_quota(existing)
                 )
                 target_row = s.compact()
                 candidate_rows.append(target_row)
-                pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)
+                pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows, profiles=quota_profile_names)
                 target_lineage = _session_row_lineage_root_id(
                     target_row,
                     {
@@ -18042,13 +18175,26 @@ def handle_post(handler, parsed) -> bool:
                     },
                 )
                 pinned_lineage_ids.discard(target_lineage)
-                pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
-                if len(pinned_lineage_ids) >= pinned_sessions_limit:
-                    return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
-                # Mark in-memory pin state under LOCK so concurrent pin
-                # requests see the increment immediately, even before
-                # save() finishes flushing to disk.
-                s.pinned = True
+                pinned_count = len(pinned_lineage_ids)
+                if root_owner:
+                    upper_profiles = {str(_session_field(row, "profile", None) or "default") for row in candidate_rows} - known_nonroots
+                    upper_count = len(_visible_pinned_lineage_ids(candidate_rows, target_row, upper_profiles))
+                if uncertain_owner:
+                    own_count = len(_visible_pinned_lineage_ids(candidate_rows, target_row, {owner_profile}))
+                if (own_count if uncertain_owner else pinned_count) >= pinned_sessions_limit:
+                    admission_error = (
+                        f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.",
+                        400,
+                    )
+                elif root_owner and upper_count >= pinned_sessions_limit:
+                    admission_error = ("Session profile information is incomplete; please retry.", 503)
+                else:
+                    # Mark in-memory pin state under LOCK so concurrent pin
+                    # requests see the increment immediately, even before
+                    # save() finishes flushing to disk.
+                    s.pinned = True
+            if admission_error:
+                return bad(handler, *admission_error)
             with _get_session_agent_lock(body["session_id"]):
                 s.save()
         else:
@@ -18894,7 +19040,7 @@ def _handle_session_export(handler, parsed):
     # ``redact_session_data`` path so export context_messages uses the same
     # alias-stripping boundary as the visible transcript.
     snapshot = dict(s.__dict__)
-    if _cancelled_journal_turn_owner(getattr(s, "messages", None) or []):
+    if _cancelled_journal_turn_owner(getattr(s, "messages", None) or [], include_live_partial=True):
         state_messages = get_state_db_session_messages(
             sid, profile=getattr(s, "profile", None), include_row_identity=True,
         )
@@ -25784,13 +25930,13 @@ def _handle_goal_command(handler, body):
         except ImportError:
             requested_profile = ""
     if requested_profile and not _profiles_match(getattr(s, "profile", None), requested_profile):
-        has_persisted_turns = bool(
-            getattr(s, "messages", None)
-            or getattr(s, "context_messages", None)
-            or getattr(s, "pending_user_message", None)
+        session_profile, retag_result = _retag_empty_session_profile(
+            s, requested_profile
         )
-        if not has_persisted_turns:
-            s.profile = requested_profile
+        if retag_result == "pinned_empty":
+            return _session_profile_mismatch_response(
+                handler, body.get("session_id", ""), session_profile
+            )
 
     current_stream_id = getattr(s, "active_stream_id", None)
     stream_running = False
@@ -26175,33 +26321,22 @@ def _handle_chat_start(handler, body, diag=None):
             except ImportError:
                 requested_profile = ""
         session_profile = getattr(s, "profile", None)
-        has_persisted_turns = bool(
-            getattr(s, "messages", None)
-            or getattr(s, "context_messages", None)
-            or getattr(s, "pending_user_message", None)
-        )
         if not _session_visible_to_active_profile(session_profile, handler):
             if (
                 requested_profile
                 and _profiles_match(requested_profile, active_profile)
-                and not has_persisted_turns
             ):
-                # Empty placeholders can still be retagged when the
-                # requested profile matches the active request profile.
-                s.profile = requested_profile
-            elif session_profile:
-                # #7710: known other profile → 409 ``session_profile_mismatch``
-                # so the client can offer to switch to it (#5419).
-                # 404 is preserved only for the None-profile
-                # (unknown/legacy) self-heal case.
-                return j(handler, {
-                    "error": "Session belongs to a different profile",
-                    "code": "session_profile_mismatch",
-                    "session_id": body.get("session_id", ""),
-                    "profile": session_profile,
-                }, status=409)
+                session_profile, retag_result = (
+                    _retag_empty_session_profile(s, requested_profile)
+                )
+                if retag_result not in ("same_owner", "retagged"):
+                    return _session_profile_mismatch_response(
+                        handler, body.get("session_id", ""), session_profile
+                    )
             else:
-                return bad(handler, "Session not found", 404)
+                return _session_profile_mismatch_response(
+                    handler, body.get("session_id", ""), session_profile
+                )
         # Resolve durable rotations before any workspace/model/pending mutation.
         # GET navigation adopts the tip; POST never silently replays a user turn.
         from api.compression_continuation import durable_compression_continuation

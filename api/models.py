@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -148,6 +149,11 @@ _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
 # _CLAUDE_CODE_PARSE_CACHE / _SIDECAR_METADATA_CACHE LRU pattern.
 _CLI_SESSIONS_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
+# Complete projections retained under an identity that excludes the volatile
+# state.db fingerprint. This store is independently bounded because the stable
+# identity still contains external Claude/session-index stat revisions.
+_CLI_SESSIONS_LAST_KNOWN_GOOD: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES = 8
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -8682,6 +8688,7 @@ def clear_cli_sessions_cache() -> None:
         global _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
         _CLI_SESSIONS_CACHE_INVALIDATION_VERSION += 1
         _CLI_SESSIONS_CACHE.clear()
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.clear()
     # The sidecar-metadata projection cache is stat-keyed (self-invalidating on
     # any file change), but clear it alongside the CLI cache so an explicit
     # reset — a mutating sidebar action or test isolation — starts fully cold.
@@ -8717,6 +8724,25 @@ def _cli_sessions_cache_done(cache_key: tuple, event: threading.Event | None) ->
         event.set()
 
 
+def _cli_sessions_stable_cache_identity(cache_key: tuple) -> tuple:
+    """Remove volatile state.db revisions from a CLI cache identity."""
+    if cache_key and cache_key[0] == 'all_profiles':
+        # Index 4 is the explicit profile-home/profile-name ownership key. It
+        # stays stable across idle and streaming-frozen primary cache modes.
+        return (*cache_key[:3], cache_key[4], *cache_key[5:])
+    # Single-profile keys place the volatile DB fingerprint at index 4.
+    return (*cache_key[:4], *cache_key[5:]) if len(cache_key) > 4 else cache_key
+
+
+def _copy_last_known_good_cli_sessions(stable_key: tuple, invalidation_stamp: int):
+    with _CLI_SESSIONS_CACHE_LOCK:
+        entry = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
+        if entry is None or entry[0] != invalidation_stamp:
+            return None
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(stable_key)
+        return _copy_cli_sessions(entry[1])
+
+
 def _cache_cli_sessions_if_current(
     cache_key: tuple,
     ttl: float,
@@ -8726,11 +8752,20 @@ def _cache_cli_sessions_if_current(
     with _CLI_SESSIONS_CACHE_LOCK:
         if _CLI_SESSIONS_CACHE_INVALIDATION_VERSION != invalidation_stamp:
             return False
+        copied_sessions = _copy_cli_sessions(sessions)
         _CLI_SESSIONS_CACHE[cache_key] = (
             time.monotonic() + ttl,
             invalidation_stamp,
-            _copy_cli_sessions(sessions),
+            copied_sessions,
         )
+        stable_key = _cli_sessions_stable_cache_identity(cache_key)
+        _CLI_SESSIONS_LAST_KNOWN_GOOD[stable_key] = (
+            invalidation_stamp,
+            _copy_cli_sessions(copied_sessions),
+        )
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(stable_key)
+        while len(_CLI_SESSIONS_LAST_KNOWN_GOOD) > _CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES:
+            _CLI_SESSIONS_LAST_KNOWN_GOOD.popitem(last=False)
         _CLI_SESSIONS_CACHE.move_to_end(cache_key)
         while len(_CLI_SESSIONS_CACHE) > _CLI_SESSIONS_CACHE_MAX_ENTRIES:
             _CLI_SESSIONS_CACHE.popitem(last=False)
@@ -8757,6 +8792,13 @@ def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
         return _copy_cli_sessions(cached_sessions)
 
 
+@dataclass(frozen=True)
+class _CliSessionsLoadResult:
+    sessions: list
+    complete: bool = True
+    fresh_when_incomplete: bool = False
+
+
 def _load_and_cache_cli_sessions(
     *,
     cache_key: tuple,
@@ -8768,8 +8810,15 @@ def _load_and_cache_cli_sessions(
     all_profiles: bool,
     db_path,
 ) -> list:
+    stable_cache_key = _cli_sessions_stable_cache_identity(cache_key)
     try:
-        sessions = load_sessions()
+        loaded = load_sessions()
+        if isinstance(loaded, _CliSessionsLoadResult):
+            sessions = loaded.sessions
+            complete = loaded.complete
+        else:
+            sessions = loaded
+            complete = True
     except Exception as _cli_err:
         logger.warning(
             "get_cli_sessions() failed — check state.db schema or path (%s): %s",
@@ -8777,7 +8826,28 @@ def _load_and_cache_cli_sessions(
         )
         if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
             return stale_sessions
+        stable_sessions = _copy_last_known_good_cli_sessions(
+            stable_cache_key, invalidation_stamp
+        )
+        if stable_sessions is not None:
+            return stable_sessions
         return []
+    if not complete:
+        if isinstance(loaded, _CliSessionsLoadResult) and loaded.fresh_when_incomplete:
+            # Optional source passes are additive. If one cannot be read, the
+            # primary rows already loaded are newer and more useful than a stale
+            # complete snapshot. Serve them for this request only; never publish
+            # an incomplete projection to either cache.
+            return _copy_cli_sessions(sessions)
+        if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
+            return stale_sessions
+        stable_sessions = _copy_last_known_good_cli_sessions(
+            stable_cache_key, invalidation_stamp
+        )
+        if stable_sessions is not None:
+            return stable_sessions
+        # Expose a first partial attempt, but never publish it as authoritative.
+        return _copy_cli_sessions(sessions)
     _cache_cli_sessions_if_current(
         cache_key,
         ttl,
@@ -8883,11 +8953,15 @@ def _path_stat_cache_key(path):
 
 
 def _callable_accepts_include_claude_code(callable_obj) -> bool:
+    return _callable_accepts_keyword(callable_obj, 'include_claude_code')
+
+
+def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
     try:
         signature = inspect.signature(callable_obj)
     except (TypeError, ValueError):
         return True
-    if 'include_claude_code' in signature.parameters:
+    if keyword in signature.parameters:
         return True
     return any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -9208,8 +9282,20 @@ def _load_cli_sessions_uncached(
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
-) -> list:
+    _with_completeness: bool = False,
+) -> list | _CliSessionsLoadResult:
     cli_sessions = []
+    projection_complete = True
+
+    def _result():
+        if _with_completeness:
+            return _CliSessionsLoadResult(
+                cli_sessions,
+                complete=projection_complete,
+                fresh_when_incomplete=not projection_complete,
+            )
+        return cli_sessions
+
     if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code:
         try:
             cli_sessions.extend(get_claude_code_sessions())
@@ -9217,11 +9303,11 @@ def _load_cli_sessions_uncached(
             logger.debug("Claude Code session scan failed", exc_info=True)
 
     if source_filter == CLAUDE_CODE_SOURCE:
-        return cli_sessions
+        return _result()
 
 
     if not db_path.exists():
-        return cli_sessions
+        return _result()
 
     # Memoize the cron project ID for this scan so we don't pay a lock-acquire +
     # disk-read of projects.json per cron session in the loop below.
@@ -9731,6 +9817,13 @@ def _load_cli_sessions_uncached(
                             )
                             widening_budget -= widened - scoped_limit
                             scoped_limit = widened
+            except (OSError, sqlite3.Error) as exc:
+                projection_complete = False
+                logger.warning(
+                    "Optional project-assigned recovery pass unavailable at %s: %s",
+                    db_path,
+                    exc,
+                )
             except Exception:
                 logger.debug("Project-assigned CLI recovery pass failed", exc_info=True)
 
@@ -9932,6 +10025,13 @@ def _load_cli_sessions_uncached(
                             ),
                         )
                     query_limit = min(scan_ceiling, next_query_limit)
+            except (OSError, sqlite3.Error) as exc:
+                projection_complete = False
+                logger.warning(
+                    "Optional unassigned refill pass unavailable at %s: %s",
+                    db_path,
+                    exc,
+                )
             except Exception:
                 logger.debug("Unassigned CLI refill pass failed", exc_info=True)
 
@@ -10007,7 +10107,22 @@ def _load_cli_sessions_uncached(
         })
 
     if source_filter is not None:
-        return cli_sessions
+        return _result()
+
+    def _optional_source_rows(label: str, **kwargs):
+        """Read one additive source pass without discarding primary rows."""
+        nonlocal projection_complete
+        try:
+            return read_importable_agent_session_rows(db_path, **kwargs)
+        except (OSError, sqlite3.Error) as exc:
+            projection_complete = False
+            logger.warning(
+                "Optional %s state.db projection unavailable at %s: %s",
+                label,
+                db_path,
+                exc,
+            )
+            return ()
 
     # --- Second pass: fetch cron sessions that may have been squeezed out
     # of the default window by more-recent non-cron sessions.
@@ -10019,8 +10134,8 @@ def _load_cli_sessions_uncached(
     if cron_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
-                db_path,
+            for row in _optional_source_rows(
+                "cron",
                 limit=cron_project_limit,
                 log=logger,
                 exclude_sources=None,
@@ -10090,8 +10205,8 @@ def _load_cli_sessions_uncached(
     if webhook_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
-                db_path,
+            for row in _optional_source_rows(
+                "webhook",
                 limit=webhook_project_limit,
                 log=logger,
                 exclude_sources=None,
@@ -10158,8 +10273,8 @@ def _load_cli_sessions_uncached(
     if kanban_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
-                db_path,
+            for row in _optional_source_rows(
+                "kanban",
                 limit=kanban_project_limit,
                 log=logger,
                 exclude_sources=None,
@@ -10220,7 +10335,7 @@ def _load_cli_sessions_uncached(
         except Exception:
             logger.debug("Kanban sidebar second pass failed", exc_info=True)
 
-    return cli_sessions
+    return _result()
 
 
 def get_cli_sessions(
@@ -10236,8 +10351,13 @@ def get_cli_sessions(
     bridge is purely additive and never crashes the WebUI.
     """
     source_filter = _normalize_cli_session_source_filter(source_filter)
+    contexts = []
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
+        stable_context_cache_key = tuple(
+            (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
+            for ctx_home, _ctx_db_path, ctx_profile in contexts
+        )
         db_path = "all profiles"
         # #4842: freeze the volatile per-profile state.db component while
         # streaming so a streamed message row in one profile doesn't bust the
@@ -10250,6 +10370,7 @@ def get_cli_sessions(
             source_filter or '',
             bool(include_claude_code),
             context_cache_key,
+            stable_context_cache_key,
             _path_cache_key(_default_claude_code_projects_dir()),
             _path_stat_cache_key(_default_claude_code_projects_dir()),
             _path_stat_cache_key(SESSION_INDEX_FILE),
@@ -10270,13 +10391,19 @@ def get_cli_sessions(
     ttl = _cli_sessions_cache_ttl_seconds()
     now = time.monotonic()
 
-    def _load_sessions():
+    def _load_sessions() -> list | _CliSessionsLoadResult:
         loader_supports_include_claude_code = _callable_accepts_include_claude_code(
             _load_cli_sessions_uncached
         )
+        loader_supports_completeness = _callable_accepts_keyword(
+            _load_cli_sessions_uncached, '_with_completeness'
+        )
         if all_profiles:
             merged: list[dict] = []
-            for idx, (ctx_home, ctx_db_path, ctx_profile) in enumerate(contexts):
+            unavailable_error = None
+            successful_profiles = 0
+            optional_incomplete = False
+            for ctx_home, ctx_db_path, ctx_profile in contexts:
                 load_kwargs = {
                     # NOTE: visible_session_limit=None is NOT "unbounded" for the
                     # interactive pass — it resolves to CLI_VISIBLE_SESSION_LIMIT
@@ -10294,19 +10421,66 @@ def get_cli_sessions(
                     'kanban_project_limit': None,
                 }
                 if loader_supports_include_claude_code:
-                    load_kwargs['include_claude_code'] = include_claude_code and idx == 0
-                merged.extend(
-                    _load_cli_sessions_uncached(
+                    # Claude Code is global rather than profile-owned. Scan it
+                    # once below so profile 0 availability cannot suppress it.
+                    load_kwargs['include_claude_code'] = False
+                if loader_supports_completeness:
+                    load_kwargs['_with_completeness'] = True
+                try:
+                    profile_loaded = _load_cli_sessions_uncached(
                         ctx_home,
                         ctx_db_path,
                         ctx_profile,
                         **load_kwargs,
                     )
-                )
-            return merged
+                    if isinstance(profile_loaded, _CliSessionsLoadResult):
+                        profile_rows = profile_loaded.sessions
+                        optional_incomplete = optional_incomplete or (
+                            not profile_loaded.complete
+                            and profile_loaded.fresh_when_incomplete
+                        )
+                    else:
+                        profile_rows = profile_loaded
+                    merged.extend(profile_rows)
+                    successful_profiles += 1
+                except (OSError, sqlite3.Error) as _profile_err:
+                    unavailable_error = _profile_err
+                    logger.warning(
+                        "get_cli_sessions() skipped unavailable profile %s at %s: %s",
+                        ctx_profile or 'default',
+                        ctx_db_path,
+                        _profile_err,
+                    )
+            external_complete = True
+            if include_claude_code and source_filter in (None, CLAUDE_CODE_SOURCE):
+                try:
+                    merged.extend(get_claude_code_sessions())
+                except Exception as _claude_err:
+                    external_complete = False
+                    logger.warning(
+                        "get_cli_sessions() Claude Code scan failed: %s",
+                        _claude_err,
+                    )
+            return _CliSessionsLoadResult(
+                merged,
+                complete=(
+                    unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                    and not optional_incomplete
+                ),
+                fresh_when_incomplete=(
+                    optional_incomplete
+                    and unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                ),
+            )
         load_kwargs: dict = {'source_filter': source_filter}
         if loader_supports_include_claude_code:
             load_kwargs['include_claude_code'] = include_claude_code
+        if loader_supports_completeness:
+            load_kwargs['_with_completeness'] = True
         return _load_cli_sessions_uncached(
             hermes_home,
             db_path,
@@ -10361,7 +10535,8 @@ def get_cli_sessions(
         )
 
     try:
-        return _load_sessions()
+        loaded = _load_sessions()
+        return loaded.sessions if isinstance(loaded, _CliSessionsLoadResult) else loaded
     except Exception as _cli_err:
         logger.warning(
             "get_cli_sessions() failed — check state.db schema or path (%s): %s",
@@ -12612,6 +12787,7 @@ def _cancelled_journal_turn_owner(
 
 def _state_db_cancelled_journal_turn_bounds(
     sidecar_messages: list, state_messages: list, *, turn_owner=None,
+    allow_legacy_integer_clock=False,
 ) -> tuple[int | None, int | None]:
     """Prove the cancelled owner and its next user in SQLite's row order.
 
@@ -12631,6 +12807,13 @@ def _state_db_cancelled_journal_turn_bounds(
         return _message_exact_timestamp(row)
 
     owner_time = timestamp(owner)
+
+    def owner_clock_matches(row):
+        if timestamp(row) == owner_time:
+            return owner_time is not None
+        return (allow_legacy_integer_clock and type(owner.get('timestamp')) is int
+                and _journal_user_timestamps_match(owner['timestamp'], row.get('timestamp')))
+
     owner_stable, stable_valid = _stable_message_identity_details(owner)
     owner_row, row_valid = _state_db_row_identity_details(owner)
     if not stable_valid or not row_valid:
@@ -12648,9 +12831,10 @@ def _state_db_cancelled_journal_turn_bounds(
             known_claims.append(i)
     matches = [i for i, row in enumerate(state_messages)
                if isinstance(row, dict) and row.get('role') == 'user'
-               and owner_time is not None and timestamp(row) == owner_time
+               and owner_clock_matches(row)
                and _session_message_content_key(row, normalize_workspace_prefix=True)
-               == _session_message_content_key(owner, normalize_workspace_prefix=False)]
+               == _session_message_content_key(owner, normalize_workspace_prefix=False)
+               and _message_private_identity_compatible(owner, row)]
     # A row claiming the cancelled owner's known ID is never a later-only
     # successor merely because its content or timestamp changed.
     if known_claims and (len(known_claims) != 1 or known_claims[0] not in matches):
@@ -12671,7 +12855,7 @@ def _state_db_cancelled_journal_turn_bounds(
         if not bound_identity:
             owner_index = next(i for i, row in enumerate(sidecar_messages) if row is owner)
             if any(isinstance(row, dict) and row.get('role') == 'user'
-                   and timestamp(row) == owner_time
+                   and owner_clock_matches(row)
                    and _session_message_content_key(row, normalize_workspace_prefix=False)
                    == _session_message_content_key(owner, normalize_workspace_prefix=False)
                    and _message_private_identity_compatible(row, matched)
@@ -12706,6 +12890,27 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
     """
     owner, _ = _cancelled_journal_turn_owner(owner_messages)
 
+    def row_owners(rows):
+        owners = []
+        current = None
+        for row in rows:
+            if row.get('role') == 'user':
+                current = row
+            owners.append(current)
+        return owners
+
+    local_owners_all, source_owners = row_owners(selected), row_owners(prefix)
+    local_owner_by_row = {id(row): turn for row, turn in zip(selected, local_owners_all, strict=True)}
+    source_owner_by_row = {id(row): turn for row, turn in zip(prefix, source_owners, strict=True)}
+    local_occurrences = collections.Counter(
+        (id(turn), _session_message_visible_key(row))
+        for row, turn in zip(selected, local_owners_all, strict=True)
+    )
+    source_occurrences = collections.Counter(
+        (id(turn), _session_message_visible_key(row, normalize_workspace_prefix=True))
+        for row, turn in zip(prefix, source_owners, strict=True)
+    )
+
     def matches(local, saved):
         if not _message_private_identity_compatible(local, saved):
             return False
@@ -12714,9 +12919,28 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
             return False
         left_time, left_valid = _message_exact_timestamp_details(local)
         right_time, right_valid = _message_exact_timestamp_details(saved)
-        return (left_valid and right_valid and left_time is not None and left_time == right_time
-                and _session_message_visible_key(local, normalize_workspace_prefix=False)
-                == _session_message_visible_key(saved, normalize_workspace_prefix=True))
+        key = _session_message_visible_key(local, normalize_workspace_prefix=False)
+        if (not left_valid or not right_valid or right_time is None
+                or key != _session_message_visible_key(saved, normalize_workspace_prefix=True)):
+            return False
+        for identity in (_state_db_row_identity_details, _stable_message_identity_details):
+            local_id, local_valid = identity(local)
+            saved_id, saved_valid = identity(saved)
+            if (local_valid and saved_valid and local_id is not None and local_id == saved_id
+                    and (identity is not _state_db_row_identity_details or int(local_id) > 0)):
+                return True
+        if left_time is not None and left_time == right_time:
+            return True
+        if local.get('role') == 'user':
+            return False
+        local_owner, saved_owner = local_owner_by_row.get(id(local)), source_owner_by_row.get(id(saved))
+        # Native Agent flush and WebUI settlement stamp replies independently.
+        # A mutually unique visible row inside the same proved user execution
+        # is a mirror, not a second completed turn or an unanchored gap.
+        return (local_owner is not None and saved_owner is not None
+                and matches(local_owner, saved_owner)
+                and local_occurrences[(id(local_owner), key)] == 1
+                and source_occurrences[(id(saved_owner), key)] == 1)
 
     owner_indices = [i for i, row in enumerate(selected) if row is owner or matches(owner, row)]
     if len(owner_indices) > 1:
@@ -12755,37 +12979,27 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
             return None
         return clock, _session_message_visible_key(row, normalize_workspace_prefix=source)
 
-    source_keys, local_keys = collections.defaultdict(list), collections.defaultdict(list)
+    source_keys = collections.defaultdict(list)
     for index, row in enumerate(prefix):
-        source_keys[anchor_key(row, source=True)].append(index)
-    for index, row in enumerate(local_prefix):
-        local_keys[anchor_key(row)].append(index)
+        source_keys[_session_message_visible_key(row, normalize_workspace_prefix=True)].append(index)
     anchors = []
-    for key, local_indices in local_keys.items():
-        if key is None:
-            continue
-        candidates = source_keys.get(key, [])
+    for local_idx, row in enumerate(local_prefix):
+        candidates = source_keys.get(_session_message_visible_key(row), [])
+        compatible = [index for index in candidates if matches(row, prefix[index])]
         # A clock/content mirror with contradictory private/provider identity
         # is quarantined, never inserted as a second authoritative occurrence.
-        if any(not matches(local_prefix[i], prefix[j]) for i in local_indices for j in candidates):
+        if (anchor_key(row) is not None
+                and any(anchor_key(row) == anchor_key(prefix[index], source=True)
+                        and not matches(row, prefix[index]) for index in candidates)):
             return selected
-        if candidates and (len(local_indices) != 1 or len(candidates) != 1):
+        if len(compatible) > 1:
             return selected
-        if len(local_indices) == len(candidates) == 1:
-            anchors.append((local_indices[0], candidates[0]))
+        if compatible:
+            anchors.append((local_idx, compatible[0]))
     anchors.sort()
     if any(right[1] <= left[1] for left, right in zip(anchors, anchors[1:], strict=False)):
         return selected
-    def row_owners(rows):
-        owners = []
-        current = None
-        for row in rows:
-            if row.get('role') == 'user':
-                current = row
-            owners.append(current)
-        return owners
-
-    local_owners, source_owners = row_owners(local_prefix), row_owners(prefix)
+    local_owners = local_owners_all[:stop_index]
     for local_idx, saved_idx in anchors:
         local_owner, saved_owner = local_owners[local_idx], source_owners[saved_idx]
         # Matching assistant/tool bytes can occur in different executions.
@@ -12873,7 +13087,7 @@ def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verif
 
 
 def _state_db_after_saved_cancel_successors(
-    owner_messages: list, state_messages: list, local_messages: list,
+    owner_messages: list, state_messages: list, local_messages: list, *, turn_owner=None,
 ) -> list:
     """Remove only an ordered mirror of successors already saved after Stop.
 
@@ -12882,7 +13096,8 @@ def _state_db_after_saved_cancel_successors(
     and reject conflicting private identities so a genuinely new identical
     turn is not collapsed. Timestamps may change when SQLite restamps mirrors.
     """
-    turn_owner = _cancelled_journal_turn_owner(owner_messages)
+    if turn_owner is None:
+        turn_owner = _cancelled_journal_turn_owner(owner_messages)
     if turn_owner is None:
         return state_messages
     carrier = turn_owner[1]
@@ -13348,15 +13563,19 @@ def _merge_session_messages_append_only_impl(
     state_messages = list(state_messages or [])
     owner_messages = sidecar_messages if cancelled_journal_owner_messages is None else cancelled_journal_owner_messages
     post_cancel_state = False
-    if (_selected_history_owns_live_partial(sidecar_messages, owner_messages)
-            or (incoming_provenance != 'state_db' and _sidecar_has_terminal_partial_error(owner_messages))):
+    owns_live_partial = _selected_history_owns_live_partial(sidecar_messages, owner_messages)
+    cancelled_turn = _cancelled_journal_turn_owner(owner_messages, include_live_partial=owns_live_partial)
+    if (incoming_provenance != 'state_db'
+            and (owns_live_partial or _sidecar_has_terminal_partial_error(owner_messages))):
         # The selected history owns the veto. Deferred model context can still
         # precede the displayed Stop; SQLite must fill that older snapshot.
         state_messages = []
-    elif incoming_provenance == 'state_db' and _cancelled_journal_turn_owner(owner_messages):
+    elif incoming_provenance == 'state_db' and cancelled_turn:
         source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
-        owner_index, successor_index = _state_db_cancelled_journal_turn_bounds(owner_messages, source_messages)
-        if owner_index is not None and truncation_watermark is None:
+        owner_index, successor_index = _state_db_cancelled_journal_turn_bounds(
+            owner_messages, source_messages, turn_owner=cancelled_turn,
+        )
+        if owner_index is not None and truncation_watermark is None and not owns_live_partial:
             allowed_rows = {id(row) for row in state_messages}
             prefix = [row for row in source_messages[:owner_index] if id(row) in allowed_rows]
             # Earlier saved Stops own their raw execution blocks as well. A
@@ -13367,10 +13586,11 @@ def _merge_session_messages_append_only_impl(
                 earlier = owner_messages[:carrier_index + 1]
                 earlier_turn = _cancelled_journal_turn_owner(earlier, include_live_partial=True)
                 if (not earlier_turn or earlier_turn[1] is not carrier
-                        or earlier_turn[0] is _cancelled_journal_turn_owner(owner_messages)[0]):
+                        or earlier_turn[0] is cancelled_turn[0]):
                     continue
                 earlier_owner, earlier_successor = _state_db_cancelled_journal_turn_bounds(
                     earlier, source_messages, turn_owner=earlier_turn,
+                    allow_legacy_integer_clock=True,
                 )
                 if earlier_owner is None:
                     prefix = []
@@ -13378,13 +13598,21 @@ def _merge_session_messages_append_only_impl(
                 end = earlier_successor if earlier_successor is not None else len(source_messages)
                 excluded = {id(row) for row in source_messages[earlier_owner + 1:end]}
                 prefix = [row for row in prefix if id(row) not in excluded]
+                source_owner = source_messages[earlier_owner]
+                if _message_exact_timestamp(source_owner) != _message_exact_timestamp(earlier_turn[0]):
+                    # The uniquely proved legacy integer/fractional owner is
+                    # one turn. Project its canonical saved owner, without
+                    # rewriting either durable source or its execution clock.
+                    prefix = [earlier_turn[0] if row is source_owner else row for row in prefix]
             _reconcile_api_content_sidecars(sidecar_messages, prefix)
             sidecar_messages = _restore_cancelled_journal_prefix(
                 sidecar_messages, prefix, owner_messages,
                 verified_start=cancelled_journal_prefix_start_verified,
             )
         proved_suffix = list(source_messages[successor_index:]) if successor_index is not None else []
-        proved_suffix = _state_db_after_saved_cancel_successors(owner_messages, proved_suffix, sidecar_messages)
+        proved_suffix = _state_db_after_saved_cancel_successors(
+            owner_messages, proved_suffix, sidecar_messages, turn_owner=cancelled_turn,
+        )
         if cancelled_journal_source_messages is None:
             state_messages = proved_suffix
         else:
@@ -14171,7 +14399,7 @@ def reconciled_state_db_messages_for_session(
     if state_messages is None:
         session_id = getattr(session, 'session_id', None)
         session_profile = getattr(session, 'profile', None)
-        if _cancelled_journal_turn_owner(getattr(session, 'messages', None) or []):
+        if _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [], include_live_partial=True):
             state_result = get_state_db_session_messages(
                 session_id, profile=session_profile,
                 with_revision=with_revision, include_row_identity=True,
@@ -14249,7 +14477,7 @@ def reconciled_state_db_messages_for_session(
                     state_messages = list(state_messages or [])[anchor_index + 1 :]
                     cancelled_journal_prefix_start_verified = True
         if not (_sidecar_has_terminal_partial_error(getattr(session, 'messages', None) or [])
-                or _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [])):
+                or _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [], include_live_partial=True)):
             state_messages = state_db_delta_after_context(local_messages, state_messages)
     reconciled_messages = merge_session_messages_append_only(
         local_messages,

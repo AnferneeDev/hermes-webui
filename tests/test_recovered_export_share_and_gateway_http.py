@@ -15,10 +15,10 @@ from tests.test_recovered_surrogate_http import _new_server
 SEED = r'''
 import json,sys
 from pathlib import Path
-from api import models
-from api.run_journal import RunJournalWriter
 from tests.test_cancel_restart_journal_recovery import _persist_recovery_boundary_turn
 from tests.test_webui_state_db_reconciliation import _make_state_db
+from api import models
+from api.run_journal import RunJournalWriter
 sid,stream,lifecycle,tokens = sys.argv[1:5]
 models.SESSION_DIR.mkdir(parents=True,exist_ok=True)
 _persist_recovery_boundary_turn(sid,stream,lifecycle)

@@ -32,10 +32,9 @@ def test_cancelled_journal_replay_cutoff_is_shared_by_display_and_context(live, 
             session, prefer_context=prefer_context, state_messages=copy.deepcopy(state))
         contents = [row.get('content') for row in merged]
         assert 'CANCELLED_REPLAY' not in contents and 'CANCELLED_TOOL' not in contents
-        if live:
-            assert 'LATER_ANSWER' not in contents
-        else:
-            assert contents[-2:] == [user, 'LATER_ANSWER']
+        # A terminal Stop owns its raw execution, including a live partial;
+        # a proved later Gateway exchange remains part of provider/display history.
+        assert contents[-2:] == [user, 'LATER_ANSWER']
     assert session.messages == sidecar
 
 

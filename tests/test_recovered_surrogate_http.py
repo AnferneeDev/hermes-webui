@@ -13,10 +13,10 @@ import pytest
 
 SEED = r'''
 import json, sys
+from tests.test_cancel_restart_journal_recovery import _persist_recovery_boundary_turn
 from api.run_journal import RunJournalWriter
 from api import models
 models.SESSION_DIR.mkdir(parents=True, exist_ok=True)
-from tests.test_cancel_restart_journal_recovery import _persist_recovery_boundary_turn
 sid, stream, tokens = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 _persist_recovery_boundary_turn(sid, stream, "crash")
 writer = RunJournalWriter(sid, stream)

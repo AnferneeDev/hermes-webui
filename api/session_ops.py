@@ -357,7 +357,7 @@ def regeneration_state(session, *, use_sidecar=False):
     )
 
     bounded_tail = None
-    cancelled_owner = _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [])
+    cancelled_owner = _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [], include_live_partial=True)
     if use_sidecar and not cancelled_owner:
         read_floor = _sidecar_regeneration_read_floor(session)
         if read_floor is not None:

@@ -62,8 +62,8 @@ def test_duplicate_rebases_exact_tool_owners_after_sqlite_image_successor_insert
     root, env, sid, stream, journal, raw = _seed(tmp_path, 'stop', TOKENS[3], 'after-carrier')
     prepare = r'''
 import json,sqlite3,sys
-from api import models
 from tests.test_native_image_turn_display_context import IMAGE_A
+from api import models
 s=models.get_session(sys.argv[1])
 assert models._cancelled_journal_turn_owner(s.messages)
 with sqlite3.connect(models._active_state_db_path()) as db:

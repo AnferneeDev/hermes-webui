@@ -145,8 +145,12 @@ cancelled run's assistant/tool replay and merge the successor suffix in durable
 order, even when it predates recovery-time sidecar timestamps. Stop synthesis
 preserves the finite positive pending owner's fractional timestamp; a recovery
 clock cannot replace its execution identity. Completed SQLite-only turns before
-that owner are restored after a unique retained, ordered exact-clock/content
-anchor, including gaps between retained pairs. Preserve saved row objects and
+that owner are restored after a unique retained, ordered compatible identity or
+exact-clock/content anchor, including gaps between retained pairs. Agent flush
+and WebUI settlement may stamp assistant rows independently: a mutually unique
+content match within the same proved user execution is a mirror. A compatible
+row identity can anchor despite that clock skew; ambiguous clock/content
+occurrences and conflicting private identities still deny restoration. Preserve saved row objects and
 native tool-call/result blocks. When both stores have unmatched turns inside
 one proved gap, merge complete user-led turns by their valid, strictly ordered
 user timestamps; equal or invalid clocks grant no relative-order authority.
@@ -157,7 +161,9 @@ their recovery clocks are newer than subsequent users. Competing unanchored
 leading fragments are ambiguous and cannot authorize restoration. Reject
 conflicting or duplicated private identities, and exclude every proved earlier
 cancelled execution block as well, including
-older live-partial Stops before a journal-recovered Stop.
+older live-partial Stops before a journal-recovered Stop. A uniquely compatible
+legacy integer/fractional owner identifies only its execution block; projecting
+its saved owner must not rewrite either durable source.
 An explicit verified compression anchor admits only its already sliced tail;
 without one, the leading discarded prefix stays excluded. Persisted truncation
 continues to veto restoration. A later-only
@@ -166,7 +172,12 @@ or ambiguous ownership grants no replay authority. Keep this cutoff after later
 rows persist, before display pagination or model-context delta selection; live
 partial, exact identity/deduplication, compression and truncation guards remain.
 The live-partial veto belongs to the selected history: a displayed Stop cannot
-suppress SQLite completion of an older deferred model-context snapshot.
+suppress SQLite completion of an older deferred model-context snapshot. A terminal
+live Stop excludes its proved raw execution rather than vetoing all SQLite
+history, so its proved successor Gateway suffix remains visible and reaches
+next-send provider history. Rebase tool-card owners through the same display
+projection before hydration/pagination, including cached limited reads; do not
+rewrite saved owner metadata.
 Selected context may omit the display-only terminal carrier. Its user and each
 ordered saved partial still require compatible content plus shared identity or
 an exact valid clock. Clock-only user proof must have exactly one compatible
