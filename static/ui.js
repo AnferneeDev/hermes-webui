@@ -3093,10 +3093,10 @@ function _userImageMarkerPresentation(text){
   let placeholders=0;
   let fence=null;
   const lines=String(text||'').split('\n').filter(line=>{
-    const delimiter=line.match(/^ {0,3}(`{3,}|~{3,})/);
+    const delimiter=line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if(delimiter){
       if(!fence) fence=delimiter[1];
-      else if(delimiter[1][0]===fence[0]&&delimiter[1].length>=fence.length) fence=null;
+      else if(!delimiter[2].trim()&&delimiter[1][0]===fence[0]&&delimiter[1].length>=fence.length) fence=null;
       return true;
     }
     if(fence) return true;
@@ -3113,6 +3113,9 @@ function _userImageMarkerPresentation(text){
     return true;
   });
   return {text:lines.join('\n').trim(),paths};
+}
+function _userImageMarkerMediaUrl(path, sessionId){
+  return 'api/media?path='+encodeURIComponent(path)+'&session_id='+encodeURIComponent(sessionId||'');
 }
 function _renderAttachmentHtml(fname, url){
   const kind=_mediaKindForName(fname);
@@ -18419,7 +18422,7 @@ function renderMessages(options){
       content='**Error:** No response received after context compression. Please retry.';
     }
     const strippedContent=isUser?_stripAttachedFilesMarkerForDisplay(_stripWorkspaceDisplayPrefix(content)):content;
-    const userImagePresentation=isUser&&!isProcessWakeup?_userImageMarkerPresentation(strippedContent):null;
+    const userImagePresentation=isUser&&!isProcessWakeup&&typeof _userImageMarkerPresentation==='function'?_userImageMarkerPresentation(strippedContent):null;
     const displayContent=userImagePresentation?userImagePresentation.text:strippedContent;
     const rowDisplayContent=displayContent;
     if(!isUser&&_isAssistantEmptyPlaceholderContent(m, displayContent)){
@@ -18448,8 +18451,7 @@ function renderMessages(options){
     if(userImagePresentation&&userImagePresentation.paths.length){
       const imageSid=(S.session&&S.session.session_id)||'';
       const imageHtml=userImagePresentation.paths.map(path=>{
-        const url='api/media?path='+encodeURIComponent(path)+'&session_id='+encodeURIComponent(imageSid);
-        return _renderAttachmentHtml(path.split('/').pop(),url);
+        return _renderAttachmentHtml(path.split('/').pop(),_userImageMarkerMediaUrl(path,imageSid));
       }).join('');
       filesHtml+=`<div class="msg-files">${imageHtml}</div>`;
     }
@@ -18608,6 +18610,8 @@ function renderMessages(options){
       // content-length estimate; the measure pass refines it exactly next frame. The
       // typeof guard keeps renderMessages runnable in the node test harnesses that
       // extract it without this helper (they stub every collaborator by name).
+      if(userImagePresentation&&userImagePresentation.paths.length) row.dataset.editText=String(strippedContent).trim();
+      else delete row.dataset.editText;
       if(typeof _applyUserRowIntrinsicHeight==='function') _applyUserRowIntrinsicHeight(row, newRawText);
       inner.appendChild(row);
       userRows.set(rawIdx, row);
@@ -20737,7 +20741,7 @@ function editMessage(btn) {
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const msgIdx = parseInt(row.dataset.msgIdx, 10);
-  const originalText = row.dataset.rawText || '';
+  const originalText = row.dataset.editText || row.dataset.rawText || '';
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
   row.dataset.editing = '1';
