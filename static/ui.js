@@ -3093,7 +3093,7 @@ function _userImageMarkerPresentation(text){
   let placeholders=0;
   let fence=null;
   const lines=String(text||'').split('\n').filter(line=>{
-    const delimiter=line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    const delimiter=line.match(/^ {0,3}(`{3,}|~{3,})(.*)\r?$/);
     if(delimiter){
       if(!fence) fence=delimiter[1];
       else if(!delimiter[2].trim()&&delimiter[1][0]===fence[0]&&delimiter[1].length>=fence.length) fence=null;

@@ -6,7 +6,9 @@ other browser tests; install it and Chromium to run this gate.
 """
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -108,3 +110,34 @@ def test_saved_marker_images_load_and_survive_reload(image_preview_browser, widt
         assert errors == []
     finally:
         context.close()
+
+
+def _marker_presentation(text):
+    src = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+    start = src.index("function _userImageMarkerPresentation(")
+    i = src.index("{", start) + 1
+    depth = 1
+    while depth:
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        i += 1
+    script = src[start:i] + "\nprocess.stdout.write(JSON.stringify(_userImageMarkerPresentation(JSON.parse(process.argv[1]))));"
+    result = subprocess.run(["node", "-e", script, json.dumps(text)], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_markers_inside_code_examples_stay_text(newline):
+    marker = "[Image attached at: /tmp/example.png]"
+    content = newline.join(["Example:", "```python", marker, "```js", marker, "```", "After"])
+    presentation = _marker_presentation(content)
+    assert presentation["paths"] == []
+    assert presentation["text"].count(marker) == 2
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_markers_after_a_closed_code_example_become_previews(newline):
+    content = newline.join(["```", "code", "```", "[Image attached at: /tmp/real.png]", "[screenshot]"])
+    presentation = _marker_presentation(content)
+    assert presentation["paths"] == ["/tmp/real.png"]
+    assert "[Image attached at:" not in presentation["text"]
+    assert "[screenshot]" not in presentation["text"]
