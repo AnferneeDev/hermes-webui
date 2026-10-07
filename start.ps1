@@ -202,11 +202,11 @@ if (-not $AgentDir) {
     $serverCandidates = $serverCandidates | Select-Object -Unique
     # Two-pass over server-equivalent candidates first (matches api/config.py).
     foreach ($c in $serverCandidates) {
-        if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf) { $AgentDir = $c; break }
+        if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
     }
     if (-not $AgentDir) {
         foreach ($c in $serverCandidates) {
-            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container) { $AgentDir = $c; break }
+            if (Test-Path (Join-Path $c 'hermes_cli') -PathType Container -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
         }
     }
     # Launcher-only fallbacks — only after both server-equivalent passes.

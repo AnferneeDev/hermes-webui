@@ -740,6 +740,42 @@ def test_program_files_agent_with_unreadable_legacy_home_still_launches(tmp_path
     assert code == 0, output
 
 
+def test_program_files_agent_with_unreadable_legacy_agent_dir_and_webui_state_launches(tmp_path):
+    """The server-pass run_agent.py probe must not throw on an unreadable legacy Agent dir.
+
+    When the legacy %USERPROFILE%\\.hermes holds WebUI state, server candidate 5
+    resolves to `.hermes\\hermes-agent`. If only that folder is unreadable,
+    `Test-Path <dir>\\run_agent.py -PathType Leaf` raises under
+    $ErrorActionPreference = 'Stop'. Master launches the Program Files Agent
+    here, so the probe has to fail quietly too.
+    """
+    fixture = tmp_path / "fx"
+    legacy = fixture / "user" / ".hermes"
+    (legacy / "webui" / "sessions").mkdir(parents=True)
+    legacy_agent = legacy / "hermes-agent"
+    legacy_agent.mkdir()
+    program_files = fixture / "pf"
+    agent = _make_agent(program_files / "hermes" / "hermes-agent")
+    (fixture / "local" / "hermes").mkdir(parents=True, exist_ok=True)
+    legacy_agent.chmod(0o000)
+
+    try:
+        code, output = _run_start_ps1(
+            fixture,
+            extra_env={
+                "HERMES_HOME": str(fixture / "local" / "hermes"),
+                "ProgramFiles": str(program_files),
+            },
+        )
+    finally:
+        legacy_agent.chmod(0o755)
+
+    assert "UnauthorizedAccessException" not in output, output
+    assert "Access to the path" not in output, output
+    assert _agent_dir(output) == str(agent), output
+    assert code == 0, output
+
+
 def test_no_agent_with_unreadable_legacy_home_reports_not_found(tmp_path):
     """With no Agent anywhere, an unreadable .hermes must not mask the clean error."""
     fixture = tmp_path / "fx"
