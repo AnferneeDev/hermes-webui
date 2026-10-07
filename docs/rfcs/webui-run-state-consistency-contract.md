@@ -179,7 +179,9 @@ next-send provider history. A typed crash/provider interruption is not a user
 Stop: its selected live-partial veto remains in force, including when an older
 cancelled segment also exists in the saved history. Rebase tool-card owners through the same display
 projection before hydration/pagination, including cached limited reads; do not
-rewrite saved owner metadata.
+rewrite saved owner metadata. Snapshot-lineage caches retain an independent
+saved-row-to-display map computed before row copies; later reconciliation composes
+that provenance through surviving exact objects, never matching assistant prose.
 Selected context may omit the display-only terminal carrier. Its user and each
 ordered saved partial still require compatible content plus shared identity or
 an exact valid clock. Clock-only user proof must have exactly one compatible

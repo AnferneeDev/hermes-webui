@@ -514,3 +514,57 @@ def test_sidecar_only_stop_tool_owner_survives_repeated_paged_get(
                     assert status == 200
                     check(json.loads(body)["session"], expected, ("http", repeat, query))
     assert models.Session.load(sid).tool_calls == persisted
+
+
+@pytest.mark.parametrize("database", ["missing", "empty", "row"])
+def test_snapshot_child_stop_cards_survive_real_http_lineage_cache(tmp_path, monkeypatch, database):
+    sid = "snapshot-stop-child-" + database
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    parent = models.Session(session_id=sid + "-parent", messages=[
+        {"role": "user", "content": "PARENT_Q1", "timestamp": 1},
+        {"role": "assistant", "content": "PARENT_A1", "timestamp": 2},
+        {"role": "user", "content": "PARENT_Q2", "timestamp": 3},
+        {"role": "assistant", "content": "PARENT_A2", "timestamp": 4},
+    ])
+    parent.pre_compression_snapshot = True
+    parent.save()
+    child, owner = _recover(sid, [
+        {"role": "user", "content": "CHILD_Q", "timestamp": 5},
+        {"role": "assistant", "content": "SAME_ANSWER", "timestamp": 6},
+    ])
+    child.parent_session_id = parent.session_id
+    child.tool_calls = [
+        {"id": "child-card", "name": "read", "result": "CHILD_RESULT",
+         "done": True, "assistant_msg_idx": 1},
+        {"id": "missing-owner", "name": "read", "assistant_msg_idx": 99},
+    ]
+    child.save(touch_updated_at=False)
+    if database != "missing":
+        rows = [] if database == "empty" else [owner]
+        _make_state_db(db, sid, rows)
+    persisted = copy.deepcopy(models.Session.load(sid).tool_calls)
+    queries = [("msg_limit=all", 5), ("msg_limit=4", 0),
+               ("msg_limit=4&msg_before=6", 3),
+               ("msg_limit=2&msg_before=2", None)]
+    # Separate process is essential: in-process live activity bypasses this cache.
+    failures = []
+    with _new_server(http_env(tmp_path), ROOT, tmp_path / "server.log") as base:
+        for repeat in range(3):
+            for query, expected in queries:
+                status, body, _ = _request(base, f"/api/session?session_id={sid}&{query}")
+                assert status == 200
+                data = json.loads(body)["session"]
+                cards = [c for c in data["tool_calls"] if c.get("id") == "child-card"]
+                assert not any(c.get("id") == "missing-owner" for c in data["tool_calls"])
+                if expected is None:
+                    assert not cards, (database, repeat, query, data)
+                else:
+                    if len(cards) != 1:
+                        failures.append((repeat, query, "missing card"))
+                    elif (cards[0]["assistant_msg_idx"] != expected
+                          or data["messages"][expected]["content"] != "SAME_ANSWER"
+                          or cards[0]["result"] != "CHILD_RESULT"):
+                        failures.append((repeat, query, "wrong owner/result"))
+    assert models.Session.load(sid).tool_calls == persisted
+    assert not failures, (database, failures)
