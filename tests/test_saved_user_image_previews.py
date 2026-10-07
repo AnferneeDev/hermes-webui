@@ -104,6 +104,8 @@ def test_saved_marker_images_load_and_survive_reload(image_preview_browser, widt
                 assert "[Image attached at:" not in row.inner_text()
                 assert "[screenshot]" not in row.inner_text()
                 assert "Look at these screenshots." in row.inner_text()
+                assert row.get_attribute("data-edit-text") == content
+                assert "[Image attached at:" not in row.get_attribute("data-raw-text")
                 assert page.evaluate("S.messages[0].content") == content
                 sources = row.locator("img").evaluate_all("images => images.map(i => ({path:new URL(i.src).searchParams.get('path'), sid:new URL(i.src).searchParams.get('session_id')}))")
                 assert sources == [{"path": path, "sid": sid} for path in paths]
